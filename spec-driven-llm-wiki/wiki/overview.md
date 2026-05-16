@@ -55,7 +55,9 @@ smollm2.c
 - 6 components defined
 - 6 architecture decisions (ADRs)
 - 4 patterns documented
-- Implementation: Not started
+- **Implementation: Phase 1-3 complete (testing in progress)**
+- Binary: `smollm2-cli` compiles, `smollm2-135m.sm2` converted
+- **Issue: Magic byte mismatch in .sm2 format (converter bug)**
 
 ## Tech Stack
 
@@ -79,10 +81,10 @@ smollm2.c
 
 ## Next Steps
 
-1. Implement .sm2 file loader (Phase 1)
-2. Implement tokenizer (Phase 1)
-3. Implement F16 forward pass (Phase 1)
-4. Verify logits vs HuggingFace reference
+1. **FIX: Magic byte in converter** - `MAGIC = b'SM2C001'` should be 8 bytes (remove trailing `\x01`)
+2. Test inference end-to-end with `smollm2-cli`
+3. Verify logits vs HuggingFace reference
+4. Add download script + README with step-by-step instructions
 
 ## References
 
