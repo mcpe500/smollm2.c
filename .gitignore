@@ -1,0 +1,41 @@
+# Binaries
+smollm2-cli
+smollm2d
+
+# Object files
+obj/
+
+# Model files (download during build/convert)
+*.safetensors
+*.sm2
+*.gguf
+*.bin
+
+# Tokenizer (download during build)
+tokenizer.json
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large data files
+*.pt
+*.pth
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
