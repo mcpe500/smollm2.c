@@ -453,8 +453,28 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
     // Use current position for this token (don't increment yet)
     int seq_pos = ctx->pos;
     
+    // DEBUG: Print top 5 logits before sampling
+    float* logits = ctx->scratch.logits;
+    // fprintf(stderr, "DEBUG decode_next: pos=%d, first 5 logits: ", seq_pos);
+    // for (int i = 0; i < 5; i++) {
+    //     fprintf(stderr, "%.2f ", logits[i]);
+    // }
+    // fprintf(stderr, "\n");
+    //
+    // // Find argmax to see what token SHOULD be selected
+    // int best_token = 0;
+    // float best_logit = logits[0];
+    // for (int i = 1; i < ctx->model->vocab_size; i++) {
+    //     if (logits[i] > best_logit) {
+    //         best_logit = logits[i];
+    //         best_token = i;
+    //     }
+    // }
+    // fprintf(stderr, "DEBUG: argmax would select token=%d (logit=%.2f)\n", best_token, best_logit);
+    
     // Sample from logits (computed in previous iteration or prefill)
     int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state);
+    // fprintf(stderr, "DEBUG: sm2_sample_token returned token=%d\n", token);
     
     // Get embedding for this token
     float* x = ctx->scratch.x;

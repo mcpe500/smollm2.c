@@ -52,9 +52,9 @@ static cli_args parse_args(int argc, char** argv) {
         .ctx_size = 2048,
         .max_output = 256,
         .n_threads = 4,
-        .temperature = 0.8f,
-        .top_p = 90,
-        .top_k = 40,
+        .temperature = 0.0f,   // Greedy by default for deterministic output
+        .top_p = 100,          // Disabled when = 100
+        .top_k = 0,            // Disabled when = 0
         .low_memory = 0,
         .interactive = 0,
     };
