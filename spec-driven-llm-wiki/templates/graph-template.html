@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>{{STYLE}}</style>
+</head>
+<body>
+  <div id="controls">
+    <h1>{{TITLE}}</h1>
+    <input id="search" placeholder="Search nodes..." aria-label="Search nodes">
+    <label><input id="show-extracted" type="checkbox" checked> Extracted</label>
+    <label><input id="show-inferred" type="checkbox" checked> Inferred</label>
+    <label><input id="show-ambiguous" type="checkbox"> Ambiguous</label>
+    <p>{{SUMMARY}}</p>
+  </div>
+  <div id="graph"></div>
+  <aside id="drawer" aria-live="polite">
+    <button id="close">Close</button>
+    <h2 id="drawer-title"></h2>
+    <p id="drawer-meta"></p>
+    <pre id="drawer-content"></pre>
+  </aside>
+  <script>
+  const GRAPH_DATA = {{GRAPH_DATA}};
+  {{SCRIPT}}
+  </script>
+</body>
+</html>

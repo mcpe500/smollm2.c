@@ -1,0 +1,23 @@
+{
+  "name": "spec-driven-llm-wiki-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build-graph": "tsx src/build-graph.ts",
+    "serve-graph": "tsx src/serve-graph.ts",
+    "viz-component": "tsx src/viz-component.ts",
+    "validate-spec": "tsx src/validate-spec.ts",
+    "lint-repo": "tsx src/lint-repo.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "vis-network": "^10.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

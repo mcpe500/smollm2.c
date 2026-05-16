@@ -1,0 +1,15 @@
+.env
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+graph/.cache.json
+graph/.inferred_edges.jsonl
+graph/graph.json
+graph/graph.html
+graph/components/*.html
+!graph/components/.gitkeep
+package-lock.json
+pnpm-lock.yaml
+bun.lock
+bun.lockb
