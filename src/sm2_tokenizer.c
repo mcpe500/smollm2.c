@@ -168,22 +168,131 @@ static int byte_to_id(sm2_tokenizer* tok, uint8_t byte) {
 }
 
 // ============================================================================
-// BPE ENCODE WORD
+// BPE ENCODE WORD - Proper BPE with merge table
 // ============================================================================
 
+// Find token ID for a string (token_to_id lookup)
+// Returns token ID or -1 if not found
+static int find_token_id(sm2_tokenizer* tok, const char* token_str) {
+    if (!tok->tokens) return -1;
+    // Linear scan - tokens array is indexed by id, not by string
+    // We need to scan to find matching token string
+    for (int i = 0; i < tok->vocab_size; i++) {
+        if (tok->tokens[i] && strcmp(tok->tokens[i], token_str) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Encode a word using BPE merges
 static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int max_len) {
     if (!word || !ids || max_len <= 0) return 0;
     
-    // Simple byte-level encoding as fallback
-    // For proper BPE, we'd split into characters and apply merges
-    int n = 0;
-    for (int i = 0; word[i] && n < max_len; i++) {
-        unsigned char b = (unsigned char)word[i];
-        int id = byte_to_id(tok, b);
-        if (id >= 0) {
-            ids[n++] = id;
+    // If no merges or tokens loaded, fall back to byte
+    if (!tok->merges || tok->num_merges == 0 || !tok->tokens) {
+        int n = 0;
+        for (int i = 0; word[i] && n < max_len; i++) {
+            unsigned char b = (unsigned char)word[i];
+            ids[n++] = b;
         }
+        return n;
     }
+    
+    // Step 1: Convert word bytes to initial token segments
+    // Each byte becomes an initial segment with its string representation
+    int word_len = strlen(word);
+    int max_segs = word_len * 2;  // worst case: no merges
+    
+    // segments: array of token IDs representing current segmentation
+    int* segments = malloc(max_segs * sizeof(int));
+    char** seg_strs = malloc(max_segs * sizeof(char*));
+    int n_segs = 0;
+    
+    for (int i = 0; i < word_len && n_segs < max_segs; i++) {
+        // Each byte is an initial segment (byte-level token)
+        unsigned char b = (unsigned char)word[i];
+        segments[n_segs] = b;  // token ID = byte value
+        seg_strs[n_segs] = malloc(2);
+        seg_strs[n_segs][0] = (char)b;
+        seg_strs[n_segs][1] = '\0';
+        n_segs++;
+    }
+    
+    // Step 2: Iteratively apply BPE merges
+    int iterations = 0;
+    int max_iterations = n_segs * 2;  // safety limit
+    
+    while (iterations < max_iterations) {
+        iterations++;
+        
+        // Find best merge (lowest rank in merges table)
+        int best_rank = -1;
+        int best_idx = -1;
+        
+        for (int i = 0; i < n_segs - 1; i++) {
+            // Build pair string: seg_strs[i] + seg_strs[i+1]
+            int len1 = strlen(seg_strs[i]);
+            int len2 = strlen(seg_strs[i + 1]);
+            char* pair = malloc(len1 + len2 + 1);
+            strcpy(pair, seg_strs[i]);
+            strcat(pair, seg_strs[i + 1]);
+            
+            int rank = get_bpe_rank(tok, pair);
+            free(pair);
+            
+            if (rank >= 0 && (best_rank < 0 || rank < best_rank)) {
+                best_rank = rank;
+                best_idx = i;
+            }
+        }
+        
+        if (best_idx < 0) {
+            break;  // No more merges possible
+        }
+        
+        // Apply merge at best_idx: combine seg[best_idx] and seg[best_idx+1]
+        // Build merged string
+        int len1 = strlen(seg_strs[best_idx]);
+        int len2 = strlen(seg_strs[best_idx + 1]);
+        char* merged = malloc(len1 + len2 + 1);
+        strcpy(merged, seg_strs[best_idx]);
+        strcat(merged, seg_strs[best_idx + 1]);
+        
+        // Find token ID for merged string
+        int merged_id = find_token_id(tok, merged);
+        free(merged);
+        
+        if (merged_id < 0) {
+            break;  // Merged string not in vocab
+        }
+        
+        // Replace seg[best_idx] with merged_id, remove seg[best_idx+1]
+        segments[best_idx] = merged_id;
+        free(seg_strs[best_idx]);
+        
+        // Shift remaining segments
+        for (int i = best_idx + 1; i < n_segs - 1; i++) {
+            segments[i] = segments[i + 1];
+            seg_strs[i] = seg_strs[i + 1];
+        }
+        free(seg_strs[n_segs - 1]);
+        n_segs--;
+    }
+    
+    // Step 3: Copy final segments to output
+    int n = 0;
+    for (int i = 0; i < n_segs && n < max_len; i++) {
+        ids[n++] = segments[i];
+    }
+    
+    // Cleanup
+    for (int i = 0; i < n_segs; i++) {
+        free(seg_strs[i]);
+    }
+    free(segments);
+    free(seg_strs);
+    
     return n;
 }
 

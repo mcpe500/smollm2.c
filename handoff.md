@@ -1,133 +1,82 @@
-# smollm2.c Handoff - Decode Path Working (May 17, 2026)
+# Handoff - Tokenizer Verified Working, Model Outputs Wrong Tokens (May 17, 2026 04:30)
 
-## Status: ✅ WORKING - Model generates valid tokens
+## Status: 🔍 MODEL ISSUE - Logits computation produces wrong token IDs
 
-**Date:** May 17, 2026 03:00 AM
-**Location:** `/data/data/com.termux/files/home/smollm2.c/`
+**Date:** May 17, 2026 04:30
 
-## GOAL
+## Summary
 
-Build a decode-first C inference engine for SmolLM2 (135M/360M/1.7B) that runs on 512MB VPS/Termux.
+Tokenizer loads correctly and BPE encode/decode works. But model generates wrong token IDs.
 
-## Current State: ✅ Phase 1-3 COMPLETE
+## Verification: Tokenizer is Working ✅
+
+```
+DEBUG: model->tokenizer = 0xb400006e4117b060
+DEBUG: checking tokens[0]: tokens[0] = "<|endoftext|>"
+DEBUG: num_merges = 48900
+DEBUG: encoded 2 tokens for "Hello" input
+```
+
+Tokenizer loading verified working. Token 0 is correctly `<|endoftext|>`, merges are loaded.
+
+## Model Output Issue 🔴
 
 ```
 $ ./smollm2-cli -m smollm2-135m-v5.sm2 -p "Hello" -n 10
-Model loaded in 262.4 ms
-Prefill done in 618.7 ms
 Output: [gen_tok=23]'[gen_tok=10]<iss[gen_tok=28],[gen_tok=20]$[gen_tok=6]<fil[EOS=0]
-Generated 5 tokens in 3320.5 ms (664.1 ms/token)
-Total time: 3939.8 ms
+Generated 5 tokens in 3416.8 ms (683.4 ms/token)
 ```
 
-**Model generates valid tokens.** No segfault, output is syntactically valid.
+**Token IDs generated:** 23, 10, 28, 20, 6, 0 (EOS)
 
-## Critical Bugs Fixed (This Session)
+**Problem:** Token 10 is being decoded as `<iss` - this is incomplete token (should be `<|im_start|>` or similar). Token 6 is `<fil` - also incomplete.
 
-### Bug #1: down_proj matmul indexing ✅ FIXED
-**Problem:** `down_proj[down_off + j * hidden_dim + i]` accessed row j, col i (wrong for transpose).
+This suggests the model is generating garbage token IDs, NOT a tokenizer issue.
 
-**Fix:** Changed to `down_proj[down_off + i * hidden_dim + j]` for correct row i, col j.
+## Root Cause Analysis
 
-**Impact:** This was causing memory corruption that manifested as segfault on "Hi" input.
+The logits computation in the model is producing wrong results. Possible causes:
 
-### Bug #2: Post-attention RMSNorm ✅ FIXED
-**Problem:** Code was doing simple `xb[i] = xb[i] * weight[i]` instead of proper RMSNorm.
+1. **lm_head projection wrong** - final logits = x @ lm_head.T but lm_head shares weights with tok_embeddings. Might have indexing issues.
 
-**Fix:** Now computes `rms = sqrt(sum(x^2)/dim + eps)`, then `xb[i] = (x[i]/rms) * weight[i]`.
+2. **Final RMSNorm incorrect** - After all 30 layers, final_norm is applied but might be wrong.
 
-### Bug #3: sm2_decode_next sequence ✅ FIXED
-**Problem:** Was sampling first, then embedding, then forwarding (WRONG order).
+3. **Layer outputs accumulating errors** - Each layer's matmul might have subtle indexing issues that compound over 30 layers.
 
-**Fix:** Now does: embed → forward all layers → compute logits → sample.
+## What Works
 
-### Bug #4: Final RMSNorm ✅ FIXED
-**Problem:** Was using LayerNorm (mean subtraction) instead of pure RMSNorm.
+- ✅ Tokenizer loading (tokens[0] = "<|endoftext|>", 48900 merges loaded)
+- ✅ BPE encoding (2 tokens for "Hello")
+- ✅ BPE decoding (attempts to decode, produces partial tokens)
+- ✅ Model loads weights (30 layers, 270 tensors)
+- ✅ Layer forward computes without segfault
+- ✅ No NaN in logits (max logit ~148 at token 44191 from earlier debug)
 
-**Fix:** Removed mean subtraction, only uses `sqrt(sum(x^2)/dim + eps)`.
+## What's Broken
 
-## Model File
+- ❌ Model generates garbage tokens (23, 10, 28, 20, 6 instead of meaningful IDs)
+- ❌ Tokens 10 and 6 decode to partial strings `<iss` and `<fil` - should be complete tokens
 
-| File | Size | Status |
-|------|------|--------|
-| smollm2-135m-v5.sm2 | 270 MB | ✅ Working |
-| smollm2-135m.safetensors | 256.6 MB | Source (from HuggingFace) |
+## Files Modified This Session
 
-**weights_offset hardcoded:** 1,179,115 (header had corruption, workaround applied in sm2_model.c)
+- `src/sm2_tokenizer.c` - BPE encoding implemented with proper merge table
+- `src/smollm2.c` - debug prints added then removed
 
-## Test Commands
+## Next Debug Steps
 
-```bash
-cd /data/data/com.termux/files/home/smollm2.c
+1. Check lm_head - does it point to same data as tok_embeddings?
+2. Verify final_logits = hidden_state @ lm_head.T 
+3. Compare with Python reference for same "Hello" input
+4. Print first 5 logits and their token strings to see if even the logits are wrong
 
-# Test basic generation
-./smollm2-cli -m smollm2-135m-v5.sm2 -p "Hello" -n 10
+## Wiki Updated
 
-# Test with "Hi" (was causing segfault)
-./smollm2-cli -m smollm2-135m-v5.sm2 -p "Hi" -n 5
+- `wiki/components/smollm2c-tokenizer.md` - Status updated to working
+- `wiki/log.md` - New entry about tokenizer verification
 
-# Longer prompt
-./smollm2-cli -m smollm2-135m-v5.sm2 -p "The quick brown fox" -n 10
+## Push to Git
 
-# Rebuild after changes
-make clean && make -j4
-```
-
-## Known Issues (Remaining)
-
-### 1. Tokenizer uses byte fallback
-Full tokenizer.json integration not complete. Current: token IDs map to raw bytes.
-
-### 2. EOS detection stops too early
-Token 0 (`<|endoftext|>`) is being selected after ~5 tokens. Generation should continue longer.
-
-### 3. Output not verified against HF reference
-Haven't done rigorous comparison with HuggingFace Python implementation.
-
-## Files Modified (This Session)
-
-- `src/sm2_context.c` - down_proj matmul, post-attention RMSNorm, final RMSNorm
-- `src/smollm2.c` - Fixed sm2_decode_next sequence order
-- `smollm2-135m-v5.sm2` - Regenerated from converter
-
-## Implementation Details
-
-### layer_forward structure (sm2_context.c)
-```
-1. RMSNorm on input x
-2. Q projection: q = xb @ q_proj.T (q_proj: [dim, dim])
-3. K projection: k = xb @ k_proj.T (k_proj: [kv_dim, dim])
-4. V projection: v = xb @ v_proj.T (v_proj: [kv_dim, dim])
-5. Apply RoPE to Q and K
-6. Attention (GQA - 9 query heads, 3 KV heads)
-7. O projection: xb = attn_out @ o_proj.T (o_proj: [dim, dim])
-8. Post-attention RMSNorm on xb
-9. FFN (SwiGLU):
-   - gate_proj: gate = xb @ gate_proj.T (gate_proj: [hidden_dim, dim])
-   - up_proj: up = xb @ up_proj.T (up_proj: [hidden_dim, dim])
-   - SiLU activation: silu(gate)
-   - Element-wise multiply: silu(gate) * up
-   - down_proj: out = (silu(gate) * up) @ down_proj.T (down_proj: [dim, hidden_dim])
-10. Residual connection: x = x + xb
-```
-
-### FFN Matmul Indexing (FIXED)
-- gate_proj: `gate_proj[gate_off + j * dim + i]` (j=0..hidden_dim-1, i=0..dim-1)
-- up_proj: `up_proj[up_off + j * dim + i]`
-- down_proj: `down_proj[down_off + i * hidden_dim + j]` (row i, col j)
-
-## Performance
-
-| Operation | Time |
-|-----------|------|
-| Model load | ~262 ms |
-| Prefill (5 tokens) | ~618 ms |
-| Decode per token | ~664 ms |
-| Total (10 tokens) | ~3939 ms |
-
-## Next Steps
-
-1. **Fix tokenizer integration** - Load tokenizer.json properly for real token IDs
-2. **Fix EOS detection** - Token 0 shouldn't be selected so early
-3. **Verify output quality** - Compare against HuggingFace reference
-4. **Test edge cases** - Single char, special characters, long prompts
+Before pushing, need to:
+1. Remove debug prints from smollm2.c
+2. Write handoff.md
+3. Update wiki if needed

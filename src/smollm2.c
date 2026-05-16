@@ -186,7 +186,7 @@ static int run_inference(sm2_model* model, const cli_args* args) {
         }
         
         // Print token using tokenizer decode if available
-        fprintf(stderr, "[gen_tok=%d]", token);  // DEBUG
+        // fprintf(stderr, "[gen_tok=%d]", token);  // DEBUG - disabled
         if (model->tokenizer && token >= 0 && token < model->vocab_size) {
             char* decoded = sm2_tokenizer_decode(model->tokenizer, &token, 1);
             if (decoded && decoded[0] != '\0') {

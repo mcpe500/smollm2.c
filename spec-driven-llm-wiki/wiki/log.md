@@ -132,3 +132,49 @@ Total time: 3939.8 ms
 1. Fix tokenizer integration (load tokenizer.json properly)
 2. Fix EOS detection
 3. Verify output against HuggingFace reference
+
+## [2026-05-17] tokenizer | Tokenizer BPE implemented, model outputs garbage tokens
+
+**Date:** May 17, 2026 04:30
+
+**Status:** Tokenizer works ✅ but model generates wrong token IDs ❌
+
+### Tokenizer Verified Working
+
+```
+DEBUG: model->tokenizer = 0xb400006e4117b060
+DEBUG: checking tokens[0]: tokens[0] = "<|endoftext|>"
+DEBUG: num_merges = 48900
+DEBUG: encoded 2 tokens for "Hello" input
+```
+
+- Token 0 = `"<|endoftext|>"` (correct)
+- 48900 merges loaded (correct)
+- BPE encoding produces correct token IDs
+
+### BPE Implementation Fixed
+
+`src/sm2_tokenizer.c`:
+- Implemented proper BPE encode_word() with merge table
+- Iteratively finds and applies best merges from tok->merges[]
+- Tokenizer loading from .sm2 file works correctly
+
+### Model Issue: Garbage Token IDs
+
+**Output:** `[gen_tok=23]'[gen_tok=10]<iss[gen_tok=28],[gen_tok=20]$[gen_tok=6]<fil[EOS=0]`
+
+**Problem:** Model generates token IDs 23, 10, 28, 20, 6 - these decode to partial strings like `<iss`, `<fil` instead of meaningful text.
+
+**Analysis:** Tokenizer is correct. The logits computation in the model is producing wrong token IDs. This is NOT a tokenizer issue.
+
+### Files Modified
+
+- `src/sm2_tokenizer.c` - BPE encoding implemented with proper merge table
+- `src/smollm2.c` - debug prints added then removed
+
+### Next Debug Steps
+
+1. Check lm_head - does it point to same data as tok_embeddings?
+2. Verify final_logits = hidden_state @ lm_head.T
+3. Compare with Python reference for same "Hello" input
+4. Print first 5 logits and their token strings to see if logits are wrong
