@@ -67,4 +67,5 @@ smollm2-135m-instruct-q4.sm2
 
 **Negative:**
 - Separate conversion step
-- Custom tooling needed
+- Separate tooling needed
+- Header corruption in v4/v5 (tensor_index_offset/size = 0), weights_offset hardcoded to 1,179,115 as workaround

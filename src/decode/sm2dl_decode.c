@@ -30,6 +30,9 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
     float* v = ctx->scratch.v;
     float* attn_out = ctx->scratch.attn_out;
     
+    fprintf(stderr, "DEBUG: forward_one_token ENTRY: x[0..2]={%f,%f,%f}, xb[0..2]={%f,%f,%f}\n",
+            x[0], x[1], x[2], xb[0], xb[1], xb[2]);
+    
     // ========================================================================
     // LAYER 0..n_layers-1
     // ========================================================================
@@ -44,6 +47,11 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
         float rms = sqrtf(sum_sq / (float)model->dim + spec->rms_eps);
         float scale = 1.0f / rms;
         
+        if (isnan(x[0]) || isnan(rms)) {
+            fprintf(stderr, "DEBUG: layer %d: x[0]=%f, sum_sq=%f, rms=%f, NaN detected BEFORE layernorm!\n", 
+                    layer, x[0], sum_sq, rms);
+        }
+        
         uint16_t* ln_weight = model->input_layernorm;  // Now contiguous array [n_layers * dim]
         if (ln_weight) {
             uint16_t* layer_ln = ln_weight + layer * model->dim;
@@ -54,6 +62,11 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
             for (int i = 0; i < model->dim; i++) {
                 xb[i] = x[i] * scale;
             }
+        }
+        
+        if (isnan(xb[0])) {
+            fprintf(stderr, "DEBUG: layer %d: xb[0]=%f AFTER layernorm, scale=%f, NaN!\n", 
+                    layer, xb[0], scale);
         }
         
         // ---- Q, K, V projections ----
@@ -218,10 +231,21 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
 // Decode next token - main entry point
 // CRITICAL: No allocation allowed in this function
 int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
-    // 1. Forward one token through the model
-    sm2dl_forward_one_token(ctx);
+    fprintf(stderr, "DEBUG: sm2dl_decode_next called, pos=%d\n", ctx->pos);
     
-// 2. Final RMSNorm
+    // 0. Debug: check scratch.x before forward
+    fprintf(stderr, "DEBUG: Before forward, x[0..2]={%f,%f,%f}\n", 
+            ctx->scratch.x[0], ctx->scratch.x[1], ctx->scratch.x[2]);
+    
+    // 1. Forward one token through the model
+    int result = sm2dl_forward_one_token(ctx);
+    if (result != 0) {
+        fprintf(stderr, "ERROR: sm2dl_forward_one_token returned %d\n", result);
+        *out_token = 0;
+        return result;
+    }
+    
+    // 2. Final RMSNorm
     if (ctx->model->final_norm) {
         float* vec = ctx->scratch.x;
         const sm2_spec* spec = sm2_get_spec(ctx->model->variant);
@@ -243,6 +267,9 @@ int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
         int vocab = ctx->model->vocab_size;
         int dim = ctx->model->dim;
         
+        fprintf(stderr, "DEBUG: Computing logits, vocab=%d, dim=%d, x[0..2]={%f,%f,%f}\n",
+                vocab, dim, ctx->scratch.x[0], ctx->scratch.x[1], ctx->scratch.x[2]);
+        
         for (int i = 0; i < vocab; i++) {
             float sum = 0.0f;
             for (int j = 0; j < dim; j++) {
@@ -251,6 +278,9 @@ int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
             }
             ctx->scratch.logits[i] = sum;
         }
+        
+        fprintf(stderr, "DEBUG: logits[0..2]={%f,%f,%f}\n",
+                ctx->scratch.logits[0], ctx->scratch.logits[1], ctx->scratch.logits[2]);
     }
     
     // 4. Sample token

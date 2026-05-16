@@ -258,6 +258,7 @@ typedef struct {
 typedef struct {
     float* x;           // input embedding [dim]
     float* xb;          // residual buffer [dim]
+    float* xb2;         // FFN temp buffer [max(dim, hidden_dim)]
     float* q;           // query [dim]
     float* k;           // key [n_kv_heads * head_dim]
     float* v;           // value [n_kv_heads * head_dim]
@@ -361,6 +362,9 @@ void sm2_debug_print_logits(sm2_context* ctx, int top_n);
 
 // Decode - generate next token (no malloc in hot path)
 int sm2_decode_next(sm2_context* ctx, int* out_token);
+
+// Fast decode path with no allocation
+int sm2dl_decode_next(sm2_context* ctx, int* out_token);
 
 // Streaming decode with callback
 typedef void (*sm2_stream_cb)(int token, void* user_data);

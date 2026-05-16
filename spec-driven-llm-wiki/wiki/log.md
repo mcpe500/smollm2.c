@@ -77,7 +77,58 @@ Updated spec-driven-llm-wiki to maximum completeness:
 - `tools/smollm2-convert.py`
 - `tokenizer.json`, `smollm2-135m.safetensors`, `smollm2-135m.sm2`
 
-**Next steps:**
-1. Fix magic byte in converter (remove trailing `\x01`)
-2. Test inference end-to-end
-3. Verify logits against HF reference
+## [2026-05-17] fix | Critical bugs fixed - Model now generates tokens
+
+**Date:** May 17, 2026 02:55 AM
+
+**Status:** ✅ Model generating valid tokens - SEGFAULT FIXED
+
+### Critical Bugs Fixed
+
+1. **down_proj matmul indexing** ✅
+   - Was: `down_proj[down_off + j * hidden_dim + i]` (wrong - row j, col i)
+   - Fixed: `down_proj[down_off + i * hidden_dim + j]` (correct - row i, col j)
+   - This was causing memory corruption that manifested as segfault
+
+2. **Post-attention RMSNorm** ✅
+   - Was: simple `xb[i] = xb[i] * weight[i]` (not RMSNorm)
+   - Fixed: proper RMSNorm formula: `xb[i] = (x[i] / rms) * weight[i]`
+   - Must compute `rms = sqrt(sum(x^2)/dim + eps)` first
+
+3. **sm2_decode_next sequence** ✅
+   - Was: sample first, then embed, then forward (WRONG)
+   - Fixed: embed → forward layers → compute logits → sample
+   - Tokens must be embedded through the model before sampling
+
+4. **Final RMSNorm** ✅
+   - Was: LayerNorm with mean subtraction
+   - Fixed: Pure RMSNorm (no mean subtraction)
+
+### Test Results
+
+```bash
+$ ./smollm2-cli -m smollm2-135m-v5.sm2 -p "Hello" -n 10
+Model loaded in 262.4 ms
+Prefill done in 618.7 ms
+Output: [gen_tok=23]'[gen_tok=10]<iss[gen_tok=28],[gen_tok=20]$[gen_tok=6]<fil[EOS=0]
+Generated 5 tokens in 3320.5 ms (664.1 ms/token)
+Total time: 3939.8 ms
+```
+
+### Files Modified
+
+- `src/sm2_context.c` - RMSNorm (final_norm, post_attention), FFN matmul indexing
+- `src/smollm2.c` - Fixed sm2_decode_next sequence order
+- `smollm2-135m-v5.sm2` - Regenerated model file
+
+### Known Remaining Issues
+
+1. **Tokenizer** - Uses byte fallback, full tokenizer.json not loaded
+2. **EOS detection** - Stops at ~5 tokens, token 0 selected too early
+3. **Output quality** - Not yet verified against HF reference
+
+### Next Steps
+
+1. Fix tokenizer integration (load tokenizer.json properly)
+2. Fix EOS detection
+3. Verify output against HuggingFace reference

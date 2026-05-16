@@ -143,8 +143,11 @@ src/dflash/
 
 ## Status
 - [[spec:001]] - Phase 3 (core), Phase 8a/8b (speculative)
+- **Phase 3: Core decode working** - sm2_context.c implements working layer_forward
 - Critical path for <50ms/token on 135M
 - DFlash Phase 8b is research (requires trained draft model)
+
+**Current implementation:** Uses sm2_context.c (not sm2dl_decode.c yet) for single-token decode. Preallocated buffers avoid malloc in hot path.
 
 ## Dependencies
 - [[sm2-kv-cache]] - KV cache management

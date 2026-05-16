@@ -54,3 +54,9 @@ input text
 ## Status
 - [[spec:001]] - tokenizer interface defined
 - Phase 1 implementation
+- ⚠️ **IN PROGRESS**: Current implementation uses byte fallback, full tokenizer.json integration pending
+
+**Tokenizer.json vs vocab.json+merges.txt:**
+SmolLM2 uses tokenizer.json (HuggingFace's single-file format containing vocab + merges as JSON). The converter embeds this in the .sm2 file at tokenizer_offset.
+
+**Current issue:** `sm2_tokenizer_encode()` not fully integrated, CLI falls back to byte-based encoding.

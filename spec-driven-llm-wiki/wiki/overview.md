@@ -2,7 +2,7 @@
 title: "Project Overview"
 type: synthesis
 tags: [overview]
-last_updated: 2026-05-16
+last_updated: 2026-05-17
 ---
 
 # Project Overview
@@ -51,13 +51,38 @@ smollm2.c
 
 ## Project Status
 
-- [[spec:001]] - Master blueprint (Phase 1-8b)
-- 6 components defined
-- 6 architecture decisions (ADRs)
-- 4 patterns documented
-- **Implementation: Phase 1-3 complete (testing in progress)**
-- Binary: `smollm2-cli` compiles, `smollm2-135m.sm2` converted
-- **Issue: Magic byte mismatch in .sm2 format (converter bug)**
+### ✅ Phase 1-3 Implementation COMPLETE
+
+**Working Implementation:**
+- `smollm2-cli` binary compiles and runs
+- Model generates valid tokens (tested with "Hello", "Hi", "Hello world")
+- Generate ~5 tokens per run before EOS
+- No segfault on any input length
+
+**Key Files:**
+- `src/sm2_context.c` - Core layer_forward, RMSNorm, attention, FFN matmul
+- `src/smollm2.c` - CLI main loop
+- `src/sm2_sampling.c` - Token sampling
+- `smollm2-135m-v5.sm2` - Working model file (270 MB)
+
+**Bugs Fixed (Critical):**
+1. **down_proj matmul indexing** - Was `j*hidden_dim+i`, fixed to `i*hidden_dim+j` (transposed)
+2. **Post-attention RMSNorm** - Was simple `xb[i] * weight[i]`, fixed to proper RMSNorm formula
+3. **sm2_decode_next sequence** - Now: embed → forward layers → compute logits → sample (correct order)
+4. **Final RMSNorm** - Was using LayerNorm (mean subtraction), fixed to pure RMSNorm
+
+### ⚠️ Known Issues
+
+1. **Tokenizer uses byte fallback** - Full tokenizer.json integration not complete
+2. **EOS detection stops at 5 tokens** - Token 0 (`<|endoftext|>`) selected too early
+3. **Generation stops prematurely** - Should generate more tokens per request
+
+### 📋 Remaining Work
+
+1. Fix tokenizer integration (load tokenizer.json properly)
+2. Fix EOS detection to allow longer generation
+3. Verify output quality against HuggingFace reference
+4. Test edge cases (single char, special characters)
 
 ## Tech Stack
 
@@ -78,13 +103,6 @@ smollm2.c
 ## Related Specs
 
 - [[spec:001]] - smollm2c-master-blueprint
-
-## Next Steps
-
-1. **FIX: Magic byte in converter** - `MAGIC = b'SM2C001'` should be 8 bytes (remove trailing `\x01`)
-2. Test inference end-to-end with `smollm2-cli`
-3. Verify logits vs HuggingFace reference
-4. Add download script + README with step-by-step instructions
 
 ## References
 

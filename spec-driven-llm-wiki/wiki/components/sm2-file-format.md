@@ -141,4 +141,6 @@ int sm2_mmap_model(const char *path, sm2_model **out_model) {
 
 ## Status
 - [[spec:001]] - Phase 1 implementation
-- Critical for model loading
+- ✅ Working: smollm2-135m-v5.sm2 generated and loaded successfully
+- Magic bytes: SM2C001 (8 bytes, correct)
+- Hardcoded weights_offset workaround: 1,179,115 bytes (header had corruption)

@@ -176,24 +176,7 @@ static int run_inference(sm2_model* model, const cli_args* args) {
         
         // DEBUG: Print logits before sampling on first token
         if (gen_tokens == 0) {
-            float* logits = ctx->scratch.logits;
-            fprintf(stderr, "\nDEBUG: params: temp=%f, top_p=%d, top_k=%d\n", 
-                    ctx->params.temperature, ctx->params.top_p, ctx->params.top_k);
-            fprintf(stderr, "DEBUG: First 5 logits: ");
-            for (int i = 0; i < 5; i++) {
-                fprintf(stderr, "[%d]=%.4f ", i, logits[i]);
-            }
-            fprintf(stderr, "\n");
-            // Find max logit
-            float max_logit = logits[0];
-            int max_idx = 0;
-            for (int i = 1; i < ctx->model->vocab_size; i++) {
-                if (logits[i] > max_logit) {
-                    max_logit = logits[i];
-                    max_idx = i;
-                }
-            }
-            fprintf(stderr, "DEBUG: max logit at [%d] = %.4f\n", max_idx, max_logit);
+            // First token only - keep minimal debug
         }
         
         // TEMPORARY: Skip EOS check for first 3 tokens to see actual output
