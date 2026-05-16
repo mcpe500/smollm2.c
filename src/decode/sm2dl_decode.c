@@ -44,10 +44,11 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
         float rms = sqrtf(sum_sq / (float)model->dim + spec->rms_eps);
         float scale = 1.0f / rms;
         
-        float* ln_weight = model->input_layernorm ? model->input_layernorm->data : NULL;
+        uint16_t* ln_weight = model->input_layernorm;  // Now contiguous array [n_layers * dim]
         if (ln_weight) {
+            uint16_t* layer_ln = ln_weight + layer * model->dim;
             for (int i = 0; i < model->dim; i++) {
-                xb[i] = x[i] * scale * ln_weight[i];
+                xb[i] = x[i] * scale * sm2_f16_to_float(layer_ln[i]);
             }
         } else {
             for (int i = 0; i < model->dim; i++) {
@@ -56,33 +57,39 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
         }
         
         // ---- Q, K, V projections ----
-        // Placeholder: identity matrix (real impl uses actual weights)
+        // With actual weights
         int q_size = model->dim;
         int kv_size = model->n_kv_heads * model->head_dim;
         
-        // Q projection
+        // Q projection: q = xb @ q_proj.T, q_proj is [dim, dim] row-major
+        size_t q_off = (size_t)layer * model->dim * model->dim;
         for (int i = 0; i < q_size; i++) {
             float sum = 0.0f;
             for (int j = 0; j < model->dim; j++) {
-                sum += xb[j] * (i < model->dim && j < model->dim ? 1.0f : 0.0f);
+                uint16_t w = model->q_proj[q_off + j * model->dim + i];  // [j][i]
+                sum += xb[j] * sm2_f16_to_float(w);
             }
             q[i] = sum;
         }
         
-        // K projection
+        // K projection: k = xb @ k_proj.T, k_proj is [kv_dim, dim] row-major
+        size_t k_off = (size_t)layer * kv_size * model->dim;
         for (int i = 0; i < kv_size; i++) {
             float sum = 0.0f;
             for (int j = 0; j < model->dim; j++) {
-                sum += xb[j] * (i < kv_size && j < model->dim ? 1.0f : 0.0f);
+                uint16_t w = model->k_proj[k_off + j * kv_size + i];  // [j][i]
+                sum += xb[j] * sm2_f16_to_float(w);
             }
             k[i] = sum;
         }
         
-        // V projection
+        // V projection: v = xb @ v_proj.T, v_proj is [kv_dim, dim] row-major
+        size_t v_off = (size_t)layer * kv_size * model->dim;
         for (int i = 0; i < kv_size; i++) {
             float sum = 0.0f;
             for (int j = 0; j < model->dim; j++) {
-                sum += xb[j] * (i < kv_size && j < model->dim ? 1.0f : 0.0f);
+                uint16_t w = model->v_proj[v_off + j * kv_size + i];  // [j][i]
+                sum += xb[j] * sm2_f16_to_float(w);
             }
             v[i] = sum;
         }
@@ -132,14 +139,76 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
         }
         
         // ---- O projection + residual ----
+        // o_proj is [dim, dim] row-major
+        size_t o_off = (size_t)layer * model->dim * model->dim;
         for (int i = 0; i < model->dim; i++) {
             float sum = 0.0f;
             for (int j = 0; j < model->dim; j++) {
-                sum += attn_out[j] * (i < model->dim && j < model->dim ? 1.0f : 0.0f);
+                uint16_t w = model->o_proj[o_off + j * model->dim + i];  // [j][i]
+                sum += attn_out[j] * sm2_f16_to_float(w);
             }
             // Residual connection
-            x[i] = xb[i] + sum;  // x now holds residual
-            // xb will hold next layer's input
+            x[i] = xb[i] + sum;
+        }
+        
+        // ---- Post-attention RMSNorm ----
+        uint16_t* post_ln = model->post_attention_layernorm + layer * model->dim;
+        float sum_sq2 = 0.0f;
+        for (int i = 0; i < model->dim; i++) {
+            sum_sq2 += x[i] * x[i];
+        }
+        float rms2 = sqrtf(sum_sq2 / (float)model->dim + spec->rms_eps);
+        float scale2 = 1.0f / rms2;
+        
+        for (int i = 0; i < model->dim; i++) {
+            xb[i] = x[i] * scale2 * sm2_f16_to_float(post_ln[i]);
+        }
+        
+        // ---- SwiGLU FFN ----
+        int hidden = model->hidden_dim;
+        
+        // gate_proj: [hidden_dim, dim] -> [hidden]
+        size_t gate_off = (size_t)layer * hidden * model->dim;
+        for (int i = 0; i < hidden; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < model->dim; j++) {
+                uint16_t w = model->gate_proj[gate_off + j * hidden + i];  // [j][i]
+                sum += xb[j] * sm2_f16_to_float(w);
+            }
+            q[i] = sum;  // reuse q buffer for gate
+        }
+        
+        // up_proj: [hidden_dim, dim] -> [hidden]
+        size_t up_off = (size_t)layer * hidden * model->dim;
+        for (int i = 0; i < hidden; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < model->dim; j++) {
+                uint16_t w = model->up_proj[up_off + j * hidden + i];  // [j][i]
+                sum += xb[j] * sm2_f16_to_float(w);
+            }
+            k[i] = sum;  // reuse k buffer for up
+        }
+        
+        // Apply silu to gate: silu(x) = x * sigmoid(x)
+        for (int i = 0; i < hidden; i++) {
+            float s = 1.0f / (1.0f + expf(-q[i]));
+            q[i] = q[i] * s;
+        }
+        
+        // Multiply: gate = silu(gate) * up
+        for (int i = 0; i < hidden; i++) {
+            q[i] = q[i] * k[i];
+        }
+        
+        // down_proj: [dim, hidden_dim] -> [dim]
+        size_t down_off = (size_t)layer * model->dim * hidden;
+        for (int i = 0; i < model->dim; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < hidden; j++) {
+                uint16_t w = model->down_proj[down_off + j * model->dim + i];  // [j][i]
+                sum += q[j] * sm2_f16_to_float(w);
+            }
+            x[i] = xb[i] + sum;
         }
     }
     
@@ -152,10 +221,20 @@ int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
     // 1. Forward one token through the model
     sm2dl_forward_one_token(ctx);
     
-    // 2. Final RMSNorm
+// 2. Final RMSNorm
     if (ctx->model->final_norm) {
-        sm2_rmsnorm_inplace(ctx->scratch.x, ctx->model->final_norm->data, 
-                           ctx->model->dim, 1e-5f);
+        float* vec = ctx->scratch.x;
+        const sm2_spec* spec = sm2_get_spec(ctx->model->variant);
+        float sum_sq = 0.0f;
+        for (int i = 0; i < ctx->model->dim; i++) {
+            sum_sq += vec[i] * vec[i];
+        }
+        float rms = sqrtf(sum_sq / (float)ctx->model->dim + spec->rms_eps);
+        float scale = 1.0f / rms;
+        uint16_t* fn = ctx->model->final_norm;  // [dim] of F16
+        for (int i = 0; i < ctx->model->dim; i++) {
+            vec[i] = vec[i] * scale * sm2_f16_to_float(fn[i]);
+        }
     }
     
     // 3. Compute logits (embedding matrix multiply)

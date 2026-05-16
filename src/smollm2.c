@@ -124,12 +124,24 @@ static int run_inference(sm2_model* model, const cli_args* args) {
     int tokens[4096];
     int n_tokens = 0;
     
-    // For now, use simple tokenization (bytes)
-    // TODO: integrate proper tokenizer
-    const char* prompt = args->prompt;
-    for (int i = 0; prompt[i] && i < 4096; i++) {
-        tokens[i] = (unsigned char)prompt[i];
-        n_tokens++;
+    // Use proper BPE tokenizer if available
+    if (model->tokenizer) {
+        n_tokens = sm2_tokenizer_encode(model->tokenizer, args->prompt, tokens, 4096);
+        if (n_tokens <= 0) {
+            fprintf(stderr, "Tokenization failed, falling back to byte mode\n");
+            const char* prompt = args->prompt;
+            for (int i = 0; prompt[i] && i < 4096; i++) {
+                tokens[i] = (unsigned char)prompt[i];
+                n_tokens++;
+            }
+        }
+    } else {
+        // Fallback: simple byte tokenization
+        const char* prompt = args->prompt;
+        for (int i = 0; prompt[i] && i < 4096; i++) {
+            tokens[i] = (unsigned char)prompt[i];
+            n_tokens++;
+        }
     }
     
     printf("Processing %d tokens...\n", n_tokens);
@@ -157,12 +169,53 @@ static int run_inference(sm2_model* model, const cli_args* args) {
         double dt = time_ms() - t1;
         total_decode_time += dt;
         
-        if (ok != 0 || token == 2) { // EOS
+        if (ok != 0) { // Error
+            fprintf(stderr, "[decode_err=%d]", ok);
             break;
         }
         
-        // Print token (as byte for now)
-        putchar(token >= 32 && token < 127 ? token : '?');
+        // DEBUG: Print logits before sampling on first token
+        if (gen_tokens == 0) {
+            float* logits = ctx->scratch.logits;
+            fprintf(stderr, "\nDEBUG: params: temp=%f, top_p=%d, top_k=%d\n", 
+                    ctx->params.temperature, ctx->params.top_p, ctx->params.top_k);
+            fprintf(stderr, "DEBUG: First 5 logits: ");
+            for (int i = 0; i < 5; i++) {
+                fprintf(stderr, "[%d]=%.4f ", i, logits[i]);
+            }
+            fprintf(stderr, "\n");
+            // Find max logit
+            float max_logit = logits[0];
+            int max_idx = 0;
+            for (int i = 1; i < ctx->model->vocab_size; i++) {
+                if (logits[i] > max_logit) {
+                    max_logit = logits[i];
+                    max_idx = i;
+                }
+            }
+            fprintf(stderr, "DEBUG: max logit at [%d] = %.4f\n", max_idx, max_logit);
+        }
+        
+        // TEMPORARY: Skip EOS check for first 3 tokens to see actual output
+        if (gen_tokens >= 3 && (token == 0 || token == 2)) { // EOS (<|endoftext|> or <|im_end|>)
+            fprintf(stderr, "[EOS=%d]\n", token);
+            break;
+        }
+        
+        // Print token using tokenizer decode if available
+        fprintf(stderr, "[gen_tok=%d]", token);  // DEBUG
+        if (model->tokenizer && token >= 0 && token < model->vocab_size) {
+            char* decoded = sm2_tokenizer_decode(model->tokenizer, &token, 1);
+            if (decoded && decoded[0] != '\0') {
+                fputs(decoded, stdout);
+                free(decoded);
+            } else {
+                // Debug: print token ID if decode fails
+                putchar(token >= 32 && token < 127 ? token : '?');
+            }
+        } else {
+            putchar(token >= 32 && token < 127 ? token : '?');
+        }
         fflush(stdout);
         gen_tokens++;
     }

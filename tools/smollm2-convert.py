@@ -22,6 +22,9 @@ MODEL_CONFIGS = {
         "n_kv_heads": 3,
         "head_dim": 64,
         "vocab_size": 49152,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_token_id": 0,
     },
     "360M": {
         "variant": "smollm2-360m",
@@ -33,6 +36,9 @@ MODEL_CONFIGS = {
         "n_kv_heads": 5,
         "head_dim": 64,
         "vocab_size": 49152,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_token_id": 0,
     },
     "1.7B": {
         "variant": "smollm2-1.7b",
@@ -44,6 +50,9 @@ MODEL_CONFIGS = {
         "n_kv_heads": 8,
         "head_dim": 64,
         "vocab_size": 49152,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_token_id": 0,
     },
 }
 
@@ -118,45 +127,29 @@ def read_safetensors(path):
 
 
 def bf16_to_f16(bf16_bytes):
-    """Convert BF16 bytes to F16 bytes (list of uint16)."""
-    n = len(bf16_bytes) // 2
-    out = []
-    for i in range(n):
-        bf16 = struct.unpack('<H', bf16_bytes[i*2:i*2+2])[0]
-        # BF16: sign(1) + exp(8) + mantissa(7)
-        # F16:  sign(1) + exp(5) + mantissa(10)
-        s  = (bf16 >> 15) & 0x1
-        be = (bf16 >> 7) & 0xFF   # BF16 exponent (8 bits)
-        bm = bf16 & 0x7F          # BF16 mantissa (7 bits)
-        
-        if be == 0xFF:
-            # Inf or NaN
-            if bm == 0:
-                f16 = (s << 15) | (0x1F << 10)  # Inf
-            else:
-                f16 = (s << 15) | (0x1F << 10) | (1 << 9)  # NaN (quiet)
-        else:
-            # Normalize BF16 exponent: bias 127 -> F16 bias 15
-            exp = be - 127 + 15
-            if exp >= 0x1F:
-                f16 = (s << 15) | (0x1F << 10)  # Inf
-            elif exp <= 0:
-                # Denormal to F16
-                if exp >= -10:
-                    m = (1 << 10) | (bm << 3)
-                    shift = 1 - exp
-                    f16 = (s << 15) | (m >> shift)
-                else:
-                    f16 = 0
-            else:
-                # Normal
-                f16 = (s << 15) | ((exp & 0x1F) << 10) | (bm << 3)
-                # Truncate to 10-bit mantissa
-        
-        out.append(struct.pack('<H', f16))
+    """Convert BF16 bytes to F16 bytes using numpy for speed."""
+    import numpy as np
     
-    result = b''.join(out)
-    return result
+    arr = np.frombuffer(bf16_bytes, dtype=np.uint16).copy()
+    s = (arr >> 15) & 0x1
+    be = (arr >> 7) & 0xFF
+    bm = arr & 0x7F
+    
+    # Handle inf and nan
+    inf_mask = (be == 0xFF) & (bm == 0)
+    nan_mask = (be == 0xFF) & (bm != 0)
+    
+    # Normal numbers: exp = be - 127 + 15, clip to [0, 0x1F]
+    exp = np.clip(be.astype(np.int32) - 127 + 15, 0, 0x1F).astype(np.uint16)
+    
+    # Compute f16: sign | exp | mantissa
+    f16 = (s.astype(np.uint16) << 15) | (exp << 10) | (bm << 3)
+    
+    # Apply inf/nan overrides
+    f16 = np.where(inf_mask, (s.astype(np.uint16) << 15) | (0x1F << 10), f16)
+    f16 = np.where(nan_mask, (s.astype(np.uint16) << 15) | (0x1F << 10) | (1 << 9), f16)
+    
+    return f16.tobytes()
 
 
 def f16_to_float(f16_bytes):
@@ -210,7 +203,7 @@ def read_tokenizer_json(path):
 def write_sm2(path, config, tensors, id_to_token, merges):
     """Write .sm2 binary file."""
     
-    MAGIC = b'SM2C001'
+    MAGIC = b'SM2C001\x00'  # 8 bytes, null-padded for C memcmp
     VERSION = 1
     
     # Map safetensor names -> .sm2 layer field names
@@ -237,20 +230,20 @@ def write_sm2(path, config, tensors, id_to_token, merges):
         f.write(struct.pack('<I', 0))                    # 4 bytes  (20-23) flags
         
         # Config block (8 x u32 = 32 bytes) (24-55)
+        # Order MUST match sm2_file_header: vocab_size, n_layers, dim, hidden_dim, n_heads, n_kv_heads, head_dim, max_seq_len
         cfg = struct.pack('<IIIIIIII',
-            config['n_layers'],
-            config['dim'],
-            config['hidden_dim'],
-            config['n_heads'],
-            config['n_kv_heads'],
-            config['head_dim'],
-            config['vocab_size'],
-            0,  # quant_type repeated
+            config['vocab_size'],   # 0: vocab_size
+            config['n_layers'],      # 1: n_layers
+            config['dim'],           # 2: dim
+            config['hidden_dim'],    # 3: hidden_dim
+            config['n_heads'],       # 4: n_heads
+            config['n_kv_heads'],    # 5: n_kv_heads
+            config['head_dim'],      # 6: head_dim
+            config.get('max_seq_len', 2048),  # 7: max_seq_len
         )
         f.write(cfg)
         
-        # max_seq_len + rms_eps + rope_theta (4 + 4 + 4 = 12 bytes) (56-67)
-        f.write(struct.pack('<I', config.get('max_seq_len', 2048)))
+        # rms_eps + rope_theta (4 + 4 = 8 bytes) (56-63)
         f.write(struct.pack('<f', 1e-5))
         f.write(struct.pack('<f', 100000.0))
         
@@ -312,6 +305,15 @@ def write_sm2(path, config, tensors, id_to_token, merges):
         for layer in range(config['n_layers']):
             layer_prefix = f'model.layers.{layer}'
             
+            def safe_write_tensor(f, val):
+                """Write tensor shape (2D or 1D) and data."""
+                shape = val['shape']
+                if len(shape) == 1:
+                    f.write(struct.pack('<II', 1, shape[0]))
+                else:
+                    f.write(struct.pack('<II', *shape))
+                f.write(bf16_to_f16(val['data']))
+            
             def write_tensor(prefix):
                 name = f'{layer_prefix}.{prefix}'
                 t = None
@@ -331,9 +333,7 @@ def write_sm2(path, config, tensors, id_to_token, merges):
                     raise ValueError(f"Tensor not found: {name} (tried prefix={prefix})")
                 
                 key, val = t
-                f16_data = bf16_to_f16(val['data'])
-                f.write(struct.pack('<II', *val['shape']))
-                f.write(f16_data)
+                safe_write_tensor(f, val)
             
             # input_layernorm
             t = None
@@ -341,75 +341,65 @@ def write_sm2(path, config, tensors, id_to_token, merges):
                 if f'.layers.{layer}.' in key and 'input_layernorm.weight' in key:
                     t = val; break
             if t:
-                f.write(struct.pack('<II', *t['shape']))
-                f.write(bf16_to_f16(t['data']))
+                safe_write_tensor(f, t)
             
             # q_proj (dim x dim)
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'q_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # k_proj (n_kv_heads*head_dim x dim)
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'k_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # v_proj (n_kv_heads*head_dim x dim)
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'v_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # o_proj (dim x n_kv_heads*head_dim)
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'o_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # post_attention_layernorm
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'post_attention_layernorm.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # gate_proj (hidden_dim x dim) = SwiGLU gate
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'gate_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # up_proj (hidden_dim x dim)
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'up_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
             
             # down_proj (dim x hidden_dim)
             for key, val in tensors.items():
                 if f'.layers.{layer}.' in key and 'down_proj.weight' in key:
-                    f.write(struct.pack('<II', *val['shape']))
-                    f.write(bf16_to_f16(val['data']))
+                    safe_write_tensor(f, val)
                     break
         
         # ---- final_norm ----
         for key, val in tensors.items():
             if key == 'model.norm.weight':
-                f.write(struct.pack('<II', *val['shape']))
-                f.write(bf16_to_f16(val['data']))
+                safe_write_tensor(f, val)
                 break
 
         # ---- Update header offsets ----
         file_size = f.tell()
-        weights_offset = 256  # weights start right after header
+        weights_offset = tokenizer_end  # weights start after tokenizer
         weights_size = file_size - weights_offset
 
         f.seek(80)  # back to offsets position in header

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 // ============================================================================
 // SMOLLM2.C - Decode-First SmolLM2 Inference Engine
@@ -172,6 +173,9 @@ typedef struct {
 // MODEL WEIGHTS STRUCTURE
 // ============================================================================
 
+// Forward declaration - tokenizer is defined later
+typedef struct sm2_tokenizer sm2_tokenizer;
+
 typedef struct {
     sm2_variant variant;
     sm2_quant_type quant_type;
@@ -179,18 +183,22 @@ typedef struct {
     // Embedding + output (shared for tie_word_embeddings)
     sm2_tensor_f16* tok_embeddings;    // [vocab, dim]
     
-    // Layer weights (allocated per layer)
-    sm2_tensor_f16* input_layernorm;  // [dim]
-    sm2_tensor_f16* q_proj;           // [dim, dim] or quantized
-    sm2_tensor_f16* k_proj;           // [dim, n_kv_heads * head_dim]
-    sm2_tensor_f16* v_proj;           // [dim, n_kv_heads * head_dim]
-    sm2_tensor_f16* o_proj;           // [n_kv_heads * head_dim, dim]
-    sm2_tensor_f16* post_attention_layernorm; // [dim]
-    sm2_tensor_f16* gate_proj;        // [dim, hidden_dim]
-    sm2_tensor_f16* up_proj;          // [dim, hidden_dim]
-    sm2_tensor_f16* down_proj;        // [hidden_dim, dim]
-    
-    sm2_tensor_f16* final_norm;       // [dim]
+    // Layer weights (allocated as arrays per layer)
+    // 1D weights: [n_layers * dim] of F16 (stored as uint16_t)
+    uint16_t* input_layernorm;        // [n_layers * dim]
+    uint16_t* post_attention_layernorm; // [n_layers * dim]
+    uint16_t* final_norm;             // [dim] (not per-layer)
+
+    // 2D weights: [n_layers * rows * cols] of F16
+    uint16_t* q_proj;                 // [n_layers * dim * dim]
+    uint16_t* k_proj;                 // [n_layers * kv_dim * dim]
+    uint16_t* v_proj;                 // [n_layers * kv_dim * dim]
+    uint16_t* o_proj;                 // [n_layers * dim * kv_dim]
+    uint16_t* gate_proj;              // [n_layers * hidden_dim * dim]
+    uint16_t* up_proj;                // [n_layers * hidden_dim * dim]
+    uint16_t* down_proj;              // [n_layers * hidden_dim * dim]
+
+    sm2_tokenizer* tokenizer;         // loaded from .sm2 file
     
     int n_layers;
     int dim;
@@ -284,7 +292,7 @@ typedef struct {
 // TOKENIZER
 // ============================================================================
 
-typedef struct {
+typedef struct sm2_tokenizer {
     int vocab_size;
     char** tokens;
     float* scores;
@@ -347,6 +355,10 @@ void sm2_kv_free_page(sm2_kv_pool* pool, uint32_t page_id);
 // Prefill - process prompt tokens
 int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens);
 
+// Add after sm2_prefill declaration in include/smollm2.h
+// Debug: print top logits
+void sm2_debug_print_logits(sm2_context* ctx, int top_n);
+
 // Decode - generate next token (no malloc in hot path)
 int sm2_decode_next(sm2_context* ctx, int* out_token);
 
@@ -392,6 +404,7 @@ int sm2_tokenizer_init(const char* vocab_path, const char* merges_path, sm2_toke
 void sm2_tokenizer_free(sm2_tokenizer* tok);
 int sm2_tokenizer_encode(sm2_tokenizer* tok, const char* text, int* ids, int max_len);
 char* sm2_tokenizer_decode(sm2_tokenizer* tok, const int* ids, int n_ids);
+int sm2_load_tokenizer_from_sm2(sm2_tokenizer* tok, FILE* f, uint64_t offset, uint64_t size);
 
 // ============================================================================
 // SERVER API (Phase 6)
