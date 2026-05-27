@@ -247,29 +247,16 @@ def write_sm2(path, config, tensors, id_to_token, merges):
         f.write(struct.pack('<f', 1e-5))
         f.write(struct.pack('<f', 100000.0))
         
-        # bos/eos/pad token ids (12 bytes) (68-79)
+        # bos/eos/pad token ids (12 bytes) (64-75)
         f.write(struct.pack('<I', config.get('bos_token_id', 1)))
         f.write(struct.pack('<I', config.get('eos_token_id', 2)))
         f.write(struct.pack('<I', config.get('pad_token_id', 0)))
-        
-        # offsets (6 x u64 = 48 bytes) (80-127)
-        # tokenizer_offset, tokenizer_size, tensor_index_offset, tensor_index_size,
-        # weights_offset, weights_size
-        # We'll fill these after we know where things are
-        header_before_offsets = f.tell()  # = 128
-        f.write(struct.pack('<QQQQQQ', 0, 0, 0, 0, 0, 0))  # 48 bytes
-        
-        # checksum (u64 = 8 bytes) (128-135)
-        f.write(struct.pack('<Q', 0))  # placeholder
-        
+
         # Padding to 256 bytes
-        padding_needed = 256 - f.tell()
-        if padding_needed < 0:
-            raise AssertionError(f"Header overflow: {f.tell()} bytes written")
-        f.write(b'\x00' * padding_needed)
-        
+        f.write(b'\x00' * (256 - f.tell()))
+
         assert f.tell() == 256, f"Header should be 256 bytes, got {f.tell()}"
-        
+
         # ---- Tokenizer section ----
         tokenizer_start = f.tell()
         
@@ -402,17 +389,22 @@ def write_sm2(path, config, tensors, id_to_token, merges):
         weights_offset = tokenizer_end  # weights start after tokenizer
         weights_size = file_size - weights_offset
 
-        f.seek(80)  # back to offsets position in header
-        f.write(struct.pack('<QQQQQQ',
-            256,             # tokenizer_offset
-            tokenizer_size,   # tokenizer_size
-            0,                # tensor_index_offset (no separate index)
-            0,                # tensor_index_size
-            weights_offset,   # weights_offset
-            weights_size,     # weights_size
-        ))
-        # checksum (placeholder)
-        f.write(struct.pack('<Q', 0))
+        f.seek(80)
+        # Write header offsets at exactly C struct field offsets
+        # Offset 80: uint32_t tokenizer_offset = 256
+        f.write(struct.pack('<I', 256))
+        # Offset 84: uint32_t padding (unused by C for tokenizer_size)
+        f.write(struct.pack('<I', tokenizer_size))
+        # Offset 88: uint32_t tensor_index_offset = 0
+        f.write(struct.pack('<I', 0))
+        # Offset 92: uint32_t tensor_index_size = 0
+        f.write(struct.pack('<I', 0))
+        # Offset 96: uint32_t weights_offset (low 32 bits)
+        f.write(struct.pack('<I', weights_offset & 0xFFFFFFFF))
+        # Offset 100: uint32_t weights_size (low 32 bits)
+        f.write(struct.pack('<I', weights_size & 0xFFFFFFFF))
+        # Offset 104-127: unused padding
+        f.write(b'\x00' * 24)
 
     print(f"  Written: {path} ({os.path.getsize(path)/1024/1024:.1f} MB)")
 

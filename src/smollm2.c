@@ -44,6 +44,7 @@ typedef struct {
     float temperature;
     int top_p;
     int top_k;
+    float repetition_penalty;
     int interactive;
 } cli_args;
 
@@ -53,6 +54,10 @@ static void print_help(const char* prog) {
     printf("  -m, --model <path>    Model file (.sm2)\n");
     printf("  -p, --prompt <text>   Input prompt\n");
     printf("  -n, --max-output <n> Max tokens (default: 50)\n");
+    printf("  -t, --temp <x>       Temperature (0.0=greedy, 0.7=recommended, 1.0=creative)\n");
+    printf("  -q, --top-p <n>      Top-p nucleus sampling (0-100, default: 90)\n");
+    printf("  -k, --top-k <n>      Top-k sampling (0=disabled)\n");
+    printf("  -r, --rep-penalty <x> Repetition penalty (1.0=off, 1.3=recommended)\n");
     printf("  -h, --help           Show help\n");
 }
 
@@ -63,9 +68,10 @@ static cli_args parse_args(int argc, char** argv) {
         .ctx_size = 2048,
         .max_output = 50,
         .n_threads = 4,
-        .temperature = 0.0f,
-        .top_p = 100,
-        .top_k = 0,
+        .temperature = 0.7f,    // Default to 0.7 for diverse output (like Ollama)
+        .top_p = 90,            // Nucleus sampling (0 = disabled)
+        .top_k = 0,             // No top-k by default
+        .repetition_penalty = 1.0f,
         .interactive = 0,
     };
 
@@ -76,7 +82,15 @@ static cli_args parse_args(int argc, char** argv) {
             args.prompt = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-output") == 0) {
             args.max_output = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) {
+            args.temperature = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--top-p") == 0) {
+            args.top_p = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0) {
+            args.top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0) {
+			args.repetition_penalty = atof(argv[++i]);
+		} else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_help(argv[0]);
             exit(0);
         }
@@ -114,18 +128,26 @@ static int run_inference(sm2_model* model, const cli_args* args) {
     ctx->params.top_k = args->top_k;
     ctx->params.max_context = args->ctx_size;
     ctx->params.max_output = args->max_output;
+    ctx->params.repetition_penalty = args->repetition_penalty;
 
-    // Byte tokenization for input (no BOS - SmolLM2 handles this internally)
+    // BPE tokenization for input using the loaded tokenizer
     int tokens[4096];
     int n_tokens = 0;
 
-    for (int i = 0; args->prompt[i] && n_tokens < 4096; i++) {
-        unsigned char byte_val = (unsigned char)args->prompt[i];
-        // Use tokenizer's byte_to_token mapping to convert byte to correct vocab token
-        if (model->tokenizer && model->tokenizer->byte_to_token) {
-            tokens[n_tokens++] = model->tokenizer->byte_to_token[byte_val];
-        } else {
-            tokens[n_tokens++] = byte_val;
+    if (model->tokenizer) {
+        // Use proper BPE tokenizer (like HF does)
+        n_tokens = sm2_tokenizer_encode(model->tokenizer, args->prompt, tokens, 4096);
+    }
+
+    // Fallback to byte tokenization if tokenizer not available
+    if (n_tokens == 0) {
+        for (int i = 0; args->prompt[i] && n_tokens < 4096; i++) {
+            unsigned char byte_val = (unsigned char)args->prompt[i];
+            if (model->tokenizer && model->tokenizer->byte_to_token) {
+                tokens[n_tokens++] = model->tokenizer->byte_to_token[byte_val];
+            } else {
+                tokens[n_tokens++] = byte_val;
+            }
         }
     }
 

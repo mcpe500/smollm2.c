@@ -284,7 +284,7 @@ int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
     }
     
     // 4. Sample token
-    int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state);
+    int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state, ctx);
     
     // 5. Update state (NO ALLOCATION)
     ctx->pos++;

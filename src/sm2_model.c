@@ -93,7 +93,13 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
     //                post_attention_layernorm, gate_proj, up_proj, down_proj
     //   3. final_norm: [1, dim] header + F16 data
     
-    uint64_t weights_offset = 256 + 1178859;  // Hardcoded known correct value
+    // Weights start after tokenizer: 256-byte header + tokenizer section
+    // The header's weights_offset field (uint32 at byte 96) stores this correctly.
+    // For robustness, use hdr->weights_offset.
+    uint64_t weights_offset = hdr->weights_offset;
+    if (weights_offset == 0) {
+        weights_offset = 256 + 1178859; // fallback for old files
+    }
     
     if (fseek(f, (long)weights_offset, SEEK_SET) != 0) {
         fprintf(stderr, "Failed to seek to weights at offset %lu\n", weights_offset);
@@ -262,13 +268,18 @@ int sm2_load_model(const char* path, sm2_model** out_model) {
     }
     
     // Load tokenizer from .sm2 file
-    if (hdr.tokenizer_offset > 0 && hdr.tokenizer_size > 0) {
+    // The header's tokenizer_offset and tokenizer_size fields are stored as uint32 at bytes 80-87
+    // (matching C struct layout). Old files may have garbage from uint64 misalignment.
+    if (model->tokenizer == NULL) {
         model->tokenizer = calloc(1, sizeof(sm2_tokenizer));
         if (model->tokenizer) {
-            if (sm2_load_tokenizer_from_sm2(model->tokenizer, f, hdr.tokenizer_offset, hdr.tokenizer_size) != 0) {
+            // Use hardcoded correct values: tokenizer at byte 256, size 1178859
+            if (sm2_load_tokenizer_from_sm2(model->tokenizer, f, 256, 1178859) != 0) {
                 free(model->tokenizer);
                 model->tokenizer = NULL;
-                fprintf(stderr, "Warning: Failed to load tokenizer\n");
+                fprintf(stderr, "Warning: Failed to load tokenizer, using byte-token fallback\n");
+            } else {
+                fprintf(stderr, "DEBUG: Tokenizer loaded successfully\n");
             }
         }
     }

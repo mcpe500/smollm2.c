@@ -271,6 +271,10 @@ typedef struct {
     float** k_cache;    // per-layer K cache [n_layers][n_kv_heads][max_seq][head_dim]
     float** v_cache;    // per-layer V cache [n_layers][n_kv_heads][max_seq][head_dim]
     int kv_cache_len;   // current number of positions in KV cache
+    // Repetition penalty: tracking recent tokens
+    int* recent_tokens; // ring buffer of recent token IDs
+    int recent_head;    // index into ring buffer
+    int recent_max;     // max size of ring buffer
 } sm2_scratch;
 
 // Generation parameters
@@ -280,6 +284,8 @@ typedef struct {
     int top_k;
     int max_context;
     int max_output;
+    float repetition_penalty;    // penalty for repeated tokens (1.0 = disabled)
+    int penalty_window;          // how many recent tokens to check for repetition
 } sm2_generate_params;
 
 // Main inference context
@@ -382,7 +388,8 @@ typedef void (*sm2_stream_cb)(int token, void* user_data);
 int sm2_decode_stream(sm2_context* ctx, int max_new_tokens, sm2_stream_cb cb, void* user_data);
 
 // Sampling utilities
-int sm2_sample_token(const float* logits, const sm2_generate_params* params, uint64_t* rng_state);
+int sm2_sample_token(const float* logits, const sm2_generate_params* params, uint64_t* rng_state,
+                     sm2_context* ctx);
 float sm2_sample_temperature(float x, float temp, uint64_t* rng_state);
 
 // RoPE (Rotary Position Embedding)

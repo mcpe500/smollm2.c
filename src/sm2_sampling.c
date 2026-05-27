@@ -3,7 +3,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "smollm2.h"
+
+// ============================================================================
+// REPETITION PENALTY
+// Applied to logits before sampling to reduce token repetition
+// ============================================================================
+
+void sm2_apply_repetition_penalty(float* logits, int vocab_size,
+                                 const int* recent_tokens, int n_recent,
+                                 float penalty) {
+    if (penalty <= 1.0f || n_recent <= 0) return;
+
+    // Divide logits for tokens that appeared in recent_window by penalty
+    // This reduces their probability of being selected again
+    for (int i = 0; i < n_recent; i++) {
+        int token_id = recent_tokens[i];
+        if (token_id >= 0 && token_id < vocab_size) {
+            if (logits[token_id] > 0) {
+                logits[token_id] /= penalty;
+            } else {
+                logits[token_id] *= penalty;
+            }
+        }
+    }
+}
 
 // ============================================================================
 // RANDOM NUMBER GENERATION (xorshift64)
@@ -175,22 +200,40 @@ int sm2_sample_top_k(float* logits, int vocab_size, int top_k, float temp, uint6
 // MAIN SAMPLE FUNCTION
 // ============================================================================
 
-int sm2_sample_token(const float* logits, const sm2_generate_params* params, uint64_t* rng_state) {
+int sm2_sample_token(const float* logits, const sm2_generate_params* params,
+                     uint64_t* rng_state, sm2_context* ctx) {
+    // Make a copy of logits so we can apply repetition penalty without modifying originals
+    float logits_copy[49152];
+    int vocab_size = 49152;
+    memcpy(logits_copy, logits, vocab_size * sizeof(float));
+
+    // Apply repetition penalty if enabled
+    if (params->repetition_penalty > 1.0f && ctx) {
+        // kv_cache_len includes tokens that will be generated this forward pass
+        // (not yet added to recent_tokens), so we penalize up to that point
+        int recent_count = ctx->scratch.kv_cache_len;
+        if (recent_count > 0 && ctx->scratch.recent_tokens) {
+            sm2_apply_repetition_penalty(logits_copy, vocab_size,
+                                         ctx->scratch.recent_tokens,
+                                         recent_count,
+                                         params->repetition_penalty);
+        }
+    }
+
     // Combine top-k and top-p
     if (params->top_k > 0 && params->top_p < 1.0f) {
-        // Use top-k then top-p
-        return sm2_sample_top_k((float*)logits, 49152, params->top_k, params->temperature, rng_state);
+        return sm2_sample_top_k(logits_copy, vocab_size, params->top_k, params->temperature, rng_state);
     } else if (params->top_p < 1.0f) {
-        return sm2_sample_top_p((float*)logits, 49152, params->top_p / 100.0f, params->temperature, rng_state);
+        return sm2_sample_top_p(logits_copy, vocab_size, params->top_p / 100.0f, params->temperature, rng_state);
     } else if (params->top_k > 0) {
-        return sm2_sample_top_k((float*)logits, 49152, params->top_k, params->temperature, rng_state);
+        return sm2_sample_top_k(logits_copy, vocab_size, params->top_k, params->temperature, rng_state);
     } else {
         // Greedy
         int max_idx = 0;
-        float max_val = logits[0];
-        for (int i = 1; i < 49152; i++) {
-            if (logits[i] > max_val) {
-                max_val = logits[i];
+        float max_val = logits_copy[0];
+        for (int i = 1; i < vocab_size; i++) {
+            if (logits_copy[i] > max_val) {
+                max_val = logits_copy[i];
                 max_idx = i;
             }
         }

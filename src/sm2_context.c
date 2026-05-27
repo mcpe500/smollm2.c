@@ -67,6 +67,17 @@ int sm2_create_context(sm2_model* model, sm2_context** out_ctx) {
     ctx->params.top_k = 0;
     ctx->params.max_context = max_seq;
     ctx->params.max_output = 256;
+    ctx->params.repetition_penalty = 1.0f;  // Disabled by default
+    ctx->params.penalty_window = 100;       // Check last 100 tokens
+
+    // Ring buffer for repetition penalty tracking
+    ctx->scratch.recent_max = max_seq;
+    ctx->scratch.recent_tokens = calloc(max_seq, sizeof(int));
+    ctx->scratch.recent_head = 0;
+    if (!ctx->scratch.recent_tokens) {
+        sm2_free_context(ctx);
+        return -1;
+    }
 
     *out_ctx = ctx;
     return 0;
@@ -83,6 +94,7 @@ int sm2_free_context(sm2_context* ctx) {
     if (ctx->scratch.attn_out) free(ctx->scratch.attn_out);
     if (ctx->scratch.logits) free(ctx->scratch.logits);
     if (ctx->scratch.xb2) free(ctx->scratch.xb2);
+    if (ctx->scratch.recent_tokens) free(ctx->scratch.recent_tokens);
 
     if (ctx->scratch.k_cache) {
         for (int l = 0; l < ctx->model->n_layers; l++) {
@@ -208,35 +220,47 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         xb_out[i] = (x_in[i] / rms) * sm2_f16_to_float(w);
     }
 
-    // 2. Q projection: q = xb_out @ q_proj.T
+    // 2. Q projection: q = xb_out @ q_proj.T with Kahan summation
     // q_proj is [dim, dim] stored row-major, so q_proj[i, j] = q_proj[i * dim + j]
     for (int i = 0; i < dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t w = model->q_proj[q_off + i * dim + j];
-            sum += xb_out[j] * sm2_f16_to_float(w);
+            float w = sm2_f16_to_float(model->q_proj[q_off + i * dim + j]);
+            float y = xb_out[j] * w - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         q[i] = sum;
     }
 
-    // 3. K projection: k = xb_out @ k_proj.T
+    // 3. K projection: k = xb_out @ k_proj.T with Kahan summation
     // k_proj is [kv_dim, dim] stored row-major, so k_proj[i, j] = k_proj[i * dim + j]
     for (int i = 0; i < kv_dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t w = model->k_proj[k_off + i * dim + j];
-            sum += xb_out[j] * sm2_f16_to_float(w);
+            float w = sm2_f16_to_float(model->k_proj[k_off + i * dim + j]);
+            float y = xb_out[j] * w - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         k[i] = sum;
     }
 
-    // 4. V projection: v = xb_out @ v_proj.T
+    // 4. V projection: v = xb_out @ v_proj.T with Kahan summation
     // v_proj is [kv_dim, dim] stored row-major, so v_proj[i, j] = v_proj[i * dim + j]
     for (int i = 0; i < kv_dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t w = model->v_proj[v_off + i * dim + j];
-            sum += xb_out[j] * sm2_f16_to_float(w);
+            float w = sm2_f16_to_float(model->v_proj[v_off + i * dim + j]);
+            float y = xb_out[j] * w - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         v[i] = sum;
     }
@@ -257,13 +281,17 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     // 7. Attention with KV cache -> attn_out
     attention_with_cache(attn_out, q, layer, ctx, model);
 
-    // 8. O projection: xb_out = attn_out @ o_proj.T
+    // 8. O projection: xb_out = attn_out @ o_proj.T with Kahan summation
     // o_proj is [dim, dim] stored row-major, so o_proj[i, j] = o_proj[i * dim + j]
     for (int i = 0; i < dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t w = model->o_proj[o_off + i * dim + j];
-            sum += attn_out[j] * sm2_f16_to_float(w);
+            float w = sm2_f16_to_float(model->o_proj[o_off + i * dim + j]);
+            float y = attn_out[j] * w - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         xb_out[i] = sum;
     }
@@ -290,24 +318,32 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     float* gate_out = ffn_temp;                  // first hidden_dim elements
     float* up_out = ffn_temp + hidden_dim;      // second hidden_dim elements
 
-    // gate = xb_out @ gate_proj.T
+    // gate = xb_out @ gate_proj.T with Kahan summation for numerical stability
     // gate_proj is [hidden_dim, dim] stored row-major, so gate_proj[i, j] = gate_proj[i * dim + j]
     for (int i = 0; i < hidden_dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;  // Kahan summation compensation
         for (int j = 0; j < dim; j++) {
-            uint16_t w = model->gate_proj[gate_off + i * dim + j];
-            sum += xb_out[j] * sm2_f16_to_float(w);
+            float w = sm2_f16_to_float(model->gate_proj[gate_off + i * dim + j]);
+            float y = xb_out[j] * w - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         gate_out[i] = sum;
     }
 
-    // up = xb_out @ up_proj.T
+    // up = xb_out @ up_proj.T with Kahan summation
     // up_proj is [hidden_dim, dim] stored row-major, so up_proj[i, j] = up_proj[i * dim + j]
     for (int i = 0; i < hidden_dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;  // Kahan summation compensation
         for (int j = 0; j < dim; j++) {
-            uint16_t w = model->up_proj[up_off + i * dim + j];
-            sum += xb_out[j] * sm2_f16_to_float(w);
+            float w = sm2_f16_to_float(model->up_proj[up_off + i * dim + j]);
+            float y = xb_out[j] * w - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         up_out[i] = sum;
     }
@@ -320,13 +356,17 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     // Multiply: gate *= up
     for (int i = 0; i < hidden_dim; i++) gate_out[i] *= up_out[i];
 
-    // down = gate_out @ down_proj.T, add residual to post-attention hidden state
+    // down = gate_out @ down_proj.T with Kahan summation, add residual
     // down_proj is [dim, hidden_dim] stored row-major: down_proj[i, j] = down_proj[down_off + i * hidden_dim + j]
     for (int i = 0; i < dim; i++) {
         float sum = 0.0f;
+        float c = 0.0f;
         for (int j = 0; j < hidden_dim; j++) {
-            uint16_t w = model->down_proj[down_off + i * hidden_dim + j];
-            sum += gate_out[j] * sm2_f16_to_float(w);
+            float w_val = gate_out[j] * sm2_f16_to_float(model->down_proj[down_off + i * hidden_dim + j]);
+            float y = w_val - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
         // FFN output + residual (post-attention hidden state)
         xb_out[i] = x_post_attn[i] + sum;
@@ -370,6 +410,11 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
         // Update KV cache length and last_token
         ctx->scratch.kv_cache_len = t + 1;
         ctx->last_token = tokens[t];  // Track last prompt token for decode
+
+        // Track prompt tokens for repetition penalty in decode
+        if (ctx->scratch.recent_tokens && t < ctx->scratch.recent_max) {
+            ctx->scratch.recent_tokens[t] = tokens[t];
+        }
     }
 
     // Final RMSNorm
@@ -384,14 +429,18 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
         }
     }
 
-    // Compute logits
+    // Compute logits with Kahan summation for numerical stability
     if (model->tok_embeddings && model->tok_embeddings->data) {
         float* final_h = ctx->scratch.x;
         for (int i = 0; i < model->vocab_size; i++) {
             float sum = 0.0f;
+            float c = 0.0f;
             for (int j = 0; j < model->dim; j++) {
-                uint16_t h = model->tok_embeddings->data[i * model->dim + j];
-                sum += final_h[j] * sm2_f16_to_float(h);
+                float w_val = final_h[j] * sm2_f16_to_float(model->tok_embeddings->data[i * model->dim + j]);
+                float y = w_val - c;
+                float t = sum + y;
+                c = (t - sum) - y;
+                sum = t;
             }
             ctx->scratch.logits[i] = sum;
         }
@@ -437,21 +486,30 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
         }
     }
 
-    // Compute logits
+    // Compute logits with Kahan summation for numerical stability
     if (ctx->model->tok_embeddings && ctx->model->tok_embeddings->data) {
         float* final_h = ctx->scratch.x;
         for (int i = 0; i < ctx->model->vocab_size; i++) {
             float sum = 0.0f;
+            float c = 0.0f;
             for (int j = 0; j < ctx->model->dim; j++) {
-                uint16_t h = ctx->model->tok_embeddings->data[i * ctx->model->dim + j];
-                sum += final_h[j] * sm2_f16_to_float(h);
+                float w_val = final_h[j] * sm2_f16_to_float(ctx->model->tok_embeddings->data[i * ctx->model->dim + j]);
+                float y = w_val - c;
+                float t = sum + y;
+                c = (t - sum) - y;
+                sum = t;
             }
             ctx->scratch.logits[i] = sum;
         }
     }
 
     // NOW sample from the newly computed logits
-    int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state);
+    int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state, ctx);
+
+    // Track token for repetition penalty (add to next slot)
+    if (ctx->scratch.recent_tokens && ctx->scratch.kv_cache_len < ctx->scratch.recent_max) {
+        ctx->scratch.recent_tokens[ctx->scratch.kv_cache_len] = token;
+    }
 
     // Update KV cache length to include this new token
     ctx->scratch.kv_cache_len = seq_pos + 1;

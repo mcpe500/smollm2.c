@@ -139,7 +139,8 @@ int sm2_spec_decode_step(sm2_spec_dec* spec, int* out_token) {
         *out_token = sm2_sample_token(
             spec->target_ctx->scratch.logits,
             &spec->target_ctx->params,
-            &spec->target_ctx->rng_state
+            &spec->target_ctx->rng_state,
+            spec->target_ctx
         );
     }
     
