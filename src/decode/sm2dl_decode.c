@@ -29,10 +29,7 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
     float* k = ctx->scratch.k;
     float* v = ctx->scratch.v;
     float* attn_out = ctx->scratch.attn_out;
-    
-    fprintf(stderr, "DEBUG: forward_one_token ENTRY: x[0..2]={%f,%f,%f}, xb[0..2]={%f,%f,%f}\n",
-            x[0], x[1], x[2], xb[0], xb[1], xb[2]);
-    
+
     // ========================================================================
     // LAYER 0..n_layers-1
     // ========================================================================
@@ -46,12 +43,7 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
         }
         float rms = sqrtf(sum_sq / (float)model->dim + spec->rms_eps);
         float scale = 1.0f / rms;
-        
-        if (isnan(x[0]) || isnan(rms)) {
-            fprintf(stderr, "DEBUG: layer %d: x[0]=%f, sum_sq=%f, rms=%f, NaN detected BEFORE layernorm!\n", 
-                    layer, x[0], sum_sq, rms);
-        }
-        
+
         uint16_t* ln_weight = model->input_layernorm;  // Now contiguous array [n_layers * dim]
         if (ln_weight) {
             uint16_t* layer_ln = ln_weight + layer * model->dim;
@@ -62,11 +54,6 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
             for (int i = 0; i < model->dim; i++) {
                 xb[i] = x[i] * scale;
             }
-        }
-        
-        if (isnan(xb[0])) {
-            fprintf(stderr, "DEBUG: layer %d: xb[0]=%f AFTER layernorm, scale=%f, NaN!\n", 
-                    layer, xb[0], scale);
         }
         
         // ---- Q, K, V projections ----
