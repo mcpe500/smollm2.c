@@ -174,10 +174,15 @@ static int run_inference(sm2_model* model, const cli_args* args) {
 
         if (token < 3) break; // EOS
 
-        if (model->tokenizer) {
+        if (model->tokenizer && model->tokenizer->tokens) {
+            // Use proper BPE decode
             char* decoded = sm2_tokenizer_decode(model->tokenizer, &token, 1);
-            print_token(decoded);
-            free(decoded);
+            if (decoded) {
+                print_token(decoded);
+                free(decoded);
+            } else if (token >= 32 && token < 127) {
+                putchar(token);
+            }
         } else if (token >= 32 && token < 127) {
             putchar(token);
         } else {
