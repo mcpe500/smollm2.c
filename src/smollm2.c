@@ -115,18 +115,18 @@ static int run_inference(sm2_model* model, const cli_args* args) {
     ctx->params.max_context = args->ctx_size;
     ctx->params.max_output = args->max_output;
 
-    // Byte tokenization for input
+    // Byte tokenization for input (no BOS - SmolLM2 handles this internally)
     int tokens[4096];
     int n_tokens = 0;
-    for (int i = 0; args->prompt[i] && i < 4096; i++) {
+
+    for (int i = 0; args->prompt[i] && n_tokens < 4096; i++) {
         unsigned char byte_val = (unsigned char)args->prompt[i];
         // Use tokenizer's byte_to_token mapping to convert byte to correct vocab token
         if (model->tokenizer && model->tokenizer->byte_to_token) {
-            tokens[i] = model->tokenizer->byte_to_token[byte_val];
+            tokens[n_tokens++] = model->tokenizer->byte_to_token[byte_val];
         } else {
-            tokens[i] = byte_val;
+            tokens[n_tokens++] = byte_val;
         }
-        n_tokens++;
     }
 
     printf("Input: \"%s\" => %d tokens\n", args->prompt, n_tokens);

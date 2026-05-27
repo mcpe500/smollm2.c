@@ -26,15 +26,15 @@ void sm2_rope_build_freqs(float* freqs, int n_heads, int head_dim, int max_seq, 
 // Apply RoPE to a single Q or K vector
 void sm2_rope_apply(float* vec, const float* freqs, int head_dim, int seq_pos) {
     int half = head_dim / 2;
-    
+
     for (int i = 0; i < half; i++) {
         float freq = freqs[seq_pos * half + i];
         float cos_theta = cosf(freq);
         float sin_theta = sinf(freq);
-        
+
         float x0 = vec[i];
         float x1 = vec[i + half];
-        
+
         vec[i] = x0 * cos_theta - x1 * sin_theta;
         vec[i + half] = x0 * sin_theta + x1 * cos_theta;
     }
@@ -42,24 +42,40 @@ void sm2_rope_apply(float* vec, const float* freqs, int head_dim, int seq_pos) {
 
 // Apply RoPE to query and key vectors (inline)
 void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_heads, float rope_theta) {
-    // Build frequency table for this head
-    float freqs[64]; // max head_dim = 64
-    
     int half = head_dim / 2;
-    for (int i = 0; i < half; i++) {
-        freqs[i] = (float)pos / powf(rope_theta, (float)(2 * i) / (float)head_dim);
-    }
-    
-    // Apply to Q (all heads)
+
+    // For decode (pos=0), we need to apply RoPE for position 0
+    // For generation, pos is kv_cache_len which increments each step
+    int rope_pos = pos;
+
     for (int h = 0; h < n_heads; h++) {
         float* q_head = q + h * head_dim;
-        sm2_rope_apply(q_head, freqs, head_dim, 0);
+        for (int i = 0; i < half; i++) {
+            float freq = (float)rope_pos / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+            float cos_theta = cosf(freq);
+            float sin_theta = sinf(freq);
+
+            float x0 = q_head[i];
+            float x1 = q_head[i + half];
+
+            q_head[i] = x0 * cos_theta - x1 * sin_theta;
+            q_head[i + half] = x0 * sin_theta + x1 * cos_theta;
+        }
     }
-    
-    // Apply to K (only KV heads)
+
     for (int h = 0; h < n_kv_heads; h++) {
         float* k_head = k + h * head_dim;
-        sm2_rope_apply(k_head, freqs, head_dim, 0);
+        for (int i = 0; i < half; i++) {
+            float freq = (float)rope_pos / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+            float cos_theta = cosf(freq);
+            float sin_theta = sinf(freq);
+
+            float x0 = k_head[i];
+            float x1 = k_head[i + half];
+
+            k_head[i] = x0 * cos_theta - x1 * sin_theta;
+            k_head[i + half] = x0 * sin_theta + x1 * cos_theta;
+        }
     }
 }
 

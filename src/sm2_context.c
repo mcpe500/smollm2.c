@@ -367,8 +367,9 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
         }
 
         // After all layers, the final hidden state is in scratch.x
-        // Update KV cache length
+        // Update KV cache length and last_token
         ctx->scratch.kv_cache_len = t + 1;
+        ctx->last_token = tokens[t];  // Track last prompt token for decode
     }
 
     // Final RMSNorm
