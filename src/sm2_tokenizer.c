@@ -19,67 +19,88 @@ int sm2_load_tokenizer_from_sm2(sm2_tokenizer* tok, FILE* f, uint64_t offset, ui
         fprintf(stderr, "Failed to seek to tokenizer at offset %lu\n", offset);
         return -1;
     }
-    
+
     // Allocate temporary buffer for tokenizer data
     uint8_t* data = malloc(size);
     if (!data) {
         fprintf(stderr, "Failed to allocate %lu bytes for tokenizer\n", size);
         return -1;
     }
-    
+
     if (fread(data, size, 1, f) != 1) {
         fprintf(stderr, "Failed to read tokenizer data\n");
         free(data);
         return -1;
     }
-    
+
     tok->vocab_size = 49152; // SmolLM2
     tok->tokens = calloc(tok->vocab_size, sizeof(char*));
     tok->token_to_id = calloc(tok->vocab_size, sizeof(int));
     tok->scores = NULL;  // Not stored in .sm2 format
-    
+
     if (!tok->tokens || !tok->token_to_id) {
         fprintf(stderr, "Failed to allocate tokenizer arrays\n");
         free(data);
         return -1;
     }
-    
+
+    // Initialize byte_to_token mapping to identity mapping (byte -> byte)
+    // This will be updated when we find single-byte tokens in the vocab
+    for (int i = 0; i < 256; i++) {
+        tok->byte_to_token[i] = i;
+    }
+
     // Parse tokenizer binary format:
     // [49152 x (4-byte length + token_bytes)] followed by [4-byte merges_count] + [merges]
     uint32_t pos = 0;
-    
+
     // Read token strings
     for (int i = 0; i < tok->vocab_size && pos < size; i++) {
         if (pos + 4 > size) break;
         uint32_t len = *(uint32_t*)(data + pos);
         pos += 4;
-        
+
         if (len > 0 && pos + len <= size) {
             char* token = malloc(len + 1);
             memcpy(token, data + pos, len);
             token[len] = '\0';
             tok->tokens[i] = token;
             tok->token_to_id[i] = i; // id == index for this format
+
+            // Build byte_to_token mapping for single-byte tokens
+            // This maps raw byte values (0-255) to actual vocab token IDs
+            if (len == 1) {
+                unsigned char byte_val = (unsigned char)token[0];
+                tok->byte_to_token[byte_val] = i;
+            }
+
+            // Special case: Ġ (U+0120 = 0xC4 0xA0) represents space in SmolLM2 BPE
+            // This is the word-start marker used when a word begins with a space
+            if (len == 2 && (unsigned char)token[0] == 0xC4 && (unsigned char)token[1] == 0xA0) {
+                // Map space (byte 32) to Ġ token
+                tok->byte_to_token[32] = i;
+            }
+
             pos += len;
         } else {
             tok->tokens[i] = NULL;
             tok->token_to_id[i] = -1;
         }
     }
-    
+
     // Read merges count and merges
     if (pos + 4 <= size) {
         uint32_t num_merges = *(uint32_t*)(data + pos);
         pos += 4;
-        
+
         tok->num_merges = num_merges;
         tok->merges = calloc(num_merges, sizeof(char*));
-        
+
         for (uint32_t i = 0; i < num_merges && pos < size; i++) {
             if (pos + 4 > size) break;
             uint32_t merge_len = *(uint32_t*)(data + pos);
             pos += 4;
-            
+
             if (merge_len > 0 && pos + merge_len <= size) {
                 char* merge = malloc(merge_len + 1);
                 memcpy(merge, data + pos, merge_len);
@@ -89,7 +110,7 @@ int sm2_load_tokenizer_from_sm2(sm2_tokenizer* tok, FILE* f, uint64_t offset, ui
             }
         }
     }
-    
+
     free(data);
     return 0;
 }
@@ -101,21 +122,21 @@ int sm2_load_tokenizer_from_sm2(sm2_tokenizer* tok, FILE* f, uint64_t offset, ui
 int sm2_tokenizer_init(const char* vocab_path, const char* merges_path, sm2_tokenizer** out_tok) {
     sm2_tokenizer* tok = calloc(1, sizeof(sm2_tokenizer));
     if (!tok) return -1;
-    
+
     tok->vocab_size = 49152; // SmolLM2 vocab size
     tok->num_merges = 0;
     tok->merges = NULL;
     tok->tokens = NULL;
     tok->token_to_id = NULL;
     tok->scores = NULL;
-    
+
     *out_tok = tok;
     return 0;
 }
 
 void sm2_tokenizer_free(sm2_tokenizer* tok) {
     if (!tok) return;
-    
+
     if (tok->tokens) {
         for (int i = 0; i < tok->vocab_size; i++) {
             if (tok->tokens[i]) free(tok->tokens[i]);
@@ -135,7 +156,7 @@ void sm2_tokenizer_free(sm2_tokenizer* tok) {
 }
 
 // ============================================================================
-// BPE ENCODING HELPERS
+// HELPERS
 // ============================================================================
 
 // Check if char is whitespace
@@ -143,53 +164,31 @@ static int is_whitespace(char c) {
     return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\v';
 }
 
-// Get byte pair rank from merges table
-// Returns rank (lower = more frequent merge) or -1 if pair not in vocab
-static int get_bpe_rank(sm2_tokenizer* tok, const char* pair) {
-    for (int i = 0; i < tok->num_merges; i++) {
-        if (tok->merges[i] && strcmp(tok->merges[i], pair) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-// Encode a single byte to token ID (byte-level fallback)
-static int byte_to_id(sm2_tokenizer* tok, uint8_t byte) {
-    // For bytes 0-255, we look up the corresponding token
-    // In GPT2/SmolLM2 BPE, bytes are encoded as specific tokens
-    // If tokens array is loaded, find the byte token
-    if (tok->tokens && byte < tok->vocab_size && tok->tokens[byte]) {
-        // Token at index byte
-        return byte;
-    }
-    // Fallback: return byte as-is
-    return byte;
-}
-
-// ============================================================================
-// BPE ENCODE WORD - Proper BPE with merge table
-// ============================================================================
-
-// Find token ID for a string (token_to_id lookup)
-// Returns token ID or -1 if not found
-static int find_token_id(sm2_tokenizer* tok, const char* token_str) {
+// Find token ID for a given UTF-8 string in the tokens array
+static int find_token_id_by_string(sm2_tokenizer* tok, const char* s, int s_len) {
     if (!tok->tokens) return -1;
-    // Linear scan - tokens array is indexed by id, not by string
-    // We need to scan to find matching token string
     for (int i = 0; i < tok->vocab_size; i++) {
-        if (tok->tokens[i] && strcmp(tok->tokens[i], token_str) == 0) {
-            return i;
+        if (tok->tokens[i]) {
+            int tok_len = strlen(tok->tokens[i]);
+            if (tok_len == s_len && memcmp(tok->tokens[i], s, s_len) == 0) {
+                return i;
+            }
         }
     }
     return -1;
 }
 
-// Encode a word using BPE merges
+// ============================================================================
+// BPE ENCODE WORD - uses token strings stored in merges
+// ============================================================================
+
 static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int max_len) {
     if (!word || !ids || max_len <= 0) return 0;
-    
-    // If no merges or tokens loaded, fall back to byte
+
+    int word_len = strlen(word);
+    if (word_len == 0) return 0;
+
+    // If no merges or tokens loaded, fall back to byte-level
     if (!tok->merges || tok->num_merges == 0 || !tok->tokens) {
         int n = 0;
         for (int i = 0; word[i] && n < max_len; i++) {
@@ -198,101 +197,123 @@ static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int m
         }
         return n;
     }
-    
-    // Step 1: Convert word bytes to initial token segments
-    // Each byte becomes an initial segment with its string representation
-    int word_len = strlen(word);
-    int max_segs = word_len * 2;  // worst case: no merges
-    
-    // segments: array of token IDs representing current segmentation
-    int* segments = malloc(max_segs * sizeof(int));
-    char** seg_strs = malloc(max_segs * sizeof(char*));
+
+    // Use token strings as the base "alphabet" - each character becomes a seg_str
+    // seg_strs holds the actual token strings (UTF-8 encoded)
+    int max_segs = word_len * 2;
+
+    // segments: array of token IDs for final output
+    int* segments = calloc(max_segs, sizeof(int));
+    // seg_strs: array of string pointers for the segmentation state
+    char** seg_strs = calloc(max_segs, sizeof(char*));
     int n_segs = 0;
-    
-    for (int i = 0; i < word_len && n_segs < max_segs; i++) {
-        // Each byte is an initial segment (byte-level token)
-        unsigned char b = (unsigned char)word[i];
-        segments[n_segs] = b;  // token ID = byte value
+
+    // Step 1: Initialize with each character as a separate segment
+    // For ASCII text, each character is a single byte = single token
+    for (int i = 0; i < word_len; i++) {
+        unsigned char byte_val = (unsigned char)word[i];
+
+        // Find the token ID for this single character
+        int token_id = find_token_id_by_string(tok, (const char*)&byte_val, 1);
+        if (token_id < 0) token_id = byte_val; // fallback
+
+        segments[n_segs] = token_id;
+
         seg_strs[n_segs] = malloc(2);
-        seg_strs[n_segs][0] = (char)b;
+        seg_strs[n_segs][0] = (char)byte_val;
         seg_strs[n_segs][1] = '\0';
         n_segs++;
     }
-    
+
     // Step 2: Iteratively apply BPE merges
+    // For each adjacent pair, check if the concatenated string is in the merges table
+    // The merge that appears at the lowest index (most frequent) gets applied first
     int iterations = 0;
-    int max_iterations = n_segs * 2;  // safety limit
-    
-    while (iterations < max_iterations) {
+    int max_iterations = n_segs * 4;
+
+    while (iterations < max_iterations && n_segs > 1) {
         iterations++;
-        
-        // Find best merge (lowest rank in merges table)
+
         int best_rank = -1;
         int best_idx = -1;
-        
+
+        // Find the best pair (lowest rank in merges table)
         for (int i = 0; i < n_segs - 1; i++) {
-            // Build pair string: seg_strs[i] + seg_strs[i+1]
             int len1 = strlen(seg_strs[i]);
             int len2 = strlen(seg_strs[i + 1]);
-            char* pair = malloc(len1 + len2 + 1);
-            strcpy(pair, seg_strs[i]);
-            strcat(pair, seg_strs[i + 1]);
-            
-            int rank = get_bpe_rank(tok, pair);
+            int pair_len = len1 + len2;
+
+            // Build the pair string
+            char* pair = malloc(pair_len + 1);
+            memcpy(pair, seg_strs[i], len1);
+            memcpy(pair + len1, seg_strs[i + 1], len2);
+            pair[pair_len] = '\0';
+
+            // Search for this pair in merges
+            int rank = -1;
+            for (int m = 0; m < tok->num_merges; m++) {
+                if (tok->merges[m] && strcmp(tok->merges[m], pair) == 0) {
+                    rank = m;
+                    break;
+                }
+            }
+
             free(pair);
-            
+
             if (rank >= 0 && (best_rank < 0 || rank < best_rank)) {
                 best_rank = rank;
                 best_idx = i;
             }
         }
-        
+
         if (best_idx < 0) {
-            break;  // No more merges possible
+            break; // No more merges possible
         }
-        
-        // Apply merge at best_idx: combine seg[best_idx] and seg[best_idx+1]
-        // Build merged string
-        int len1 = strlen(seg_strs[best_idx]);
-        int len2 = strlen(seg_strs[best_idx + 1]);
-        char* merged = malloc(len1 + len2 + 1);
+
+        // Build the merged string
+        int merged_len = strlen(seg_strs[best_idx]) + strlen(seg_strs[best_idx + 1]);
+        char* merged = malloc(merged_len + 1);
         strcpy(merged, seg_strs[best_idx]);
         strcat(merged, seg_strs[best_idx + 1]);
-        
-        // Find token ID for merged string
-        int merged_id = find_token_id(tok, merged);
+
+        // Find the token ID for the merged string
+        int merged_id = find_token_id_by_string(tok, merged, merged_len);
         free(merged);
-        
+
         if (merged_id < 0) {
-            break;  // Merged string not in vocab
+            // Merged string not in vocab - no more merges possible
+            break;
         }
-        
-        // Replace seg[best_idx] with merged_id, remove seg[best_idx+1]
+
+        // Apply merge: replace seg[best_idx] with merged_id, remove seg[best_idx+1]
         segments[best_idx] = merged_id;
         free(seg_strs[best_idx]);
-        
+        seg_strs[best_idx] = merged; // Keep the malloced string
+
         // Shift remaining segments
         for (int i = best_idx + 1; i < n_segs - 1; i++) {
             segments[i] = segments[i + 1];
             seg_strs[i] = seg_strs[i + 1];
         }
-        free(seg_strs[n_segs - 1]);
+        seg_strs[n_segs - 1] = NULL;
         n_segs--;
+
+        if (n_segs == 1) break;
     }
-    
+
     // Step 3: Copy final segments to output
     int n = 0;
     for (int i = 0; i < n_segs && n < max_len; i++) {
         ids[n++] = segments[i];
     }
-    
+
     // Cleanup
     for (int i = 0; i < n_segs; i++) {
         free(seg_strs[i]);
     }
     free(segments);
     free(seg_strs);
-    
+
     return n;
 }
 
@@ -304,21 +325,21 @@ static int pre_tokenize(const char* text, char*** out_words, int* out_n) {
     int capacity = 256;
     char** words = malloc(capacity * sizeof(char*));
     int n = 0;
-    
+
     const char* p = text;
     while (*p) {
         while (*p && is_whitespace(*p)) p++;
         if (!*p) break;
-        
+
         const char* start = p;
         while (*p && !is_whitespace(*p)) p++;
-        
+
         int len = (int)(p - start);
         if (len > 0) {
             char* word = malloc(len + 1);
             memcpy(word, start, len);
             word[len] = '\0';
-            
+
             if (n >= capacity) {
                 capacity *= 2;
                 words = realloc(words, capacity * sizeof(char*));
@@ -326,7 +347,7 @@ static int pre_tokenize(const char* text, char*** out_words, int* out_n) {
             words[n++] = word;
         }
     }
-    
+
     *out_words = words;
     *out_n = n;
     return 0;
@@ -344,65 +365,69 @@ static void free_words(char** words, int n) {
 
 int sm2_tokenizer_encode(sm2_tokenizer* tok, const char* text, int* ids, int max_len) {
     if (!tok || !text || !ids || max_len <= 0) return -1;
-    
+
     char** words;
     int n_words;
     pre_tokenize(text, &words, &n_words);
-    
+
     int n = 0;
     for (int w = 0; w < n_words && n < max_len; w++) {
         int word_ids[512];
         int n_ids = bpe_encode_word(tok, words[w], word_ids, 512);
-        
+
         for (int i = 0; i < n_ids && n < max_len; i++) {
             ids[n++] = word_ids[i];
         }
     }
-    
+
     free_words(words, n_words);
     return n;
 }
 
 char* sm2_tokenizer_decode(sm2_tokenizer* tok, const int* ids, int n_ids) {
     if (!tok || !ids || n_ids <= 0) return NULL;
-    
-    // Allocate output buffer (max 4 chars per token + null)
-    char* out = malloc(n_ids * 4 + 1);
+
+    // Allocate output buffer (max ~4 bytes per token + null)
+    size_t out_capacity = (size_t)n_ids * 4 + 1;
+    char* out = malloc(out_capacity);
     if (!out) return NULL;
-    
-    int pos = 0;
-    for (int i = 0; i < n_ids; i++) {
+
+    size_t pos = 0;
+    for (int i = 0; i < n_ids && pos < out_capacity - 1; i++) {
         int id = ids[i];
-        
+
         // Handle special tokens
         if (id == 0) {
-            // <|endoftext|> - stop token
-            break;
+            break; // <|endoftext|> - stop
         } else if (id == 1) {
-            // <|im_start|> - skip for now
-            continue;
+            continue; // <|im_start|> - skip
         } else if (id == 2) {
-            // <|im_end|> - end of message
-            break;
-        } else if (id >= 3 && id < tok->vocab_size) {
-            // Regular token
+            break; // <|im_end|> - end of message
+        } else if (id >= 0 && id < tok->vocab_size) {
+            // Regular token - copy UTF-8 bytes directly
             if (tok->tokens && tok->tokens[id]) {
                 const char* token_str = tok->tokens[id];
-                int tok_len = strlen(token_str);
-                if (tok_len == 1 && (unsigned char)token_str[0] < 128) {
-                    // ASCII character
-                    out[pos++] = token_str[0];
-                } else {
-                    // For multi-byte tokens, try to write as-is
-                    // For UTF-8, this may produce garbage but at least doesn't crash
-                    for (int j = 0; j < tok_len && pos < n_ids * 4; j++) {
-                        out[pos++] = token_str[j];
-                    }
+                size_t tok_len = strlen(token_str);
+
+                // Copy the UTF-8 bytes (could be 1-4 bytes for multi-byte chars)
+                for (size_t j = 0; j < tok_len && pos < out_capacity - 1; j++) {
+                    out[pos++] = token_str[j];
+                }
+            } else if (id < 256) {
+                // Fallback: print as ASCII if printable
+                if (id >= 32 && id < 127) {
+                    out[pos++] = (char)id;
                 }
             }
         }
     }
-    
+
     out[pos] = '\0';
     return out;
+}
+
+// Convert byte value to token ID using tokenizer's byte mapping
+int sm2_tokenizer_byte_to_token(sm2_tokenizer* tok, unsigned char byte_val) {
+    if (!tok || byte_val >= 256) return byte_val;
+    return tok->byte_to_token[byte_val];
 }

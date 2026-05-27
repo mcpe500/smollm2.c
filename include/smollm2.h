@@ -70,6 +70,9 @@ static const sm2_spec sm2_specs[] = {
     { SM2_1700M, 24, 2048, 8192, 32, 32, 64, 49152, 8192, 1e-5f, 130000.0f, 1, 2, 0 },
 };
 
+// Maximum dimension across all variants (for stack allocation)
+#define DIM_MAX 2048
+
 static inline const sm2_spec* sm2_get_spec(sm2_variant v) {
     for (int i = 0; i < 3; i++) {
         if (sm2_specs[i].id == v) return &sm2_specs[i];
@@ -264,6 +267,10 @@ typedef struct {
     float* v;           // value [n_kv_heads * head_dim]
     float* attn_out;    // attention output [dim]
     float* logits;      // output logits [vocab_size]
+    // KV cache for full context
+    float** k_cache;    // per-layer K cache [n_layers][n_kv_heads][max_seq][head_dim]
+    float** v_cache;    // per-layer V cache [n_layers][n_kv_heads][max_seq][head_dim]
+    int kv_cache_len;   // current number of positions in KV cache
 } sm2_scratch;
 
 // Generation parameters
@@ -298,12 +305,16 @@ typedef struct sm2_tokenizer {
     char** tokens;
     float* scores;
     int* token_to_id;
-    
+
     int num_merges;
-    char*** merges;             // pair of tokens to merge
-    
+    char** merges;              // pair of tokens to merge
+
     uint8_t* vocab_data;        // raw vocab json
     size_t vocab_size_bytes;
+
+    // Byte-to-token mapping: byte_to_token[256] maps raw byte values to vocab IDs
+    // For example, byte 84 ('T') -> vocab token 68
+    int byte_to_token[256];
 } sm2_tokenizer;
 
 // ============================================================================
@@ -409,6 +420,9 @@ void sm2_tokenizer_free(sm2_tokenizer* tok);
 int sm2_tokenizer_encode(sm2_tokenizer* tok, const char* text, int* ids, int max_len);
 char* sm2_tokenizer_decode(sm2_tokenizer* tok, const int* ids, int n_ids);
 int sm2_load_tokenizer_from_sm2(sm2_tokenizer* tok, FILE* f, uint64_t offset, uint64_t size);
+
+// Convert byte value to token ID using tokenizer's byte mapping
+int sm2_tokenizer_byte_to_token(sm2_tokenizer* tok, unsigned char byte_val);
 
 // ============================================================================
 // SERVER API (Phase 6)

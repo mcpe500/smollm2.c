@@ -8,108 +8,73 @@
 #include "sm2_utils.h"
 
 // ============================================================================
-// FLOAT16 UTILITIES (deprecated - use sm2_utils.h)
-// ============================================================================
-
-// Convert IEEE-754 float16 to float (deprecated - use sm2_f16_to_float)
-static float f16_to_float(uint16_t h) {
-    unsigned int bits = h;
-    int sign = (bits >> 15) & 1;
-    int exp = (bits >> 10) & 0x1F;
-    int frac = bits & 0x3FF;
-    float result;
-
-    if (exp == 0) {
-        result = (float)frac / 1024.0f;
-    } else if (exp == 31) {
-        result = (frac == 0) ? 1.0f / 0.0f : 0.0f / 0.0f;
-    } else {
-        result = (1.0f + (float)frac / 1024.0f) * powf(2.0f, (float)(exp - 15));
-    }
-
-    return sign ? -result : result;
-}
-
-// ============================================================================
 // CONTEXT ALLOCATION (preallocated, no runtime allocation in hot path)
 // ============================================================================
 
 int sm2_create_context(sm2_model* model, sm2_context** out_ctx) {
     sm2_context* ctx = calloc(1, sizeof(sm2_context));
     if (!ctx) return -1;
-    
+
     ctx->model = model;
     ctx->pos = 0;
     ctx->last_token = 1; // BOS
     ctx->rng_state = 123456789ULL; // Initial RNG state
-    
-    // Get spec for dimensions
+
     const sm2_spec* spec = sm2_get_spec(model->variant);
-    
-    // Preallocate scratch buffers (never freed during lifetime)
-    size_t dim = model->dim;
-    size_t hidden = model->hidden_dim;
-    size_t vocab = model->vocab_size;
-    size_t kv_size = (size_t)model->n_kv_heads * model->head_dim;
-    
+    int dim = model->dim;
+    int hidden = model->hidden_dim;
+    int vocab = model->vocab_size;
+    int kv_dim = model->n_kv_heads * model->head_dim;
+    int max_seq = spec->max_seq_len;
+    int n_layers = model->n_layers;
+
     ctx->scratch.x = calloc(dim, sizeof(float));
     ctx->scratch.xb = calloc(dim, sizeof(float));
-    ctx->scratch.q = calloc(dim, sizeof(float));         // Used for Q
-    ctx->scratch.k = calloc(kv_size, sizeof(float));      // Used for K
-    ctx->scratch.v = calloc(kv_size, sizeof(float));      // Used for V
+    ctx->scratch.q = calloc(dim, sizeof(float));
+    ctx->scratch.k = calloc(kv_dim, sizeof(float));
+    ctx->scratch.v = calloc(kv_dim, sizeof(float));
     ctx->scratch.attn_out = calloc(dim, sizeof(float));
     ctx->scratch.logits = calloc(vocab, sizeof(float));
-    
-    // FFN scratch buffers (hidden_dim + dim for gate/up and down output)
-    ctx->scratch.xb2 = calloc(hidden + dim, sizeof(float)); // FFN temp
-    
+    ctx->scratch.xb2 = calloc((size_t)hidden * 2, sizeof(float));
+
     if (!ctx->scratch.x || !ctx->scratch.xb || !ctx->scratch.q ||
         !ctx->scratch.k || !ctx->scratch.v || !ctx->scratch.attn_out ||
         !ctx->scratch.logits || !ctx->scratch.xb2) {
         sm2_free_context(ctx);
         return -1;
     }
-    
-    // Default generation params
-    ctx->params.temperature = 0.8f;
-    ctx->params.top_p = 90;
-    ctx->params.top_k = 40;
-    ctx->params.max_context = spec->max_seq_len;
-    ctx->params.max_output = 256;
-    
-    // Initialize KV pool for model
-    ctx->kv_pool = calloc(1, sizeof(sm2_kv_pool));
-    if (!ctx->kv_pool) {
+
+    // Allocate KV cache: [n_layers][n_kv_heads][max_seq][head_dim] flat as float
+    size_t kv_per_layer = (size_t)model->n_kv_heads * max_seq * model->head_dim;
+    ctx->scratch.k_cache = calloc(n_layers, sizeof(float*));
+    ctx->scratch.v_cache = calloc(n_layers, sizeof(float*));
+    if (!ctx->scratch.k_cache || !ctx->scratch.v_cache) {
         sm2_free_context(ctx);
         return -1;
     }
-    
-    // Simple contiguous KV for Phase 1
-    int max_tokens = spec->max_seq_len;
-    int kv_elements = (int)model->n_layers * (int)model->n_kv_heads * max_tokens * (int)model->head_dim * 2; // K+V
-    ctx->kv_pool->pages = calloc(1, sizeof(sm2_kv_page)); // Single contiguous page
-    ctx->kv_pool->n_layers = model->n_layers;
-    ctx->kv_pool->n_kv_heads = model->n_kv_heads;
-    ctx->kv_pool->head_dim = model->head_dim;
-    ctx->kv_pool->page_tokens = max_tokens;
-    ctx->kv_pool->max_pages = 1;
-    ctx->kv_pool->dtype = SM2_KV_F16;
-    
-    // Allocate KV data (F16 = 2 bytes per element)
-    size_t kv_bytes = (size_t)model->n_layers * model->n_kv_heads * max_tokens * model->head_dim * 2 * 2;
-    uint8_t* kv_data = calloc(kv_bytes, 1);
-    
-    ctx->kv.seq_len = 0;
-    ctx->kv.n_pages = 1;
-    ctx->kv.page_ids[0] = 0;
-    
+    for (int l = 0; l < n_layers; l++) {
+        ctx->scratch.k_cache[l] = calloc(kv_per_layer, sizeof(float));
+        ctx->scratch.v_cache[l] = calloc(kv_per_layer, sizeof(float));
+        if (!ctx->scratch.k_cache[l] || !ctx->scratch.v_cache[l]) {
+            sm2_free_context(ctx);
+            return -1;
+        }
+    }
+    ctx->scratch.kv_cache_len = 0;
+
+    ctx->params.temperature = 0.0f;  // Greedy by default
+    ctx->params.top_p = 100;
+    ctx->params.top_k = 0;
+    ctx->params.max_context = max_seq;
+    ctx->params.max_output = 256;
+
     *out_ctx = ctx;
     return 0;
 }
 
 int sm2_free_context(sm2_context* ctx) {
     if (!ctx) return 0;
-    
+
     if (ctx->scratch.x) free(ctx->scratch.x);
     if (ctx->scratch.xb) free(ctx->scratch.xb);
     if (ctx->scratch.q) free(ctx->scratch.q);
@@ -117,11 +82,17 @@ int sm2_free_context(sm2_context* ctx) {
     if (ctx->scratch.v) free(ctx->scratch.v);
     if (ctx->scratch.attn_out) free(ctx->scratch.attn_out);
     if (ctx->scratch.logits) free(ctx->scratch.logits);
-    if (ctx->kv_pool) {
-        if (ctx->kv_pool->pages) free(ctx->kv_pool->pages);
-        free(ctx->kv_pool);
+    if (ctx->scratch.xb2) free(ctx->scratch.xb2);
+
+    if (ctx->scratch.k_cache) {
+        for (int l = 0; l < ctx->model->n_layers; l++) {
+            free(ctx->scratch.k_cache[l]);
+            free(ctx->scratch.v_cache[l]);
+        }
+        free(ctx->scratch.k_cache);
+        free(ctx->scratch.v_cache);
     }
-    
+
     free(ctx);
     return 0;
 }
@@ -131,57 +102,62 @@ int sm2_free_context(sm2_context* ctx) {
 // ============================================================================
 
 static void embedding_lookup(float* out, int token, const sm2_tensor_f16* embed) {
-    // out = embed[token], where embed is [vocab, dim] stored as F16
     int dim = embed->cols;
-    
     for (int i = 0; i < dim; i++) {
         uint16_t h = embed->data[token * dim + i];
-        out[i] = f16_to_float(h);
+        out[i] = sm2_f16_to_float(h);
     }
 }
 
 // ============================================================================
-// ATTENTION (simplified GQA)
+// ATTENTION with KV cache
 // ============================================================================
 
-static void attention_forward(float* out, const float* q, const float* k, const float* v,
-                              int n_heads, int n_kv_heads, int head_dim, int seq_len) {
-    // Simplified attention with GQA support
-    // Q: [n_heads, head_dim], K/V: [n_kv_heads, head_dim]
-    
+static void attention_with_cache(float* out, const float* q, int layer,
+                              sm2_context* ctx, sm2_model* model) {
+    int n_heads = model->n_heads;
+    int n_kv_heads = model->n_kv_heads;
+    int head_dim = model->head_dim;
     int group_size = n_heads / n_kv_heads;
-    
-    // For each query head, attend over all KV heads
+    // K/V for the current position has already been stored by layer_forward
+    // at position kv_cache_len. So we must attend over kv_cache_len + 1 positions.
+    int kv_seq = ctx->scratch.kv_cache_len + 1;
+
+    // For each query head, attend over all cached K/V positions
     for (int qh = 0; qh < n_heads; qh++) {
         int kv_head = qh / group_size;
-        
-        // Compute attention scores
-        float scores[256]; // max seq_len
+
+        // Compute attention scores for all cached positions
         float max_score = -1e9f;
-        
-        for (int pos = 0; pos < seq_len; pos++) {
-            // Dot product q with K[pos]
+        float scores[2048];
+
+        for (int pos = 0; pos < kv_seq; pos++) {
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) {
-                dot += q[qh * head_dim + d] * k[kv_head * head_dim + pos * head_dim + d];
+                float qv = q[qh * head_dim + d];
+                int cache_idx = kv_head * ctx->params.max_context * head_dim + pos * head_dim + d;
+                float kv = ctx->scratch.k_cache[layer][cache_idx];
+                dot += qv * kv;
             }
-            dot /= sqrtf((float)head_dim);
+            dot *= 1.0f / sqrtf((float)head_dim);
             scores[pos] = dot;
             if (dot > max_score) max_score = dot;
         }
-        
+
         // Softmax
         float sum_exp = 0.0f;
-        for (int pos = 0; pos < seq_len; pos++) {
+        for (int pos = 0; pos < kv_seq; pos++) {
             scores[pos] = expf(scores[pos] - max_score);
             sum_exp += scores[pos];
         }
-        
-        // Weighted sum of V
+
+        // Weighted sum
         for (int d = 0; d < head_dim; d++) {
             float sum = 0.0f;
-            for (int pos = 0; pos < seq_len; pos++) {
-                sum += scores[pos] * v[kv_head * head_dim + pos * head_dim + d];
+            for (int pos = 0; pos < kv_seq; pos++) {
+                int cache_idx = kv_head * ctx->params.max_context * head_dim + pos * head_dim + d;
+                float vv = ctx->scratch.v_cache[layer][cache_idx];
+                sum += scores[pos] * vv;
             }
             out[qh * head_dim + d] = sum / sum_exp;
         }
@@ -189,214 +165,174 @@ static void attention_forward(float* out, const float* q, const float* k, const 
 }
 
 // ============================================================================
-// MATMUL HELPERS
-// ============================================================================
-
-// matmul: out[m] += a[m,k] @ b[k,n] (column-major storage)
-static void matmul_f16(float* out, const float* a, const uint16_t* b, int m, int k, int n) {
-    for (int i = 0; i < m; i++) {
-        float sum = 0.0f;
-        for (int j = 0; j < k; j++) {
-            uint16_t h = b[i * k + j];
-            sum += a[j] * sm2_f16_to_float(h);
-        }
-        out[i] += sum;
-    }
-}
-
-// out[m,n] += a[m,k] @ b[k,n] (column-major, accumulates into out)
-static void matmul_f16_2d(float* out, const float* a, const uint16_t* b, int m, int n, int k) {
-    for (int col = 0; col < n; col++) {
-        for (int row = 0; row < m; row++) {
-            float sum = 0.0f;
-            for (int j = 0; j < k; j++) {
-                uint16_t h = b[j * n + col];  // b[k,n] column-major -> b[j*n + col]
-                sum += a[row * k + j] * sm2_f16_to_float(h);
-            }
-            out[row * n + col] += sum;
-        }
-    }
-}
-
-// ============================================================================
 // SINGLE LAYER FORWARD
+// Writes result to xb_out. Does NOT use ctx->scratch.x or ctx->scratch.xb
+// as those are the caller's ping-pong buffers.
 // ============================================================================
 
-static void layer_forward(float* xb, const float* x, int layer,
+static void layer_forward(float* xb_out, const float* x_in, int layer,
                           sm2_model* model, sm2_context* ctx, int seq_pos) {
     const sm2_spec* spec = sm2_get_spec(model->variant);
     int dim = model->dim;
     int kv_dim = model->n_kv_heads * model->head_dim;
     int hidden_dim = model->hidden_dim;
-    
-    // ALWAYS print layer 28 entry
-    // if (layer == 28) {
-    //     // layer_forward: ENTER layer 28
-    // }
-    
-    // 1. RMSNorm (input layernorm): xb = rmsnorm(x, input_layernorm[layer])
-    size_t ln_off   = (size_t)layer * dim;
-    size_t q_off    = (size_t)layer * dim * dim;
-    size_t k_off    = (size_t)layer * kv_dim * dim;
-    size_t v_off    = (size_t)layer * kv_dim * dim;
-    size_t o_off    = (size_t)layer * dim * dim;
-    size_t post_off = (size_t)layer * dim;
-    size_t gate_off = (size_t)layer * hidden_dim * dim;
-    size_t up_off   = (size_t)layer * hidden_dim * dim;
-    size_t down_off = (size_t)layer * dim * hidden_dim;
-    
+
+    // xb_out is the output buffer, x_in is the input (do NOT modify)
+    // Use scratch space for Q/K/V projections and attention output
     float* q = ctx->scratch.q;
     float* k = ctx->scratch.k;
     float* v = ctx->scratch.v;
     float* attn_out = ctx->scratch.attn_out;
-    float* xb2 = ctx->scratch.xb;  // reuse xb buffer
-    
-    // Debug: print input x values for layer 0
-    // if (layer == 0) {
-    //     fprintf(stderr, "DEBUG layer 0 START: x[0]=%f, x[1]=%f\n", x[0], x[1]);
-    // }
-    
-    // 1. RMSNorm (input layernorm): xb = rmsnorm(x, input_layernorm[layer])
-    // Proper RMSNorm: xb = (x / rms(x)) * weight
+    float* ffn_temp = ctx->scratch.xb2;  // [hidden_dim * 2]
+
+    // Save x_in for residual connections (we'll overwrite xb_out with RMSNorm)
+    float x_residual[DIM_MAX];
+    for (int i = 0; i < dim; i++) x_residual[i] = x_in[i];
+
+    size_t ln_off = (size_t)layer * dim;
+    size_t q_off = (size_t)layer * dim * dim;
+    size_t k_off = (size_t)layer * kv_dim * dim;
+    size_t v_off = (size_t)layer * kv_dim * dim;
+    size_t o_off = (size_t)layer * dim * dim;
+    size_t post_off = (size_t)layer * dim;
+    size_t gate_off = (size_t)layer * hidden_dim * dim;
+    size_t up_off = (size_t)layer * hidden_dim * dim;
+    size_t down_off = (size_t)layer * dim * hidden_dim;
+
+    // 1. RMSNorm on x_in, write to xb_out
     float sum_sq = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        sum_sq += x[i] * x[i];
-    }
+    for (int i = 0; i < dim; i++) sum_sq += x_in[i] * x_in[i];
     float rms = sqrtf(sum_sq / (float)dim + 1e-5f);
     for (int i = 0; i < dim; i++) {
         uint16_t w = model->input_layernorm[ln_off + i];
-        float wf = sm2_f16_to_float(w);
-        xb[i] = (x[i] / rms) * wf;
+        xb_out[i] = (x_in[i] / rms) * sm2_f16_to_float(w);
     }
-    // DEBUG: Layer 0 RMSNorm only
-    // if (layer == 0) { fprintf(stderr, "DEBUG: Layer 0 RMSNorm: xb[0]=%f, xb[1]=%f, rms=%f\n", xb[0], xb[1], rms); }
-    
-    // 2. Q projection: q = xb @ q_proj.T  (q_proj is [dim, dim], stored row-major)
-    // We want q[i] = sum_j xb[j] * q_proj[j][i]  =>  xb @ q_proj^T
-    // q is [dim], q_proj is [dim x dim] row-major, so q_proj[j][i] = q_proj[j*dim + i]
-    memset(q, 0, dim * sizeof(float));
+
+    // 2. Q projection: q = xb_out @ q_proj.T
+    // q_proj is [dim, dim] stored row-major, so q_proj[i, j] = q_proj[i * dim + j]
     for (int i = 0; i < dim; i++) {
+        float sum = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t h = model->q_proj[q_off + j * dim + i];  // q_proj[j][i] = q_proj[j*dim + i]
-            float hf = sm2_f16_to_float(h);
-            q[i] += xb[j] * hf;
+            uint16_t w = model->q_proj[q_off + i * dim + j];
+            sum += xb_out[j] * sm2_f16_to_float(w);
         }
+        q[i] = sum;
     }
-    
-    // 3. K projection: k = xb @ k_proj.T  (k_proj is [kv_dim, dim], stored row-major)
-    // k_proj[j][i] = k_proj[j * dim + i] (row-major with dim columns)
-    memset(k, 0, kv_dim * sizeof(float));
+
+    // 3. K projection: k = xb_out @ k_proj.T
+    // k_proj is [kv_dim, dim] stored row-major, so k_proj[i, j] = k_proj[i * dim + j]
     for (int i = 0; i < kv_dim; i++) {
+        float sum = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t h = model->k_proj[k_off + j * kv_dim + i];
-            k[i] += xb[j] * sm2_f16_to_float(h);
+            uint16_t w = model->k_proj[k_off + i * dim + j];
+            sum += xb_out[j] * sm2_f16_to_float(w);
         }
+        k[i] = sum;
     }
-    
-    // 4. V projection: v = xb @ v_proj.T  (v_proj is [kv_dim, dim], stored row-major)
-    memset(v, 0, kv_dim * sizeof(float));
+
+    // 4. V projection: v = xb_out @ v_proj.T
+    // v_proj is [kv_dim, dim] stored row-major, so v_proj[i, j] = v_proj[i * dim + j]
     for (int i = 0; i < kv_dim; i++) {
+        float sum = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t h = model->v_proj[v_off + j * kv_dim + i];
-            v[i] += xb[j] * sm2_f16_to_float(h);
+            uint16_t w = model->v_proj[v_off + i * dim + j];
+            sum += xb_out[j] * sm2_f16_to_float(w);
         }
+        v[i] = sum;
     }
-    
-    // 5. Apply RoPE to Q and K
+
+    // 5. RoPE on Q and K
     sm2_rope(q, k, model->head_dim, seq_pos, model->n_heads, model->n_kv_heads, spec->rope_theta);
-    
-    // 6. Attention (simplified - no KV cache yet)
-    // For prefill with single token, seq_len=1 (attend only to current position)
-    // K and V are computed for current position only, so only attend to pos 0
-    attention_forward(attn_out, q, k, v, model->n_heads, model->n_kv_heads, model->head_dim, 1);
-    
-    // 7. O projection: xb = attn_out @ o_proj.T  (o_proj is [dim, dim])
-    memset(xb, 0, dim * sizeof(float));
+
+    // 6. Store K/V to cache at position seq_pos
+    int kv_head_dim = model->head_dim;
+    for (int head = 0; head < model->n_kv_heads; head++) {
+        for (int d = 0; d < kv_head_dim; d++) {
+            int cache_idx = head * ctx->params.max_context * kv_head_dim + seq_pos * kv_head_dim + d;
+            ctx->scratch.k_cache[layer][cache_idx] = k[head * kv_head_dim + d];
+            ctx->scratch.v_cache[layer][cache_idx] = v[head * kv_head_dim + d];
+        }
+    }
+
+    // 7. Attention with KV cache -> attn_out
+    attention_with_cache(attn_out, q, layer, ctx, model);
+
+    // 8. O projection: xb_out = attn_out @ o_proj.T
+    // o_proj is [dim, dim] stored row-major, so o_proj[i, j] = o_proj[i * dim + j]
     for (int i = 0; i < dim; i++) {
+        float sum = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t h = model->o_proj[o_off + j * dim + i];
-            xb[i] += attn_out[j] * sm2_f16_to_float(h);
+            uint16_t w = model->o_proj[o_off + i * dim + j];
+            sum += attn_out[j] * sm2_f16_to_float(w);
         }
+        xb_out[i] = sum;
     }
-    
-    // 8. Residual: xb += residual (original input was xb before layernorm, now add)
+
+    // 9. Residual: xb_out += original input (for attention)
     for (int i = 0; i < dim; i++) {
-        xb[i] = x[i] + xb[i];
+        xb_out[i] += x_residual[i];
     }
-    
-    // 9. Post-attention RMSNorm: xb2 = (xb / rms(xb)) * post_attention_layernorm
-    // Compute rms of xb (the residual output after attention)
-    {
-        float sum_sq2 = 0.0f;
-        for (int i = 0; i < dim; i++) {
-            sum_sq2 += xb[i] * xb[i];
-        }
-        float rms2 = sqrtf(sum_sq2 / (float)dim + 1e-5f);
-        for (int i = 0; i < dim; i++) {
-            uint16_t w = model->post_attention_layernorm[post_off + i];
-            float wf = sm2_f16_to_float(w);
-            xb2[i] = (xb[i] / rms2) * wf;
-        }
+
+    // Save post-attention hidden state for FFN residual
+    float x_post_attn[DIM_MAX];
+    for (int i = 0; i < dim; i++) x_post_attn[i] = xb_out[i];
+
+    // 10. Post-attention RMSNorm on xb_out, store back to xb_out
+    sum_sq = 0.0f;
+    for (int i = 0; i < dim; i++) sum_sq += xb_out[i] * xb_out[i];
+    rms = sqrtf(sum_sq / (float)dim + 1e-5f);
+    for (int i = 0; i < dim; i++) {
+        uint16_t w = model->post_attention_layernorm[post_off + i];
+        xb_out[i] = (xb_out[i] / rms) * sm2_f16_to_float(w);
     }
-    
-    // 10. SwiGLU FFN: gate = xb2 @ gate_proj.T, up = xb2 @ up_proj.T, down = silu(gate) * up @ down_proj.T
-    // gate_proj: [hidden_dim, dim] stored row-major, gate_proj[i][j] = gate_proj[i * dim + j]
-    // up_proj: [hidden_dim, dim] stored row-major, up_proj[i][j] = up_proj[i * dim + j]
-    // down_proj: [dim, hidden_dim] stored row-major, down_proj[i][j] = down_proj[i * hidden_dim + j]
-    // Use xb2[0..hidden_dim-1] for gate_out, xb2[hidden_dim..2*hidden_dim-1] for up_out
-    float* gate_out = ctx->scratch.xb2;
-    float* up_out = ctx->scratch.xb2 + hidden_dim;
-    
-    // gate = xb2 @ gate_proj.T -> [hidden_dim]
-    // gate_proj: [hidden_dim, dim] row-major, flat[i*dim + j] = element[i][j]
-    // gate_proj.T[i][j] = gate_proj[j][i] = flat[j*dim + i]
-    memset(gate_out, 0, hidden_dim * sizeof(float));
+
+    // 11. SwiGLU FFN using ffn_temp as workspace
+    float* gate_out = ffn_temp;                  // first hidden_dim elements
+    float* up_out = ffn_temp + hidden_dim;      // second hidden_dim elements
+
+    // gate = xb_out @ gate_proj.T
+    // gate_proj is [hidden_dim, dim] stored row-major, so gate_proj[i, j] = gate_proj[i * dim + j]
     for (int i = 0; i < hidden_dim; i++) {
+        float sum = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t h = model->gate_proj[gate_off + j * dim + i];
-            gate_out[i] += xb2[j] * sm2_f16_to_float(h);
+            uint16_t w = model->gate_proj[gate_off + i * dim + j];
+            sum += xb_out[j] * sm2_f16_to_float(w);
         }
+        gate_out[i] = sum;
     }
-    
-    // up = xb2 @ up_proj.T -> [hidden_dim]
-    // up_proj: [hidden_dim, dim] row-major, flat[i*dim + j] = element[i][j]
-    // up_proj.T[i][j] = up_proj[j][i] = flat[j*dim + i]
-    memset(up_out, 0, hidden_dim * sizeof(float));
+
+    // up = xb_out @ up_proj.T
+    // up_proj is [hidden_dim, dim] stored row-major, so up_proj[i, j] = up_proj[i * dim + j]
     for (int i = 0; i < hidden_dim; i++) {
+        float sum = 0.0f;
         for (int j = 0; j < dim; j++) {
-            uint16_t h = model->up_proj[up_off + j * dim + i];
-            up_out[i] += xb2[j] * sm2_f16_to_float(h);
+            uint16_t w = model->up_proj[up_off + i * dim + j];
+            sum += xb_out[j] * sm2_f16_to_float(w);
         }
+        up_out[i] = sum;
     }
-    
-    // Apply SiLU to gate: silu(x) = x * sigmoid(x)
+
+    // SiLU: gate = gate * sigmoid(gate)
     for (int i = 0; i < hidden_dim; i++) {
-        float s = 1.0f / (1.0f + expf(-gate_out[i]));
-        gate_out[i] = gate_out[i] * s;
+        gate_out[i] *= 1.0f / (1.0f + expf(-gate_out[i]));
     }
-    
-    // Multiply: gate_out = silu(gate) * up
-    for (int i = 0; i < hidden_dim; i++) {
-        gate_out[i] *= up_out[i];
-    }
-    
-    // down = gate_out @ down_proj.T -> [dim]
-    // down_proj: [dim, hidden_dim] row-major, flat[i*hidden_dim + j] = element[i][j]
-    // down_proj.T[i][j] = down_proj[j][i] = flat[j*hidden_dim + i]
-    // Compute directly into xb (which is free since we already saved residual in step 8)
+
+    // Multiply: gate *= up
+    for (int i = 0; i < hidden_dim; i++) gate_out[i] *= up_out[i];
+
+    // down = gate_out @ down_proj.T, add residual to post-attention hidden state
+    // down_proj is [dim, hidden_dim] stored row-major: down_proj[i, j] = down_proj[down_off + i * hidden_dim + j]
     for (int i = 0; i < dim; i++) {
         float sum = 0.0f;
         for (int j = 0; j < hidden_dim; j++) {
-            uint16_t h = model->down_proj[down_off + i * hidden_dim + j];
-            sum += gate_out[j] * sm2_f16_to_float(h);
+            uint16_t w = model->down_proj[down_off + i * hidden_dim + j];
+            sum += gate_out[j] * sm2_f16_to_float(w);
         }
-        xb[i] += sum;  // Add to residual (xb already has residual from step 8)
+        // FFN output + residual (post-attention hidden state)
+        xb_out[i] = x_post_attn[i] + sum;
     }
-    
-    // Debug: after FFN + residual
-    // if (layer == 1) {
-    //     fprintf(stderr, "DEBUG layer 1: after FFN + residual, xb[0]=%f, xb[1]=%f\n", xb[0], xb[1]);
-    // }
+    // xb_out now holds the final layer output
+    (void)hidden_dim; // unused
 }
 
 // ============================================================================
@@ -405,33 +341,51 @@ static void layer_forward(float* xb, const float* x, int layer,
 
 int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
     sm2_model* model = ctx->model;
-    
-    // Embed first token
-    float* x = ctx->scratch.x;
-    
-    if (model->tok_embeddings && model->tok_embeddings->data) {
-        embedding_lookup(x, tokens[0], model->tok_embeddings);
-    } else {
+
+    // Process all layers for each token independently
+    // This is correct for transformers: each token goes through all layers
+    // The KV cache stores K/V so attention can attend to previous tokens
+    for (int t = 0; t < n_tokens; t++) {
+        int seq_pos = t;
+
+        // Get embedding for current token into scratch.x
+        if (model->tok_embeddings && model->tok_embeddings->data) {
+            embedding_lookup(ctx->scratch.x, tokens[t], model->tok_embeddings);
+        } else {
+            for (int i = 0; i < model->dim; i++) ctx->scratch.x[i] = (float)(tokens[t] % 256) / 256.0f;
+        }
+
+        // Run this token through all layers
+        // Each layer reads from scratch.x, writes to scratch.xb
+        // After each layer, swap buffers so output becomes input for next layer
+        for (int layer = 0; layer < model->n_layers; layer++) {
+            layer_forward(ctx->scratch.xb, ctx->scratch.x, layer, model, ctx, seq_pos);
+            // Swap input and output buffers
+            float* tmp = ctx->scratch.x;
+            ctx->scratch.x = ctx->scratch.xb;
+            ctx->scratch.xb = tmp;
+        }
+
+        // After all layers, the final hidden state is in scratch.x
+        // Update KV cache length
+        ctx->scratch.kv_cache_len = t + 1;
+    }
+
+    // Final RMSNorm
+    if (model->final_norm) {
+        float* final_h = ctx->scratch.x;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < model->dim; i++) sum_sq += final_h[i] * final_h[i];
+        float rms = sqrtf(sum_sq / (float)model->dim + 1e-5f);
+        float scale = 1.0f / rms;
         for (int i = 0; i < model->dim; i++) {
-            x[i] = (float)(tokens[0] % 256) / 256.0f;
+            final_h[i] = final_h[i] * scale * sm2_f16_to_float(model->final_norm[i]);
         }
     }
-    
-    // Forward through all layers
-    for (int layer = 0; layer < model->n_layers; layer++) {
-        layer_forward(ctx->scratch.xb, x, layer, model, ctx, n_tokens - 1);
-        
-        // Swap xb and x for next layer
-        float* tmp = ctx->scratch.x;
-        ctx->scratch.x = ctx->scratch.xb;
-        ctx->scratch.xb = tmp;
-    }
-    
-    // Compute logits from final hidden state
-    // logits = tok_embeddings @ hidden_state.T  (vocab_size x dim)
-    // Use scratch.x (which has the final hidden state after layer loop)
+
+    // Compute logits
     if (model->tok_embeddings && model->tok_embeddings->data) {
-        float* final_h = ctx->scratch.x;  // Final hidden state
+        float* final_h = ctx->scratch.x;
         for (int i = 0; i < model->vocab_size; i++) {
             float sum = 0.0f;
             for (int j = 0; j < model->dim; j++) {
@@ -441,77 +395,67 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
             ctx->scratch.logits[i] = sum;
         }
     }
-    
+
     return 0;
 }
 
 // ============================================================================
-// DECODE NEXT - Generate single token (no allocation in hot path)
+// DECODE NEXT - Generate single token
 // ============================================================================
 
 int sm2_decode_next(sm2_context* ctx, int* out_token) {
-    // Use current position for this token (don't increment yet)
-    int seq_pos = ctx->pos;
-    
-    // DEBUG: Print top 5 logits before sampling
-    float* logits = ctx->scratch.logits;
-    // fprintf(stderr, "DEBUG decode_next: pos=%d, first 5 logits: ", seq_pos);
-    // for (int i = 0; i < 5; i++) {
-    //     fprintf(stderr, "%.2f ", logits[i]);
-    // }
-    // fprintf(stderr, "\n");
-    //
-    // // Find argmax to see what token SHOULD be selected
-    // int best_token = 0;
-    // float best_logit = logits[0];
-    // for (int i = 1; i < ctx->model->vocab_size; i++) {
-    //     if (logits[i] > best_logit) {
-    //         best_logit = logits[i];
-    //         best_token = i;
-    //     }
-    // }
-    // fprintf(stderr, "DEBUG: argmax would select token=%d (logit=%.2f)\n", best_token, best_logit);
-    
-    // Sample from logits (computed in previous iteration or prefill)
-    int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state);
-    // fprintf(stderr, "DEBUG: sm2_sample_token returned token=%d\n", token);
-    
-    // Get embedding for this token
-    float* x = ctx->scratch.x;
-    
+    // seq_pos is absolute position in the full sequence
+    int seq_pos = ctx->scratch.kv_cache_len;  // Position right after all cached tokens
+
+    // Get embedding for this token into ctx->scratch.x
+    // The token to embed is the last generated token (ctx->last_token)
     if (ctx->model->tok_embeddings && ctx->model->tok_embeddings->data) {
-        embedding_lookup(x, token, ctx->model->tok_embeddings);
+        embedding_lookup(ctx->scratch.x, ctx->last_token, ctx->model->tok_embeddings);
     } else {
-        for (int i = 0; i < ctx->model->dim; i++) {
-            x[i] = (float)(token % 256) / 256.0f;
-        }
+        for (int i = 0; i < ctx->model->dim; i++) ctx->scratch.x[i] = (float)(ctx->last_token % 256) / 256.0f;
     }
-    
-    // Forward through layers
+
+    // Forward through all layers
     for (int layer = 0; layer < ctx->model->n_layers; layer++) {
-        layer_forward(ctx->scratch.xb, x, layer, ctx->model, ctx, seq_pos);
-        
+        layer_forward(ctx->scratch.xb, ctx->scratch.x, layer, ctx->model, ctx, seq_pos);
+        // Swap input and output buffers
         float* tmp = ctx->scratch.x;
         ctx->scratch.x = ctx->scratch.xb;
         ctx->scratch.xb = tmp;
     }
-    
-    // Compute logits for next token
+
+    // Final RMSNorm
+    if (ctx->model->final_norm) {
+        float* final_h = ctx->scratch.x;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < ctx->model->dim; i++) sum_sq += final_h[i] * final_h[i];
+        float rms = sqrtf(sum_sq / (float)ctx->model->dim + 1e-5f);
+        float scale = 1.0f / rms;
+        for (int i = 0; i < ctx->model->dim; i++) {
+            final_h[i] = final_h[i] * scale * sm2_f16_to_float(ctx->model->final_norm[i]);
+        }
+    }
+
+    // Compute logits
     if (ctx->model->tok_embeddings && ctx->model->tok_embeddings->data) {
+        float* final_h = ctx->scratch.x;
         for (int i = 0; i < ctx->model->vocab_size; i++) {
             float sum = 0.0f;
             for (int j = 0; j < ctx->model->dim; j++) {
                 uint16_t h = ctx->model->tok_embeddings->data[i * ctx->model->dim + j];
-                sum += ctx->scratch.x[j] * sm2_f16_to_float(h);
+                sum += final_h[j] * sm2_f16_to_float(h);
             }
             ctx->scratch.logits[i] = sum;
         }
     }
-    
-    // Update position AFTER processing
+
+    // NOW sample from the newly computed logits
+    int token = sm2_sample_token(ctx->scratch.logits, &ctx->params, &ctx->rng_state);
+
+    // Update KV cache length to include this new token
+    ctx->scratch.kv_cache_len = seq_pos + 1;
     ctx->pos++;
     ctx->last_token = token;
-    
     *out_token = token;
     return 0;
 }
@@ -523,15 +467,13 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
 void sm2_debug_print_logits(sm2_context* ctx, int top_n) {
     float* logits = ctx->scratch.logits;
     int vocab_size = ctx->model->vocab_size;
-    
-    // Simple approach: just print first 20 logits
+
     fprintf(stderr, "First 20 logits:");
     for (int i = 0; i < 20 && i < vocab_size; i++) {
         fprintf(stderr, " [%d]=%.2f", i, logits[i]);
     }
     fprintf(stderr, "\n");
-    
-    // Find top N
+
     fprintf(stderr, "Top %d logits:\n", top_n);
     for (int t = 0; t < top_n; t++) {
         int max_idx = 0;
@@ -543,7 +485,7 @@ void sm2_debug_print_logits(sm2_context* ctx, int top_n) {
             }
         }
         fprintf(stderr, "  [%d] = %.4f\n", max_idx, max_val);
-        logits[max_idx] = -1e9; // Mark as done
+        logits[max_idx] = -1e9f;
     }
 }
 
@@ -554,14 +496,15 @@ void sm2_debug_print_logits(sm2_context* ctx, int top_n) {
 int sm2_decode_stream(sm2_context* ctx, int max_new_tokens, sm2_stream_cb cb, void* user_data) {
     int n = 0;
     int token;
-    
+    (void)user_data; // unused
+
     while (n < max_new_tokens) {
         int ok = sm2_decode_next(ctx, &token);
         if (ok != 0 || token == 2) break; // EOS
-        
         if (cb) cb(token, user_data);
         n++;
     }
-    
+    if (cb) cb(-1, user_data); // Signal end of stream
+
     return n;
 }
