@@ -1,7 +1,7 @@
 # Makefile for smollm2.c - Decode-first SmolLM2 inference engine
 
 CC = gcc
-CFLAGS = -std=c99 -Wall -Wextra -O2 -march=native
+CFLAGS = -std=c99 -Wall -Wextra -O3 -march=native -fomit-frame-pointer -ffast-math
 CFLAGS += -DNDEBUG -Iinclude
 
 # Target: smollm2-cli (CLI tool)
@@ -19,6 +19,7 @@ SRC_CORE = $(SRC)smollm2.c \
            $(SRC)sm2_mlp.c \
            $(SRC)sm2_sampling.c \
            $(SRC)sm2_matmul_ref.c \
+           $(SRC)sm2_matmul_fast.c \
            $(SRC)sm2_context.c
 
 # Decode layer (smollm2dl)

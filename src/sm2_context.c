@@ -141,7 +141,7 @@ static void attention_with_cache(float* out, const float* q, int layer,
 
         // Compute attention scores for all cached positions
         float max_score = -1e9f;
-        float scores[2048];
+        float scores[8192];  // Must be >= max_context
 
         for (int pos = 0; pos < kv_seq; pos++) {
             float dot = 0.0f;
@@ -466,6 +466,7 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
     }
 
     // Forward through all layers
+    // Note: After the loop, xb_out is in ctx->scratch.xb (last swap puts output there)
     for (int layer = 0; layer < ctx->model->n_layers; layer++) {
         layer_forward(ctx->scratch.xb, ctx->scratch.x, layer, ctx->model, ctx, seq_pos);
         // Swap input and output buffers
@@ -474,7 +475,7 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
         ctx->scratch.xb = tmp;
     }
 
-    // Final RMSNorm
+    // Final RMSNorm - need to use the correct buffer (final hidden state is in scratch.x)
     if (ctx->model->final_norm) {
         float* final_h = ctx->scratch.x;
         float sum_sq = 0.0f;

@@ -15,7 +15,8 @@ static inline float sm2_f16_to_float(uint16_t h) {
     float result;
 
     if (exp == 0) {
-        result = (float)frac / 1024.0f;
+        // Denormalized: (frac / 1024) * 2^(-14)
+        result = (float)frac / 65536.0f;  // 1024 * 2^(-14) = 65536
     } else if (exp == 31) {
         result = (frac == 0) ? 1.0f / 0.0f : 0.0f / 0.0f;
     } else {
