@@ -81,11 +81,15 @@ int run_chat_cli(sm2_model* model, const cli_args* args, const sm2_generate_para
         // Generate response
         printf("\n");
         printf("\033[1;32mSmolLM:\033[0m ");
+        fflush(stdout);
 
         double t0 = time_ms();
+        int last_update = 0;
+        int gen_tokens = 0;
 
         // Generate response using args for sampling
         int resp_len = 0;
+        char response[8192] = {0};
         {
             char* prompt = chat_history_build_prompt(&hist, NULL);
             if (prompt) {
@@ -105,6 +109,10 @@ int run_chat_cli(sm2_model* model, const cli_args* args, const sm2_generate_para
                         ctx->params.penalty_window = 32;
 
                         if (sm2_prefill(ctx, tokens, n_tokens) == 0) {
+                            // Show loading indicator
+                            printf("\033[90m[Generating...]\033[0m");
+                            fflush(stdout);
+
                             while (resp_len < (int)sizeof(response) - 1) {
                                 int token;
                                 if (sm2_decode_next(ctx, &token) != 0) break;
@@ -127,6 +135,19 @@ int run_chat_cli(sm2_model* model, const cli_args* args, const sm2_generate_para
                                     }
                                     free(decoded);
                                 }
+                                gen_tokens++;
+
+                                // Update progress every 300ms
+                                double dt_gen = (time_ms() - t0) / 1000.0;
+                                int now = (int)(time_ms() / 300);
+                                if (now != last_update && gen_tokens > 0) {
+                                    printf("\r\033[1;32mSmolLM:\033[0m %s\033[90m[%.1f tok/s]\033[0m",
+                                           response + (resp_len > 50 ? resp_len - 50 : 0),
+                                           gen_tokens / dt_gen);
+                                    if (resp_len > 50) printf("...");
+                                    fflush(stdout);
+                                    last_update = now;
+                                }
                             }
                         }
                         sm2_free_context(ctx);
@@ -139,7 +160,7 @@ int run_chat_cli(sm2_model* model, const cli_args* args, const sm2_generate_para
         response[resp_len >= 0 ? resp_len : 0] = '\0';
 
         if (resp_len > 0) {
-            printf("\n\033[90m(%.1f ms, %d chars)\033[0m", dt, resp_len);
+            printf("\n\033[90m(%.1f ms, %d chars, %.1f tok/s)\033[0m", dt, resp_len, gen_tokens / (dt / 1000.0));
             chat_history_add_assistant(&hist, response);
         } else {
             printf("\n\033[91mGeneration failed\033[0m");

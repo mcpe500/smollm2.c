@@ -260,16 +260,21 @@ int main(int argc, char** argv) {
     }
 
     int ok;
-    if (args.mode == MODE_CLI) {
-        // CLI mode: single-prompt inference (no interactive chat)
-        ok = run_inference(model, &args);
-    } else if (args.mode == MODE_TUI) {
+    sm2_generate_params gen_params = {
+        .temperature = args.temperature,
+        .top_p = args.top_p,
+        .top_k = args.top_k,
+        .max_output = args.max_output,
+        .repetition_penalty = args.repetition_penalty,
+    };
+
+    if (args.mode == MODE_TUI) {
         ok = run_chat_tui(model, &args);
     } else if (args.mode == MODE_WEB) {
         ok = run_chat_web(model, &args);
     } else {
-        // Fallback: single-prompt mode
-        ok = run_inference(model, &args);
+        // MODE_CLI or default: interactive CLI chat mode
+        ok = run_chat_cli(model, &args, &gen_params);
     }
 
     sm2_free_model(model);

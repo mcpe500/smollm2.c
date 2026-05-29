@@ -250,10 +250,15 @@ static int generate_response(const char* user_input) {
 
     g_state.generating = 1;
     double t0 = time_ms();
+    int last_update = 0;
 
     char response[8192];
     int resp_len = 0;
     int gen_tokens = 0;
+
+    // Show initial loading message
+    printf("\n" ANSI_YELLOW "▌ SmolLM: Generating..." ANSI_RESET);
+    fflush(stdout);
 
     while (resp_len < (int)sizeof(response) - 1) {
         int token;
@@ -280,10 +285,21 @@ static int generate_response(const char* user_input) {
         }
         gen_tokens++;
 
-        // Update stats
+        // Update stats and show progress every 200ms
         double dt = (time_ms() - t0) / 1000.0;
         if (dt > 0.1) {
             g_state.tokens_per_sec = gen_tokens / dt;
+        }
+
+        // Update display periodically
+        int now = (int)(time_ms() / 200);
+        if (now != last_update && now % 5 == 0) {
+            // Show progress: spinner + tokens/s + chars generated
+            printf("\r" ANSI_YELLOW "▌ SmolLM: " ANSI_RESET "%s ", response + (resp_len > 40 ? resp_len - 40 : 0));
+            if (resp_len > 40) printf("...");
+            printf(ANSI_DIM "[%.1f tok/s, %d chars]" ANSI_RESET, g_state.tokens_per_sec, resp_len);
+            fflush(stdout);
+            last_update = now;
         }
     }
 
@@ -291,7 +307,6 @@ static int generate_response(const char* user_input) {
     sm2_free_context(ctx);
 
     g_state.generating = 0;
-    g_state.tokens_per_sec = gen_tokens / ((time_ms() - t0) / 1000.0);
 
     chat_history_add_assistant(&g_state.history, response);
     chat_history_trim(&g_state.history, 1800);
