@@ -2,21 +2,34 @@
 //
 // RoPE encodes position information by rotating query and key vectors.
 // Each head dimension d is split into pairs, rotated by theta^(2i/d).
-// 
+//
 
 #include <stdio.h>
 #include <math.h>
 #include "smollm2.h"
 
 // ============================================================================
-// Precompute RoPE frequencies for efficiency
+// Precomputed RoPE frequencies (computed once)
 // ============================================================================
 
+// Freq table: freq_base[i] = theta^(-2i/head_dim) for i in [0, head_dim/2)
+static float rope_freq_table[64];  // head_dim max is 64
+static int rope_freq_table_size = 0;
+static float rope_theta_global = 0;
+
+// Build frequency table once
 void sm2_rope_build_freqs(float* freqs, int n_heads, int head_dim, int max_seq, float theta) {
-    // Precompute rotation frequencies for each head dimension
+    rope_theta_global = theta;
+    rope_freq_table_size = head_dim / 2;
+
+    // Precompute 1/theta^(2i/head_dim) for each i
+    for (int i = 0; i < rope_freq_table_size; i++) {
+        rope_freq_table[i] = powf(theta, -(float)(2 * i) / (float)head_dim);
+    }
+
+    // Also fill the output freqs array for compatibility
     for (int i = 0; i < head_dim / 2; i++) {
-        float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
-        
+        float freq = rope_freq_table[i];
         for (int pos = 0; pos < max_seq; pos++) {
             freqs[pos * (head_dim / 2) + i] = freq * (float)pos;
         }
@@ -40,18 +53,24 @@ void sm2_rope_apply(float* vec, const float* freqs, int head_dim, int seq_pos) {
     }
 }
 
-// Apply RoPE to query and key vectors (inline)
+// Apply RoPE to query and key vectors (inline) - optimized
 void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_heads, float rope_theta) {
     int half = head_dim / 2;
 
-    // For decode (pos=0), we need to apply RoPE for position 0
-    // For generation, pos is kv_cache_len which increments each step
-    int rope_pos = pos;
+    // Rebuild freq table if theta changed (shouldn't happen often)
+    if (rope_theta_global != rope_theta || rope_freq_table_size == 0) {
+        rope_theta_global = rope_theta;
+        rope_freq_table_size = half;
+        for (int i = 0; i < half; i++) {
+            rope_freq_table[i] = powf(rope_theta, -(float)(2 * i) / (float)head_dim);
+        }
+    }
 
     for (int h = 0; h < n_heads; h++) {
         float* q_head = q + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = (float)rope_pos / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+            // Use precomputed freq * pos
+            float freq = rope_freq_table[i] * (float)pos;
             float cos_theta = cosf(freq);
             float sin_theta = sinf(freq);
 
@@ -66,7 +85,7 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
     for (int h = 0; h < n_kv_heads; h++) {
         float* k_head = k + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = (float)rope_pos / powf(rope_theta, (float)(2 * i) / (float)head_dim);
+            float freq = rope_freq_table[i] * (float)pos;
             float cos_theta = cosf(freq);
             float sin_theta = sinf(freq);
 

@@ -7,23 +7,30 @@
 #include <math.h>
 
 // Convert IEEE-754 float16 to float
+// Optimized: uses shifts instead of powf
 static inline float sm2_f16_to_float(uint16_t h) {
     unsigned int bits = h;
     int sign = (bits >> 15) & 1;
     int exp = (bits >> 10) & 0x1F;
     int frac = bits & 0x3FF;
-    float result;
 
     if (exp == 0) {
-        // Denormalized: (frac / 1024) * 2^(-14)
-        result = (float)frac / 65536.0f;  // 1024 * 2^(-14) = 65536
-    } else if (exp == 31) {
-        result = (frac == 0) ? 1.0f / 0.0f : 0.0f / 0.0f;
-    } else {
-        result = (1.0f + (float)frac / 1024.0f) * powf(2.0f, (float)(exp - 15));
+        // Denormalized
+        return sign ? -(float)frac / 65536.0f : (float)frac / 65536.0f;
+    }
+    if (exp == 31) {
+        // Inf or NaN
+        return sign ? -1.0f / 0.0f : 1.0f / 0.0f;
     }
 
-    return sign ? -result : result;
+    // Fast path: compute 2^(exp-15) using bit manipulation
+    // Use direct float construction
+    unsigned int ieee = ((sign << 31) |
+                         ((exp + 127 - 15) << 23) |
+                         (frac << (23 - 10)));
+    float result;
+    memcpy(&result, &ieee, sizeof(float));
+    return result;
 }
 
 // Convert float to IEEE-754 float16
