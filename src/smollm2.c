@@ -146,27 +146,26 @@ static int run_inference(sm2_model* model, const cli_args* args) {
     tokens[n_tokens++] = 1;  // <|im_start|>
     if (model->tokenizer) {
         // System prompt
-        int n = sm2_tokenizer_encode(model->tokenizer, system_prompt, tokens + n_tokens, 4096 - n_tokens);
-        n_tokens += n;
+        n_tokens += sm2_tokenizer_encode(model->tokenizer, "system", tokens + n_tokens, 4096 - n_tokens);
+        tokens[n_tokens++] = 198;  // Ċ (newline)
+        n_tokens += sm2_tokenizer_encode(model->tokenizer, "You are a helpful AI assistant named SmolLM, trained by Hugging Face", tokens + n_tokens, 4096 - n_tokens);
     }
     tokens[n_tokens++] = 2;  // <|im_end|>
-    tokens[n_tokens++] = 1;  // <|im_start|>
+    tokens[n_tokens++] = 198;  // Ċ (newline)
+    tokens[n_tokens++] = 1;  // <|im_start|> for user
 
     if (model->tokenizer) {
-        // User message with role
-        int n = sm2_tokenizer_encode(model->tokenizer, "user\n", tokens + n_tokens, 4096 - n_tokens);
-        n_tokens += n;
-        n = sm2_tokenizer_encode(model->tokenizer, args->prompt, tokens + n_tokens, 4096 - n_tokens);
-        n_tokens += n;
+        // User message: "user" + Ċ + "{prompt}"
+        n_tokens += sm2_tokenizer_encode(model->tokenizer, "user", tokens + n_tokens, 4096 - n_tokens);
+        tokens[n_tokens++] = 198;  // Ċ (newline)
+        n_tokens += sm2_tokenizer_encode(model->tokenizer, args->prompt, tokens + n_tokens, 4096 - n_tokens);
     }
     tokens[n_tokens++] = 2;  // <|im_end|>
+    tokens[n_tokens++] = 198;  // Ċ (newline)
     tokens[n_tokens++] = 1;  // <|im_start|> for assistant
     if (model->tokenizer) {
-        int n = sm2_tokenizer_encode(model->tokenizer, assistant_prefix, tokens + n_tokens, 4096 - n_tokens);
-        n_tokens += n;
-        // Add newline for proper formatting
-        n = sm2_tokenizer_encode(model->tokenizer, "\n", tokens + n_tokens, 4096 - n_tokens);
-        n_tokens += n;
+        n_tokens += sm2_tokenizer_encode(model->tokenizer, "assistant", tokens + n_tokens, 4096 - n_tokens);
+        tokens[n_tokens++] = 198;  // Ċ (newline)
     }
 
     // Fallback to byte tokenization if tokenizer not available
@@ -181,14 +180,7 @@ static int run_inference(sm2_model* model, const cli_args* args) {
         }
     }
 
-    // WORKAROUND: For now, use exact tokens from Python reference for "hello"
-    // The C BPE tokenizer still doesn't match HF's Rust tokenizer for all cases.
-    // Fixed: newline (Ċ) mapping is now correct.
-    if (strcmp(args->prompt, "hello") == 0) {
-        int ref_tokens[] = {1, 9690, 198, 2683, 359, 253, 5356, 5646, 11173, 3365, 3511, 308, 34519, 28, 7018, 411, 407, 19712, 8182, 2, 198, 1, 4093, 198, 28120, 2, 198, 1, 520, 9531, 198};
-        n_tokens = sizeof(ref_tokens) / sizeof(ref_tokens[0]);
-        memcpy(tokens, ref_tokens, n_tokens * sizeof(int));
-    }
+    // Tokenizer is now fixed - no more hardcoded workarounds needed
 
     printf("Input: \"%s\" => %d tokens\n", args->prompt, n_tokens);
     // Debug: print first 10 tokens

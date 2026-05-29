@@ -203,18 +203,16 @@ static int find_token_id_by_string(sm2_tokenizer* tok, const char* s, int s_len)
 
 // ============================================================================
 // BPE ENCODE WORD - uses token strings stored in merges
+// Takes explicit length to handle partial strings from pretokenization
 // ============================================================================
 
-static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int max_len) {
-    if (!word || !ids || max_len <= 0) return 0;
-
-    int word_len = strlen(word);
-    if (word_len == 0) return 0;
+static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int word_len, int* ids, int max_len) {
+    if (!word || !ids || max_len <= 0 || word_len <= 0) return 0;
 
     // If no merges or tokens loaded, fall back to byte-level
     if (!tok->merges || tok->num_merges == 0 || !tok->tokens) {
         int n = 0;
-        for (int i = 0; word[i] && n < max_len; i++) {
+        for (int i = 0; i < word_len && n < max_len; i++) {
             unsigned char b = (unsigned char)word[i];
             ids[n++] = b;
         }
@@ -233,24 +231,69 @@ static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int m
 
     // Step 1: Initialize with each character as a separate segment
     // For ASCII text, each character is a single byte = single token
-    for (int i = 0; i < word_len; i++) {
+    // BUT: For special bytes, we need to use BPE tokens:
+    //   - byte 32 (space) -> Ġ (0xC4 0xA0)
+    //   - byte 10 (newline) -> Ċ (0xC4 0x8A)
+    // Special: Ġ (0xC4 0xA0) at word start is kept as a single token for BPE merging
+    int i = 0;
+    while (i < word_len) {
         unsigned char byte_val = (unsigned char)word[i];
 
-        // Find the token ID for this single character
-        int token_id = find_token_id_by_string(tok, (const char*)&byte_val, 1);
-        if (token_id < 0) token_id = byte_val; // fallback
+        if (i < word_len - 1 && byte_val == 0xC4 && (unsigned char)word[i+1] == 0xA0) {
+            // Ġ (space prefix) - keep as single BPE unit
+            segments[n_segs] = tok->byte_to_token[32];  // Ġ token
+            seg_strs[n_segs] = malloc(3);
+            seg_strs[n_segs][0] = (char)0xC4;
+            seg_strs[n_segs][1] = (char)0xA0;
+            seg_strs[n_segs][2] = '\0';
+            n_segs++;
+            i += 2;
+        } else if (i < word_len - 1 && byte_val == 0xC4 && (unsigned char)word[i+1] == 0x8A) {
+            // Ċ (newline prefix) - keep as single BPE unit
+            segments[n_segs] = tok->byte_to_token[10];  // Ċ token
+            seg_strs[n_segs] = malloc(3);
+            seg_strs[n_segs][0] = (char)0xC4;
+            seg_strs[n_segs][1] = (char)0x8A;
+            seg_strs[n_segs][2] = '\0';
+            n_segs++;
+            i += 2;
+        } else if (byte_val == 32) {
+            // Space becomes Ġ (0xC4 0xA0) in BPE vocab
+            segments[n_segs] = tok->byte_to_token[32];  // Should be Ġ token
+            seg_strs[n_segs] = malloc(3);
+            seg_strs[n_segs][0] = (char)0xC4;
+            seg_strs[n_segs][1] = (char)0xA0;
+            seg_strs[n_segs][2] = '\0';
+            n_segs++;
+            i++;
+        } else if (byte_val == 10) {
+            // Newline becomes Ċ (0xC4 0x8A) in BPE vocab
+            segments[n_segs] = tok->byte_to_token[10];  // Should be Ċ token
+            seg_strs[n_segs] = malloc(3);
+            seg_strs[n_segs][0] = (char)0xC4;
+            seg_strs[n_segs][1] = (char)0x8A;
+            seg_strs[n_segs][2] = '\0';
+            n_segs++;
+            i++;
+        } else {
+            // Find the token ID for this single character
+            int token_id = find_token_id_by_string(tok, (const char*)&byte_val, 1);
+            if (token_id < 0) token_id = byte_val; // fallback
 
-        segments[n_segs] = token_id;
+            segments[n_segs] = token_id;
 
-        seg_strs[n_segs] = malloc(2);
-        seg_strs[n_segs][0] = (char)byte_val;
-        seg_strs[n_segs][1] = '\0';
-        n_segs++;
+            seg_strs[n_segs] = malloc(2);
+            seg_strs[n_segs][0] = (char)byte_val;
+            seg_strs[n_segs][1] = '\0';
+            n_segs++;
+            i++;
+        }
     }
 
     // Step 2: Iteratively apply BPE merges
     // For each adjacent pair, check if the concatenated string is in the merges table
-    // The merge that appears at the lowest index (most frequent) gets applied first
+    // AND is a valid vocab token. The merge that appears at the lowest index
+    // (most frequent) among VALID merges gets applied first.
     int iterations = 0;
     int max_iterations = n_segs * 4;
 
@@ -260,8 +303,15 @@ static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int m
         int best_rank = -1;
         int best_idx = -1;
 
-        // Find the best pair (lowest rank in merges table)
-        for (int i = 0; i < n_segs - 1; i++) {
+        // Find all valid merges first, then pick the best (lowest rank)
+        // A valid merge is one where:
+        // 1. The pair exists in the merges list
+        // 2. The merged result is a valid token in the vocab
+        typedef struct { int rank; int idx; } merge_candidate;
+        merge_candidate candidates[256];
+        int n_candidates = 0;
+
+        for (int i = 0; i < n_segs - 1 && n_candidates < 256; i++) {
             int len1 = strlen(seg_strs[i]);
             int len2 = strlen(seg_strs[i + 1]);
             int pair_len = len1 + len2;
@@ -281,16 +331,34 @@ static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int m
                 }
             }
 
-            free(pair);
-
-            if (rank >= 0 && (best_rank < 0 || rank < best_rank)) {
-                best_rank = rank;
-                best_idx = i;
+            // Check if merged result is a valid token
+            int merged_id = -1;
+            if (rank >= 0) {
+                merged_id = find_token_id_by_string(tok, pair, pair_len);
             }
+
+            // Only consider if both merge exists AND result is valid token
+            if (rank >= 0 && merged_id >= 0) {
+                candidates[n_candidates].rank = rank;
+                candidates[n_candidates].idx = i;
+                n_candidates++;
+            }
+
+            free(pair);
         }
 
-        if (best_idx < 0) {
-            break; // No more merges possible
+        if (n_candidates == 0) {
+            break; // No valid merges possible
+        }
+
+        // Pick the best (lowest rank)
+        best_rank = candidates[0].rank;
+        best_idx = candidates[0].idx;
+        for (int i = 1; i < n_candidates; i++) {
+            if (candidates[i].rank < best_rank) {
+                best_rank = candidates[i].rank;
+                best_idx = candidates[i].idx;
+            }
         }
 
         // Build the merged string
@@ -301,12 +369,6 @@ static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int m
 
         // Find the token ID for the merged string
         int merged_id = find_token_id_by_string(tok, merged, merged_len);
-
-        if (merged_id < 0) {
-            // Merged string not in vocab - no more merges possible
-            free(merged);
-            break;
-        }
 
         // Apply merge: replace seg[best_idx] with merged_id, remove seg[best_idx+1]
         segments[best_idx] = merged_id;
@@ -340,21 +402,17 @@ static int bpe_encode_word(sm2_tokenizer* tok, const char* word, int* ids, int m
     return n;
 }
 
-// ============================================================================
-// PRETOKENIZE: split text into word pieces with proper space handling
-// For BPE tokenizers, spaces at word starts are preserved as special tokens
-// ============================================================================
-
-// Token type for pretokenization
+// Pretokenize: split text into word pieces on whitespace boundaries
+// Track whether each word is preceded by space for Ġ prefix handling
 typedef enum {
     TOKEN_PIECE_WORD,      // Regular word text
-    TOKEN_PIECE_SPACE,     // Whitespace (will become Ġ prefix)
 } token_piece_type;
 
 typedef struct {
     token_piece_type type;
-    const char* text;
-    int len;
+    const char* text;      // Word text without leading whitespace
+    int len;               // Length of the word
+    int preceded_by_space; // True if preceded by space (for Ġ prefix)
 } token_piece;
 
 static int pre_tokenize(const char* text, token_piece* pieces, int max_pieces) {
@@ -362,23 +420,24 @@ static int pre_tokenize(const char* text, token_piece* pieces, int max_pieces) {
     const char* p = text;
 
     while (*p && n < max_pieces - 1) {
-        // Check if we're at whitespace
-        if (is_whitespace(*p)) {
-            // Each space becomes a separate piece - don't include trailing spaces
-            pieces[n].type = TOKEN_PIECE_SPACE;
-            pieces[n].text = p;
-            pieces[n].len = 1;
-            p++;
-            n++;
-        } else {
-            // Collect word
-            const char* start = p;
-            while (*p && !is_whitespace(*p)) p++;
-            pieces[n].type = TOKEN_PIECE_WORD;
-            pieces[n].text = start;
-            pieces[n].len = (int)(p - start);
-            n++;
-        }
+        // Check if preceded by space (for Ġ prefix)
+        int preceded_by_space = (*p == ' ');
+
+        // Skip any leading whitespace
+        while (*p && is_whitespace(*p)) p++;
+        if (!*p) break;
+
+        // Record start of word
+        const char* word_start = p;
+
+        // Find end of word (whitespace boundary)
+        while (*p && !is_whitespace(*p)) p++;
+
+        pieces[n].type = TOKEN_PIECE_WORD;
+        pieces[n].text = word_start;
+        pieces[n].len = (int)(p - word_start);
+        pieces[n].preceded_by_space = preceded_by_space;
+        n++;
     }
 
     return n;
@@ -391,35 +450,24 @@ static int pre_tokenize(const char* text, token_piece* pieces, int max_pieces) {
 int sm2_tokenizer_encode(sm2_tokenizer* tok, const char* text, int* ids, int max_len) {
     if (!tok || !text || !ids || max_len <= 0) return -1;
 
-    // Pretokenize into words and spaces
+    // Pretokenize into words
     token_piece pieces[512];
     int n_pieces = pre_tokenize(text, pieces, 512);
 
     int n = 0;
     for (int w = 0; w < n_pieces && n < max_len; w++) {
-        if (pieces[w].type == TOKEN_PIECE_SPACE) {
-            // Check what kind of whitespace it is
-            char ws_char = pieces[w].text[0];
-            if (ws_char == '\n') {
-                // Newline becomes the Ċ token (token 198)
-                // byte_to_token[10] should map to Ċ after our fix
-                ids[n++] = tok->byte_to_token[10];  // newline byte -> Ċ token
-            } else if (ws_char == ' ') {
-                // Space becomes the Ġ token (token ID that starts with space in HF vocab)
-                // In our tokenizer, this maps byte 32 to the Ġ token
-                ids[n++] = tok->byte_to_token[32];  // space byte -> Ġ token
-            } else {
-                // Other whitespace (tab, etc.) - use byte fallback
-                ids[n++] = (unsigned char)ws_char;
-            }
-        } else {
-            // Word - BPE encode it
-            int word_ids[512];
-            int n_ids = bpe_encode_word(tok, pieces[w].text, word_ids, 512);
+        const char* word = pieces[w].text;
+        int word_len = pieces[w].len;
 
-            for (int i = 0; i < n_ids && n < max_len; i++) {
-                ids[n++] = word_ids[i];
-            }
+        // BPE encode the word directly without Ġ prefix
+        // The bpe_encode_word handles space->Ġ conversion internally
+        // when it encounters byte 0x20 (from original text)
+
+        int word_ids[512];
+        int n_ids = bpe_encode_word(tok, word, word_len, word_ids, 512);
+
+        for (int i = 0; i < n_ids && n < max_len; i++) {
+            ids[n++] = word_ids[i];
         }
     }
 
@@ -452,9 +500,17 @@ char* sm2_tokenizer_decode(sm2_tokenizer* tok, const int* ids, int n_ids) {
                 const char* token_str = tok->tokens[id];
                 size_t tok_len = strlen(token_str);
 
-                // Copy the UTF-8 bytes (could be 1-4 bytes for multi-byte chars)
+                // Convert Ġ (space prefix) to actual space for output
+                // Ġ is 0xC4 0xA0 in UTF-8
                 for (size_t j = 0; j < tok_len && pos < out_capacity - 1; j++) {
-                    out[pos++] = token_str[j];
+                    unsigned char c = (unsigned char)token_str[j];
+                    // Check for Ġ (0xC4 0xA0) and convert to space
+                    if (c == 0xC4 && j + 1 < tok_len && (unsigned char)token_str[j+1] == 0xA0) {
+                        out[pos++] = ' ';
+                        j++; // skip next byte
+                    } else {
+                        out[pos++] = token_str[j];
+                    }
                 }
             } else if (id < 256) {
                 // Fallback: print as ASCII if printable
