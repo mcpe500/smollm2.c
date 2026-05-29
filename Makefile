@@ -58,13 +58,19 @@ SRC_SERVER = $(SRC)server/smollm2d.c \
              $(SRC)server/sm2_scheduler.c \
              $(SRC)server/sm2_metrics.c
 
+# Chat interface modules
+SRC_CHAT = $(SRC)chat_history.c \
+           $(SRC)chat_cli.c \
+           $(SRC)chat_tui.c \
+           $(SRC)chat_web.c
+
 # DFlash (Phase 8b)
 SRC_DFLASH = $(SRC)dflash/sm2_dflash.c \
              $(SRC)dflash/sm2_dflash_model.c \
              $(SRC)dflash/sm2_dflash_verify.c
 
 # All sources for full build
-ALL_SRC = $(SRC_CORE) $(SRC_DECODE) $(SRC_ATTENTION) $(SRC_KV) $(SRC_QUANT) $(SRC_BACKEND)
+ALL_SRC = $(SRC_CORE) $(SRC_DECODE) $(SRC_ATTENTION) $(SRC_KV) $(SRC_QUANT) $(SRC_BACKEND) $(SRC_CHAT)
 
 # Object files
 OBJ_DIR = obj

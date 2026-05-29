@@ -337,6 +337,32 @@ typedef enum {
 } sm2_req_state;
 
 // ============================================================================
+// CLI ARGUMENTS (shared across modes)
+// ============================================================================
+
+typedef enum {
+    MODE_CLI,
+    MODE_TUI,
+    MODE_WEB,
+} run_mode;
+
+typedef struct {
+    const char* model_path;
+    const char* prompt;
+    int ctx_size;
+    int max_output;
+    int n_threads;
+    float temperature;
+    int top_p;
+    int top_k;
+    float repetition_penalty;
+    run_mode mode;
+    int web_port;
+    const char* web_host;
+    const char* system_prompt;
+} cli_args;
+
+// ============================================================================
 // DFLASH CONFIG (Phase 8b)
 // ============================================================================
 

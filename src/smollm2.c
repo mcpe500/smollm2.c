@@ -7,6 +7,7 @@
 #include <time.h>
 #include <math.h>
 #include "smollm2.h"
+#include "chat_history.h"
 
 // ============================================================================
 // PRINT TOKEN: Converts tokenizer output to terminal-safe ASCII
@@ -35,31 +36,31 @@ static void print_token(const char* decoded) {
 // CLI Argument Parsing
 // ============================================================================
 
-typedef struct {
-    const char* model_path;
-    const char* prompt;
-    int ctx_size;
-    int max_output;
-    int n_threads;
-    float temperature;
-    int top_p;
-    int top_k;
-    float repetition_penalty;
-    int interactive;
-    int chat_mode;  // Use chat template like <|im_start|>user\n{prompt}<|im_end|><|im_start|>assistant\n
-} cli_args;
-
 static void print_help(const char* prog) {
     printf("smollm2.c - SmolLM2 inference engine\n\n");
-    printf("Usage: %s -m <model.sm2> -p <prompt>\n", prog);
-    printf("  -m, --model <path>    Model file (.sm2)\n");
-    printf("  -p, --prompt <text>   Input prompt\n");
+    printf("Usage: %s -m <model.sm2> [options]\n\n", prog);
+    printf("Mode options:\n");
+    printf("  --mode cli         Interactive CLI chat (default)\n");
+    printf("  --mode tui         Text-based UI with chat history\n");
+    printf("  --mode web         HTTP server with web UI\n\n");
+    printf("Model options:\n");
+    printf("  -m, --model <path>    Model file (.sm2) [required]\n\n");
+    printf("Chat options:\n");
+    printf("  -p, --prompt <text>   Initial prompt (default: \"Hello\")\n");
+    printf("  --system-prompt <text> Custom system prompt\n\n");
+    printf("Generation options:\n");
     printf("  -n, --max-output <n> Max tokens (default: 50)\n");
     printf("  -t, --temp <x>       Temperature (0.0=greedy, 0.7=recommended, 1.0=creative)\n");
     printf("  -q, --top-p <n>      Top-p nucleus sampling (0-100, default: 90)\n");
     printf("  -k, --top-k <n>      Top-k sampling (0=disabled)\n");
-    printf("  -r, --rep-penalty <x> Repetition penalty (1.0=off, 1.2=default, 1.5=strong)\n");
-    printf("  -h, --help           Show help\n");
+    printf("  -r, --rep-penalty <x> Repetition penalty (1.0=off, 1.2=default, 1.5=strong)\n\n");
+    printf("Web mode options:\n");
+    printf("  -P, --port <n>      HTTP server port (default: 7331)\n");
+    printf("  --host <addr>       Bind address (default: 127.0.0.1)\n\n");
+    printf("Examples:\n");
+    printf("  %s -m model.sm2 --mode cli\n", prog);
+    printf("  %s -m model.sm2 --mode tui\n", prog);
+    printf("  %s -m model.sm2 --mode web --port 8080\n", prog);
 }
 
 static cli_args parse_args(int argc, char** argv) {
@@ -69,11 +70,14 @@ static cli_args parse_args(int argc, char** argv) {
         .ctx_size = 2048,
         .max_output = 50,
         .n_threads = 4,
-        .temperature = 0.7f,    // Default to 0.7 for diverse output (like Ollama)
-        .top_p = 90,            // Nucleus sampling (0 = disabled)
-        .top_k = 0,             // No top-k by default
-        .repetition_penalty = 1.3f,  // Enable by default to handle model-specific repetition
-        .interactive = 0,
+        .temperature = 0.7f,
+        .top_p = 90,
+        .top_k = 0,
+        .repetition_penalty = 1.3f,
+        .mode = MODE_CLI,
+        .web_port = 7331,
+        .web_host = "127.0.0.1",
+        .system_prompt = NULL,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -91,7 +95,19 @@ static cli_args parse_args(int argc, char** argv) {
             args.top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0) {
 			args.repetition_penalty = atof(argv[++i]);
-		} else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+		} else if (strcmp(argv[i], "--mode") == 0) {
+            i++;
+            if (strcmp(argv[i], "cli") == 0) args.mode = MODE_CLI;
+            else if (strcmp(argv[i], "tui") == 0) args.mode = MODE_TUI;
+            else if (strcmp(argv[i], "web") == 0) args.mode = MODE_WEB;
+            else fprintf(stderr, "Unknown mode: %s\n", argv[i]);
+        } else if (strcmp(argv[i], "-P") == 0 || strcmp(argv[i], "--port") == 0) {
+            args.web_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--host") == 0) {
+            args.web_host = argv[++i];
+        } else if (strcmp(argv[i], "--system-prompt") == 0) {
+            args.system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_help(argv[0]);
             exit(0);
         }
@@ -109,6 +125,14 @@ static double time_ms() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
+
+// ============================================================================
+// CHAT MODE HANDLERS
+// ============================================================================
+
+int run_chat_cli(sm2_model* model, const cli_args* args, const sm2_generate_params* gen_params);
+int run_chat_tui(sm2_model* model, const cli_args* args);
+int run_chat_web(sm2_model* model, const cli_args* args);
 
 // ============================================================================
 // MAIN INFERENCE LOOP
@@ -140,9 +164,6 @@ static int run_inference(sm2_model* model, const cli_args* args) {
     // <|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
     // <|im_start|>user\n{prompt}<|im_end|>
     // <|im_start|>assistant\n
-    const char* system_prompt = "system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face";
-    const char* assistant_prefix = "assistant";
-
     tokens[n_tokens++] = 1;  // <|im_start|>
     if (model->tokenizer) {
         // System prompt
@@ -167,28 +188,6 @@ static int run_inference(sm2_model* model, const cli_args* args) {
         n_tokens += sm2_tokenizer_encode(model->tokenizer, "assistant", tokens + n_tokens, 4096 - n_tokens);
         tokens[n_tokens++] = 198;  // Ċ (newline)
     }
-
-    // Fallback to byte tokenization if tokenizer not available
-    if (n_tokens == 1) {  // Only BOS, no tokenizer
-        for (int i = 0; args->prompt[i] && n_tokens < 4096; i++) {
-            unsigned char byte_val = (unsigned char)args->prompt[i];
-            if (model->tokenizer && model->tokenizer->byte_to_token) {
-                tokens[n_tokens++] = model->tokenizer->byte_to_token[byte_val];
-            } else {
-                tokens[n_tokens++] = byte_val;
-            }
-        }
-    }
-
-    // Tokenizer is now fixed - no more hardcoded workarounds needed
-
-    printf("Input: \"%s\" => %d tokens\n", args->prompt, n_tokens);
-    // Debug: print first 10 tokens
-    printf("DEBUG: First 10 tokens: ");
-    for (int i = 0; i < 10 && i < n_tokens; i++) {
-        printf("%d ", tokens[i]);
-    }
-    printf("\n");
 
     // Prefill
     double t0 = time_ms();
@@ -260,7 +259,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    int ok = run_inference(model, &args);
+    int ok;
+    if (args.mode == MODE_CLI) {
+        // CLI mode: single-prompt inference (no interactive chat)
+        ok = run_inference(model, &args);
+    } else if (args.mode == MODE_TUI) {
+        ok = run_chat_tui(model, &args);
+    } else if (args.mode == MODE_WEB) {
+        ok = run_chat_web(model, &args);
+    } else {
+        // Fallback: single-prompt mode
+        ok = run_inference(model, &args);
+    }
+
     sm2_free_model(model);
     return ok;
 }
