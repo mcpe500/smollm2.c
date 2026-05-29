@@ -29,11 +29,16 @@ typedef struct {
     chat_history history;
     char input_buffer[2048];
     int input_pos;
-    int input_scroll;       // Scroll position in input
+    int input_scroll;
     int generating;
     double tokens_per_sec;
     int window_width;
     int window_height;
+    // Generation state
+    char partial_response[8192];
+    int partial_len;
+    int gen_tokens;
+    double gen_start_time;
 } tui_state;
 
 static tui_state g_state = {0};
@@ -188,6 +193,28 @@ static void tui_render() {
         }
     }
 
+    // Show in-progress generation if currently generating
+    if (g_state.generating && g_state.partial_len > 0) {
+        printf(ANSI_GREEN "▌ SmolLM: " ANSI_RESET);
+        int col = 9;
+        const char* p = g_state.partial_response;
+        while (*p && col < g_state.window_width - 1) {
+            putchar(*p);
+            col++;
+            p++;
+        }
+        if (strlen(g_state.partial_response) > (size_t)(g_state.window_width - 10)) {
+            printf(ANSI_DIM "..." ANSI_RESET);
+        }
+        printf("\n\n");
+
+        // Loading indicator with stats
+        double dt = (time_ms() - g_state.gen_start_time) / 1000.0;
+        printf(ANSI_YELLOW "  ◐ Generating... " ANSI_RESET);
+        printf(ANSI_DIM "%d chars, %.1f tok/s" ANSI_RESET, g_state.partial_len, g_state.tokens_per_sec);
+        printf("\n");
+    }
+
     // Input line
     printf("\n");
     printf(ANSI_YELLOW "▐> " ANSI_RESET);
@@ -219,7 +246,7 @@ static void tui_render() {
     fflush(stdout);
 }
 
-// Generate response asynchronously (simplified: synchronous)
+// Generate response - updates state instead of printing
 static int generate_response(const char* user_input) {
     chat_history_add_user(&g_state.history, user_input);
 
@@ -248,17 +275,19 @@ static int generate_response(const char* user_input) {
         return -1;
     }
 
+    // Reset generation state
     g_state.generating = 1;
-    double t0 = time_ms();
-    int last_update = 0;
+    g_state.partial_response[0] = '\0';
+    g_state.partial_len = 0;
+    g_state.gen_tokens = 0;
+    g_state.gen_start_time = time_ms();
+    g_state.tokens_per_sec = 0;
+
+    // Update status to generating
+    tui_render();
 
     char response[8192];
     int resp_len = 0;
-    int gen_tokens = 0;
-
-    // Show initial loading message
-    printf("\n" ANSI_YELLOW "▌ SmolLM: Generating..." ANSI_RESET);
-    fflush(stdout);
 
     while (resp_len < (int)sizeof(response) - 1) {
         int token;
@@ -268,38 +297,36 @@ static int generate_response(const char* user_input) {
 
         char* decoded = sm2_tokenizer_decode(g_tok, &token, 1);
         if (decoded) {
-            // Print and accumulate
+            // Accumulate
             for (const char* p = decoded; *p && resp_len < (int)sizeof(response) - 1; p++) {
                 unsigned char c = (unsigned char)*p;
                 if (c == 0xC4 && (unsigned char)p[1] == 0xA0) {
                     response[resp_len++] = ' ';
+                    g_state.partial_response[g_state.partial_len++] = ' ';
                     p++;
                 } else if (c == 0xC4 && (unsigned char)p[1] == 0x8A) {
                     response[resp_len++] = '\n';
+                    g_state.partial_response[g_state.partial_len++] = '\n';
                     p++;
                 } else {
                     response[resp_len++] = *p;
+                    g_state.partial_response[g_state.partial_len++] = *p;
                 }
             }
+            g_state.partial_response[g_state.partial_len] = '\0';
             free(decoded);
         }
-        gen_tokens++;
+        g_state.gen_tokens++;
 
-        // Update stats and show progress every 200ms
-        double dt = (time_ms() - t0) / 1000.0;
-        if (dt > 0.1) {
-            g_state.tokens_per_sec = gen_tokens / dt;
+        // Update stats
+        double dt = (time_ms() - g_state.gen_start_time) / 1000.0;
+        if (dt > 0.05) {
+            g_state.tokens_per_sec = g_state.gen_tokens / dt;
         }
 
         // Update display periodically
-        int now = (int)(time_ms() / 200);
-        if (now != last_update && now % 5 == 0) {
-            // Show progress: spinner + tokens/s + chars generated
-            printf("\r" ANSI_YELLOW "▌ SmolLM: " ANSI_RESET "%s ", response + (resp_len > 40 ? resp_len - 40 : 0));
-            if (resp_len > 40) printf("...");
-            printf(ANSI_DIM "[%.1f tok/s, %d chars]" ANSI_RESET, g_state.tokens_per_sec, resp_len);
-            fflush(stdout);
-            last_update = now;
+        if (g_state.gen_tokens % 2 == 0) {
+            tui_render();
         }
     }
 
@@ -307,10 +334,16 @@ static int generate_response(const char* user_input) {
     sm2_free_context(ctx);
 
     g_state.generating = 0;
+    g_state.tokens_per_sec = g_state.gen_tokens / ((time_ms() - g_state.gen_start_time) / 1000.0);
 
     chat_history_add_assistant(&g_state.history, response);
     chat_history_trim(&g_state.history, 1800);
 
+    // Reset partial response
+    g_state.partial_response[0] = '\0';
+    g_state.partial_len = 0;
+
+    tui_render();
     return 0;
 }
 
