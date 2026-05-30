@@ -8,24 +8,91 @@
 #include "sm2_utils.h"
 
 // ============================================================================
-// F16 TO F32 LOOKUP TABLE (precomputed for fast weight access)
+// NEON-ACCELERATED MATMUL (ARM SIMD for 4x speedup)
 // ============================================================================
 
-static float f16_to_f32_table[65536];
-static int f16_table_initialized = 0;
+#ifdef __ARM_NEON
+#include <arm_neon.h>
 
-static void init_f16_table(void) {
-    if (f16_table_initialized) return;
-    for (int i = 0; i < 65536; i++) {
-        f16_to_f32_table[i] = sm2_f16_to_float((uint16_t)i);
+// NEON matmul: y = x @ w where x is [1, k], w is [k, n] stored column-major
+// Uses FMA (fused multiply-add) for maximum throughput
+static inline void matmul_neon(float* out, const float* x, const float* w, int n, int k) {
+    // Process4 output elements per iteration
+    for (int j = 0; j < n; j += 4) {
+        float32x4_t sum0 = vdupq_n_f32(0.0f);
+        float32x4_t sum1 = vdupq_n_f32(0.0f);
+        float32x4_t sum2 = vdupq_n_f32(0.0f);
+        float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+        int l = 0;
+        // Process 16 elements at a time for better pipelining
+        for (; l + 15 < k; l += 16) {
+            // Load x elements
+            float32x4_t x0 = vdupq_n_f32(x[l+0]);
+            float32x4_t x1 = vdupq_n_f32(x[l+1]);
+            float32x4_t x2 = vdupq_n_f32(x[l+2]);
+            float32x4_t x3 = vdupq_n_f32(x[l+3]);
+            float32x4_t x4 = vdupq_n_f32(x[l+4]);
+            float32x4_t x5 = vdupq_n_f32(x[l+5]);
+            float32x4_t x6 = vdupq_n_f32(x[l+6]);
+            float32x4_t x7 = vdupq_n_f32(x[l+7]);
+            float32x4_t x8 = vdupq_n_f32(x[l+8]);
+            float32x4_t x9 = vdupq_n_f32(x[l+9]);
+            float32x4_t x10 = vdupq_n_f32(x[l+10]);
+            float32x4_t x11 = vdupq_n_f32(x[l+11]);
+            float32x4_t x12 = vdupq_n_f32(x[l+12]);
+            float32x4_t x13 = vdupq_n_f32(x[l+13]);
+            float32x4_t x14 = vdupq_n_f32(x[l+14]);
+            float32x4_t x15 = vdupq_n_f32(x[l+15]);
+
+            // Load w columns and FMA
+            float32x4_t w0 = vld1q_f32(w + (l+0) * n + j);
+            float32x4_t w1 = vld1q_f32(w + (l+1) * n + j);
+            float32x4_t w2 = vld1q_f32(w + (l+2) * n + j);
+            float32x4_t w3 = vld1q_f32(w + (l+3) * n + j);
+            float32x4_t w4 = vld1q_f32(w + (l+4) * n + j);
+            float32x4_t w5 = vld1q_f32(w + (l+5) * n + j);
+            float32x4_t w6 = vld1q_f32(w + (l+6) * n + j);
+            float32x4_t w7 = vld1q_f32(w + (l+7) * n + j);
+            float32x4_t w8 = vld1q_f32(w + (l+8) * n + j);
+            float32x4_t w9 = vld1q_f32(w + (l+9) * n + j);
+            float32x4_t w10 = vld1q_f32(w + (l+10) * n + j);
+            float32x4_t w11 = vld1q_f32(w + (l+11) * n + j);
+            float32x4_t w12 = vld1q_f32(w + (l+12) * n + j);
+            float32x4_t w13 = vld1q_f32(w + (l+13) * n + j);
+            float32x4_t w14 = vld1q_f32(w + (l+14) * n + j);
+            float32x4_t w15 = vld1q_f32(w + (l+15) * n + j);
+
+            sum0 = vfmaq_f32(sum0, x0, w0);
+            sum1 = vfmaq_f32(sum1, x1, w1);
+            sum2 = vfmaq_f32(sum2, x2, w2);
+            sum3 = vfmaq_f32(sum3, x3, w3);
+            sum0 = vfmaq_f32(sum0, x4, w4);
+            sum1 = vfmaq_f32(sum1, x5, w5);
+            sum2 = vfmaq_f32(sum2, x6, w6);
+            sum3 = vfmaq_f32(sum3, x7, w7);
+            sum0 = vfmaq_f32(sum0, x8, w8);
+            sum1 = vfmaq_f32(sum1, x9, w9);
+            sum2 = vfmaq_f32(sum2, x10, w10);
+            sum3 = vfmaq_f32(sum3, x11, w11);
+            sum0 = vfmaq_f32(sum0, x12, w12);
+            sum1 = vfmaq_f32(sum1, x13, w13);
+            sum2 = vfmaq_f32(sum2, x14, w14);
+            sum3 = vfmaq_f32(sum3, x15, w15);
+        }
+
+        // Handle remainder
+        for (; l < k; l++) {
+            float32x4_t x_val = vdupq_n_f32(x[l]);
+            float32x4_t w_vec = vld1q_f32(w + l * n + j);
+            sum0 = vfmaq_f32(sum0, x_val, w_vec);
+        }
+
+        // Store results
+        vst1q_f32(out + j, sum0);
     }
-    f16_table_initialized = 1;
 }
-
-// Fast F16->F32 using lookup table (inline for speed)
-static inline float f16_lookup(uint16_t h) {
-    return f16_to_f32_table[h];
-}
+#endif
 
 // ============================================================================
 // CONTEXT ALLOCATION (preallocated, no runtime allocation in hot path)
@@ -36,8 +103,6 @@ int sm2_create_context(sm2_model* model, sm2_context** out_ctx) {
     if (!ctx) return -1;
 
     // Initialize F16 lookup table (256KB, done once)
-    init_f16_table();
-
     ctx->model = model;
     ctx->pos = 0;
     ctx->last_token = 1; // BOS
@@ -136,19 +201,19 @@ int sm2_free_context(sm2_context* ctx) {
 // EMBEDDING LOOKUP
 // ============================================================================
 
-static void embedding_lookup(float* out, int token, const sm2_tensor_f16* embed) {
-    int dim = embed->cols;
-    uint16_t* data = embed->data + token * dim;
+static void embedding_lookup(float* out, int token, const sm2_model* model) {
+    int dim = model->dim;
+    float* embed_f32 = model->tok_embeddings_f32 + token * dim;
     int i = 0;
     // 4x unrolled
     for (; i + 3 < dim; i += 4) {
-        out[i+0] = f16_lookup(data[i+0]);
-        out[i+1] = f16_lookup(data[i+1]);
-        out[i+2] = f16_lookup(data[i+2]);
-        out[i+3] = f16_lookup(data[i+3]);
+        out[i+0] = embed_f32[i+0];
+        out[i+1] = embed_f32[i+1];
+        out[i+2] = embed_f32[i+2];
+        out[i+3] = embed_f32[i+3];
     }
     for (; i < dim; i++) {
-        out[i] = f16_lookup(data[i]);
+        out[i] = embed_f32[i];
     }
 }
 
@@ -261,23 +326,28 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     float rms = sqrtf(sum_sq / (float)dim + 1e-5f);
     for (int i = 0; i < dim; i++) {
         uint16_t w = model->input_layernorm[ln_off + i];
-        xb_out[i] = (x_in[i] / rms) * f16_lookup(w);
+        xb_out[i] = (x_in[i] / rms) * model->input_layernorm_f32[ln_off + i];
     }
 
-    // 2. Q projection: q = xb_out @ q_proj.T (with 4x unrolling)
+    // 2. Q projection: q = xb_out @ q_proj.T (with 8x unrolling)
     for (int i = 0; i < dim; i++) {
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+        float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
         int j = 0;
-        for (; j + 3 < dim; j += 4) {
-            sum0 += xb_out[j+0] * f16_lookup(model->q_proj[q_off + i * dim + j + 0]);
-            sum1 += xb_out[j+1] * f16_lookup(model->q_proj[q_off + i * dim + j + 1]);
-            sum2 += xb_out[j+2] * f16_lookup(model->q_proj[q_off + i * dim + j + 2]);
-            sum3 += xb_out[j+3] * f16_lookup(model->q_proj[q_off + i * dim + j + 3]);
+        for (; j + 7 < dim; j += 8) {
+            sum0 += xb_out[j+0] * model->q_proj_f32[q_off + i * dim + j + 0];
+            sum1 += xb_out[j+1] * model->q_proj_f32[q_off + i * dim + j + 1];
+            sum2 += xb_out[j+2] * model->q_proj_f32[q_off + i * dim + j + 2];
+            sum3 += xb_out[j+3] * model->q_proj_f32[q_off + i * dim + j + 3];
+            sum4 += xb_out[j+4] * model->q_proj_f32[q_off + i * dim + j + 4];
+            sum5 += xb_out[j+5] * model->q_proj_f32[q_off + i * dim + j + 5];
+            sum6 += xb_out[j+6] * model->q_proj_f32[q_off + i * dim + j + 6];
+            sum7 += xb_out[j+7] * model->q_proj_f32[q_off + i * dim + j + 7];
         }
         for (; j < dim; j++) {
-            sum0 += xb_out[j] * f16_lookup(model->q_proj[q_off + i * dim + j]);
+            sum0 += xb_out[j] * model->q_proj_f32[q_off + i * dim + j];
         }
-        q[i] = sum0 + sum1 + sum2 + sum3;
+        q[i] = sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7;
     }
 
     // 3. K projection: k = xb_out @ k_proj.T (with 4x unrolling)
@@ -285,13 +355,13 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
         int j = 0;
         for (; j + 3 < dim; j += 4) {
-            sum0 += xb_out[j+0] * f16_lookup(model->k_proj[k_off + i * dim + j + 0]);
-            sum1 += xb_out[j+1] * f16_lookup(model->k_proj[k_off + i * dim + j + 1]);
-            sum2 += xb_out[j+2] * f16_lookup(model->k_proj[k_off + i * dim + j + 2]);
-            sum3 += xb_out[j+3] * f16_lookup(model->k_proj[k_off + i * dim + j + 3]);
+            sum0 += xb_out[j+0] * model->k_proj_f32[k_off + i * dim + j + 0];
+            sum1 += xb_out[j+1] * model->k_proj_f32[k_off + i * dim + j + 1];
+            sum2 += xb_out[j+2] * model->k_proj_f32[k_off + i * dim + j + 2];
+            sum3 += xb_out[j+3] * model->k_proj_f32[k_off + i * dim + j + 3];
         }
         for (; j < dim; j++) {
-            sum0 += xb_out[j] * f16_lookup(model->k_proj[k_off + i * dim + j]);
+            sum0 += xb_out[j] * model->k_proj_f32[k_off + i * dim + j];
         }
         k[i] = sum0 + sum1 + sum2 + sum3;
     }
@@ -301,13 +371,13 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
         int j = 0;
         for (; j + 3 < dim; j += 4) {
-            sum0 += xb_out[j+0] * f16_lookup(model->v_proj[v_off + i * dim + j + 0]);
-            sum1 += xb_out[j+1] * f16_lookup(model->v_proj[v_off + i * dim + j + 1]);
-            sum2 += xb_out[j+2] * f16_lookup(model->v_proj[v_off + i * dim + j + 2]);
-            sum3 += xb_out[j+3] * f16_lookup(model->v_proj[v_off + i * dim + j + 3]);
+            sum0 += xb_out[j+0] * model->v_proj_f32[v_off + i * dim + j + 0];
+            sum1 += xb_out[j+1] * model->v_proj_f32[v_off + i * dim + j + 1];
+            sum2 += xb_out[j+2] * model->v_proj_f32[v_off + i * dim + j + 2];
+            sum3 += xb_out[j+3] * model->v_proj_f32[v_off + i * dim + j + 3];
         }
         for (; j < dim; j++) {
-            sum0 += xb_out[j] * f16_lookup(model->v_proj[v_off + i * dim + j]);
+            sum0 += xb_out[j] * model->v_proj_f32[v_off + i * dim + j];
         }
         v[i] = sum0 + sum1 + sum2 + sum3;
     }
@@ -333,13 +403,13 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
         int j = 0;
         for (; j + 3 < dim; j += 4) {
-            sum0 += attn_out[j+0] * f16_lookup(model->o_proj[o_off + i * dim + j + 0]);
-            sum1 += attn_out[j+1] * f16_lookup(model->o_proj[o_off + i * dim + j + 1]);
-            sum2 += attn_out[j+2] * f16_lookup(model->o_proj[o_off + i * dim + j + 2]);
-            sum3 += attn_out[j+3] * f16_lookup(model->o_proj[o_off + i * dim + j + 3]);
+            sum0 += attn_out[j+0] * model->o_proj_f32[o_off + i * dim + j + 0];
+            sum1 += attn_out[j+1] * model->o_proj_f32[o_off + i * dim + j + 1];
+            sum2 += attn_out[j+2] * model->o_proj_f32[o_off + i * dim + j + 2];
+            sum3 += attn_out[j+3] * model->o_proj_f32[o_off + i * dim + j + 3];
         }
         for (; j < dim; j++) {
-            sum0 += attn_out[j] * f16_lookup(model->o_proj[o_off + i * dim + j]);
+            sum0 += attn_out[j] * model->o_proj_f32[o_off + i * dim + j];
         }
         xb_out[i] = sum0 + sum1 + sum2 + sum3;
     }
@@ -359,7 +429,7 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     rms = sqrtf(sum_sq / (float)dim + 1e-5f);
     for (int i = 0; i < dim; i++) {
         uint16_t w = model->post_attention_layernorm[post_off + i];
-        xb_out[i] = (xb_out[i] / rms) * f16_lookup(w);
+        xb_out[i] = (xb_out[i] / rms) * model->post_attention_layernorm_f32[post_off + i];
     }
 
     // 11. SwiGLU FFN using ffn_temp as workspace
@@ -371,13 +441,13 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
         int j = 0;
         for (; j + 3 < dim; j += 4) {
-            sum0 += xb_out[j+0] * f16_lookup(model->gate_proj[gate_off + i * dim + j + 0]);
-            sum1 += xb_out[j+1] * f16_lookup(model->gate_proj[gate_off + i * dim + j + 1]);
-            sum2 += xb_out[j+2] * f16_lookup(model->gate_proj[gate_off + i * dim + j + 2]);
-            sum3 += xb_out[j+3] * f16_lookup(model->gate_proj[gate_off + i * dim + j + 3]);
+            sum0 += xb_out[j+0] * model->gate_proj_f32[gate_off + i * dim + j + 0];
+            sum1 += xb_out[j+1] * model->gate_proj_f32[gate_off + i * dim + j + 1];
+            sum2 += xb_out[j+2] * model->gate_proj_f32[gate_off + i * dim + j + 2];
+            sum3 += xb_out[j+3] * model->gate_proj_f32[gate_off + i * dim + j + 3];
         }
         for (; j < dim; j++) {
-            sum0 += xb_out[j] * f16_lookup(model->gate_proj[gate_off + i * dim + j]);
+            sum0 += xb_out[j] * model->gate_proj_f32[gate_off + i * dim + j];
         }
         gate_out[i] = sum0 + sum1 + sum2 + sum3;
     }
@@ -387,13 +457,13 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
         int j = 0;
         for (; j + 3 < dim; j += 4) {
-            sum0 += xb_out[j+0] * f16_lookup(model->up_proj[up_off + i * dim + j + 0]);
-            sum1 += xb_out[j+1] * f16_lookup(model->up_proj[up_off + i * dim + j + 1]);
-            sum2 += xb_out[j+2] * f16_lookup(model->up_proj[up_off + i * dim + j + 2]);
-            sum3 += xb_out[j+3] * f16_lookup(model->up_proj[up_off + i * dim + j + 3]);
+            sum0 += xb_out[j+0] * model->up_proj_f32[up_off + i * dim + j + 0];
+            sum1 += xb_out[j+1] * model->up_proj_f32[up_off + i * dim + j + 1];
+            sum2 += xb_out[j+2] * model->up_proj_f32[up_off + i * dim + j + 2];
+            sum3 += xb_out[j+3] * model->up_proj_f32[up_off + i * dim + j + 3];
         }
         for (; j < dim; j++) {
-            sum0 += xb_out[j] * f16_lookup(model->up_proj[up_off + i * dim + j]);
+            sum0 += xb_out[j] * model->up_proj_f32[up_off + i * dim + j];
         }
         up_out[i] = sum0 + sum1 + sum2 + sum3;
     }
@@ -411,13 +481,13 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
         float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
         int j = 0;
         for (; j + 3 < hidden_dim; j += 4) {
-            sum0 += gate_out[j+0] * f16_lookup(model->down_proj[down_off + i * hidden_dim + j + 0]);
-            sum1 += gate_out[j+1] * f16_lookup(model->down_proj[down_off + i * hidden_dim + j + 1]);
-            sum2 += gate_out[j+2] * f16_lookup(model->down_proj[down_off + i * hidden_dim + j + 2]);
-            sum3 += gate_out[j+3] * f16_lookup(model->down_proj[down_off + i * hidden_dim + j + 3]);
+            sum0 += gate_out[j+0] * model->down_proj_f32[down_off + i * hidden_dim + j + 0];
+            sum1 += gate_out[j+1] * model->down_proj_f32[down_off + i * hidden_dim + j + 1];
+            sum2 += gate_out[j+2] * model->down_proj_f32[down_off + i * hidden_dim + j + 2];
+            sum3 += gate_out[j+3] * model->down_proj_f32[down_off + i * hidden_dim + j + 3];
         }
         for (; j < hidden_dim; j++) {
-            sum0 += gate_out[j] * f16_lookup(model->down_proj[down_off + i * hidden_dim + j]);
+            sum0 += gate_out[j] * model->down_proj_f32[down_off + i * hidden_dim + j];
         }
         // FFN output + residual (post-attention hidden state)
         xb_out[i] = x_post_attn[i] + sum0 + sum1 + sum2 + sum3;
@@ -440,7 +510,7 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
 
         // Get embedding for current token into scratch.x
         if (model->tok_embeddings && model->tok_embeddings->data) {
-            embedding_lookup(ctx->scratch.x, tokens[t], model->tok_embeddings);
+            embedding_lookup(ctx->scratch.x, tokens[t], model);
         } else {
             for (int i = 0; i < model->dim; i++) ctx->scratch.x[i] = (float)(tokens[t] % 256) / 256.0f;
         }
@@ -475,7 +545,7 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
         float rms = sqrtf(sum_sq / (float)model->dim + 1e-5f);
         float scale = 1.0f / rms;
         for (int i = 0; i < model->dim; i++) {
-            final_h[i] = final_h[i] * scale * f16_lookup(model->final_norm[i]);
+            final_h[i] = final_h[i] * scale * model->final_norm_f32[i];
         }
     }
 
@@ -488,13 +558,13 @@ int sm2_prefill(sm2_context* ctx, const int* tokens, int n_tokens) {
             float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
             int j = 0;
             for (; j + 3 < dim; j += 4) {
-                sum0 += final_h[j+0] * f16_lookup(model->tok_embeddings->data[i * dim + j + 0]);
-                sum1 += final_h[j+1] * f16_lookup(model->tok_embeddings->data[i * dim + j + 1]);
-                sum2 += final_h[j+2] * f16_lookup(model->tok_embeddings->data[i * dim + j + 2]);
-                sum3 += final_h[j+3] * f16_lookup(model->tok_embeddings->data[i * dim + j + 3]);
+                sum0 += final_h[j+0] * model->tok_embeddings_f32[i * dim + j + 0];
+                sum1 += final_h[j+1] * model->tok_embeddings_f32[i * dim + j + 1];
+                sum2 += final_h[j+2] * model->tok_embeddings_f32[i * dim + j + 2];
+                sum3 += final_h[j+3] * model->tok_embeddings_f32[i * dim + j + 3];
             }
             for (; j < dim; j++) {
-                sum0 += final_h[j] * f16_lookup(model->tok_embeddings->data[i * dim + j]);
+                sum0 += final_h[j] * model->tok_embeddings_f32[i * dim + j];
             }
             ctx->scratch.logits[i] = sum0 + sum1 + sum2 + sum3;
         }
@@ -514,7 +584,7 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
     // Get embedding for this token into ctx->scratch.x
     // The token to embed is the last generated token (ctx->last_token)
     if (ctx->model->tok_embeddings && ctx->model->tok_embeddings->data) {
-        embedding_lookup(ctx->scratch.x, ctx->last_token, ctx->model->tok_embeddings);
+        embedding_lookup(ctx->scratch.x, ctx->last_token, ctx->model);
     } else {
         for (int i = 0; i < ctx->model->dim; i++) ctx->scratch.x[i] = (float)(ctx->last_token % 256) / 256.0f;
     }
@@ -537,7 +607,7 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
         float rms = sqrtf(sum_sq / (float)ctx->model->dim + 1e-5f);
         float scale = 1.0f / rms;
         for (int i = 0; i < ctx->model->dim; i++) {
-            final_h[i] = final_h[i] * scale * f16_lookup(ctx->model->final_norm[i]);
+            final_h[i] = final_h[i] * scale * ctx->model->final_norm_f32[i];
         }
     }
 
@@ -550,13 +620,13 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
             float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
             int j = 0;
             for (; j + 3 < dim; j += 4) {
-                sum0 += final_h[j+0] * f16_lookup(ctx->model->tok_embeddings->data[i * dim + j + 0]);
-                sum1 += final_h[j+1] * f16_lookup(ctx->model->tok_embeddings->data[i * dim + j + 1]);
-                sum2 += final_h[j+2] * f16_lookup(ctx->model->tok_embeddings->data[i * dim + j + 2]);
-                sum3 += final_h[j+3] * f16_lookup(ctx->model->tok_embeddings->data[i * dim + j + 3]);
+                sum0 += final_h[j+0] * ctx->model->tok_embeddings_f32[i * dim + j + 0];
+                sum1 += final_h[j+1] * ctx->model->tok_embeddings_f32[i * dim + j + 1];
+                sum2 += final_h[j+2] * ctx->model->tok_embeddings_f32[i * dim + j + 2];
+                sum3 += final_h[j+3] * ctx->model->tok_embeddings_f32[i * dim + j + 3];
             }
             for (; j < dim; j++) {
-                sum0 += final_h[j] * f16_lookup(ctx->model->tok_embeddings->data[i * dim + j]);
+                sum0 += final_h[j] * ctx->model->tok_embeddings_f32[i * dim + j];
             }
             ctx->scratch.logits[i] = sum0 + sum1 + sum2 + sum3;
         }

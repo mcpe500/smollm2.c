@@ -185,7 +185,8 @@ typedef struct {
     
     // Embedding + output (shared for tie_word_embeddings)
     sm2_tensor_f16* tok_embeddings;    // [vocab, dim]
-    
+    float* tok_embeddings_f32;          // Precomputed F32 embeddings [vocab * dim]
+
     // Layer weights (allocated as arrays per layer)
     // 1D weights: [n_layers * dim] of F16 (stored as uint16_t)
     uint16_t* input_layernorm;        // [n_layers * dim]
@@ -200,6 +201,18 @@ typedef struct {
     uint16_t* gate_proj;              // [n_layers * hidden_dim * dim]
     uint16_t* up_proj;                // [n_layers * hidden_dim * dim]
     uint16_t* down_proj;              // [n_layers * hidden_dim * dim]
+
+    // Precomputed F32 weights (same layout as F16)
+    float* q_proj_f32;
+    float* k_proj_f32;
+    float* v_proj_f32;
+    float* o_proj_f32;
+    float* gate_proj_f32;
+    float* up_proj_f32;
+    float* down_proj_f32;
+    float* input_layernorm_f32;
+    float* post_attention_layernorm_f32;
+    float* final_norm_f32;
 
     sm2_tokenizer* tokenizer;         // loaded from .sm2 file
     
@@ -360,6 +373,7 @@ typedef struct {
     int web_port;
     const char* web_host;
     const char* system_prompt;
+    int benchmark_mode;
 } cli_args;
 
 // ============================================================================

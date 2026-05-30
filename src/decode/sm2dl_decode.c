@@ -218,20 +218,13 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
 // Decode next token - main entry point
 // CRITICAL: No allocation allowed in this function
 int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
-    fprintf(stderr, "DEBUG: sm2dl_decode_next called, pos=%d\n", ctx->pos);
-    
-    // 0. Debug: check scratch.x before forward
-    fprintf(stderr, "DEBUG: Before forward, x[0..2]={%f,%f,%f}\n", 
-            ctx->scratch.x[0], ctx->scratch.x[1], ctx->scratch.x[2]);
-    
     // 1. Forward one token through the model
     int result = sm2dl_forward_one_token(ctx);
     if (result != 0) {
-        fprintf(stderr, "ERROR: sm2dl_forward_one_token returned %d\n", result);
         *out_token = 0;
         return result;
     }
-    
+
     // 2. Final RMSNorm
     if (ctx->model->final_norm) {
         float* vec = ctx->scratch.x;
@@ -248,26 +241,32 @@ int sm2dl_decode_next(sm2_context* ctx, int* out_token) {
         }
     }
     
-    // 3. Compute logits (embedding matrix multiply)
+    // 3. Compute logits (embedding matrix multiply) - unrolled 4x
     if (ctx->model->tok_embeddings && ctx->model->tok_embeddings->data) {
-        // logits = x @ embed (shared weights, tie_word_embeddings)
         int vocab = ctx->model->vocab_size;
         int dim = ctx->model->dim;
-        
-        fprintf(stderr, "DEBUG: Computing logits, vocab=%d, dim=%d, x[0..2]={%f,%f,%f}\n",
-                vocab, dim, ctx->scratch.x[0], ctx->scratch.x[1], ctx->scratch.x[2]);
-        
+
         for (int i = 0; i < vocab; i++) {
-            float sum = 0.0f;
-            for (int j = 0; j < dim; j++) {
-                uint16_t h = ctx->model->tok_embeddings->data[i * dim + j];
-                sum += ctx->scratch.x[j] * sm2_f16_to_float(h);
+            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+            int j = 0;
+            // Unroll 4x
+            for (; j + 4 <= dim; j += 4) {
+                uint16_t h0 = ctx->model->tok_embeddings->data[i * dim + j + 0];
+                uint16_t h1 = ctx->model->tok_embeddings->data[i * dim + j + 1];
+                uint16_t h2 = ctx->model->tok_embeddings->data[i * dim + j + 2];
+                uint16_t h3 = ctx->model->tok_embeddings->data[i * dim + j + 3];
+                sum0 += ctx->scratch.x[j + 0] * sm2_f16_to_float(h0);
+                sum1 += ctx->scratch.x[j + 1] * sm2_f16_to_float(h1);
+                sum2 += ctx->scratch.x[j + 2] * sm2_f16_to_float(h2);
+                sum3 += ctx->scratch.x[j + 3] * sm2_f16_to_float(h3);
             }
-            ctx->scratch.logits[i] = sum;
+            // Handle remainder
+            for (; j < dim; j++) {
+                uint16_t h = ctx->model->tok_embeddings->data[i * dim + j];
+                sum0 += ctx->scratch.x[j] * sm2_f16_to_float(h);
+            }
+            ctx->scratch.logits[i] = sum0 + sum1 + sum2 + sum3;
         }
-        
-        fprintf(stderr, "DEBUG: logits[0..2]={%f,%f,%f}\n",
-                ctx->scratch.logits[0], ctx->scratch.logits[1], ctx->scratch.logits[2]);
     }
     
     // 4. Sample token

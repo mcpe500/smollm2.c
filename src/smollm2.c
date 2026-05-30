@@ -78,6 +78,7 @@ static cli_args parse_args(int argc, char** argv) {
         .web_port = 7331,
         .web_host = "127.0.0.1",
         .system_prompt = NULL,
+        .benchmark_mode = 0,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -107,6 +108,8 @@ static cli_args parse_args(int argc, char** argv) {
             args.web_host = argv[++i];
         } else if (strcmp(argv[i], "--system-prompt") == 0) {
             args.system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--benchmark") == 0) {
+            args.benchmark_mode = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_help(argv[0]);
             exit(0);

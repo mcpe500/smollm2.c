@@ -1,8 +1,9 @@
 # Makefile for smollm2.c - Decode-first SmolLM2 inference engine
 
 CC = gcc
-CFLAGS = -std=c99 -Wall -Wextra -O3 -march=native -fomit-frame-pointer -ffast-math
+CFLAGS = -std=c99 -Wall -Wextra -O3 -march=native -ffast-math -funroll-loops -flto
 CFLAGS += -DNDEBUG -Iinclude
+LDFLAGS = -flto
 
 # Target: smollm2-cli (CLI tool)
 TARGET = smollm2-cli
@@ -48,7 +49,7 @@ SRC_QUANT = $(SRC)quant/sm2_q8.c \
             $(SRC)quant/sm2_q4k.c \
             $(SRC)quant/sm2_q5k.c
 
-# Backend
+# Backend (ref for now, NEON needs fixes)
 SRC_BACKEND = $(SRC)backend/sm2_backend_ref.c
 
 # Server daemon (optional, Phase 6)
@@ -89,7 +90,7 @@ dirs:
 	mkdir -p $(OBJ_DIR)/dflash
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBM)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBM)
 	@echo "Built: $@"
 
 # Pattern rules

@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include "smollm2.h"
+#include "sm2_utils.h"
 
 // ============================================================================
 // MODEL ALLOCATION / FREE
@@ -52,6 +53,19 @@ void sm2_model_free(sm2_model* model) {
         free(model->tok_embeddings);
     }
     if (model->tokenizer) sm2_tokenizer_free(model->tokenizer);
+
+    // Free precomputed F32 weights
+    if (model->tok_embeddings_f32) free(model->tok_embeddings_f32);
+    if (model->q_proj_f32) free(model->q_proj_f32);
+    if (model->k_proj_f32) free(model->k_proj_f32);
+    if (model->v_proj_f32) free(model->v_proj_f32);
+    if (model->o_proj_f32) free(model->o_proj_f32);
+    if (model->gate_proj_f32) free(model->gate_proj_f32);
+    if (model->up_proj_f32) free(model->up_proj_f32);
+    if (model->down_proj_f32) free(model->down_proj_f32);
+    if (model->input_layernorm_f32) free(model->input_layernorm_f32);
+    if (model->post_attention_layernorm_f32) free(model->post_attention_layernorm_f32);
+    if (model->final_norm_f32) free(model->final_norm_f32);
 
     free(model);
 }
@@ -116,7 +130,7 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
     if (fread(&rows, 4, 1, f) != 1) { fprintf(stderr, "Failed to read tok_embeddings rows\n"); return -1; }
     if (fread(&cols, 4, 1, f) != 1) { fprintf(stderr, "Failed to read tok_embeddings cols\n"); return -1; }
     fprintf(stderr, "DEBUG: tok_embeddings header: rows=%u, cols=%u\n", rows, cols);
-    
+
     size_t embed_size = (size_t)rows * cols * sizeof(uint16_t);
     model->tok_embeddings = calloc(1, sizeof(sm2_tensor_f16));
     if (!model->tok_embeddings) return -1;
@@ -126,6 +140,13 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
     if (!model->tok_embeddings->data) return -1;
     if (fread(model->tok_embeddings->data, embed_size, 1, f) != 1) {
         fprintf(stderr, "Failed to read tok_embeddings data\n"); return -1;
+    }
+
+    // Precompute F32 embeddings
+    model->tok_embeddings_f32 = malloc((size_t)rows * cols * sizeof(float));
+    if (!model->tok_embeddings_f32) return -1;
+    for (size_t i = 0; i < (size_t)rows * cols; i++) {
+        model->tok_embeddings_f32[i] = sm2_f16_to_float(model->tok_embeddings->data[i]);
     }
     
     // ========== 2. Load layer weights ==========
@@ -155,6 +176,22 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
         !model->up_proj || !model->down_proj) {
         fprintf(stderr, "Failed to allocate layer weights\n"); return -1;
     }
+
+    // Allocate precomputed F32 weights
+    model->input_layernorm_f32 = malloc(input_ln_size * sizeof(float));
+    model->q_proj_f32 = malloc(q_size * sizeof(float));
+    model->k_proj_f32 = malloc(k_size * sizeof(float));
+    model->v_proj_f32 = malloc(v_size * sizeof(float));
+    model->o_proj_f32 = malloc(o_size * sizeof(float));
+    model->post_attention_layernorm_f32 = malloc(post_ln_size * sizeof(float));
+    model->gate_proj_f32 = malloc(gate_size * sizeof(float));
+    model->up_proj_f32 = malloc(up_size * sizeof(float));
+    model->down_proj_f32 = malloc(down_size * sizeof(float));
+    if (!model->input_layernorm_f32 || !model->q_proj_f32 || !model->k_proj_f32 ||
+        !model->v_proj_f32 || !model->o_proj_f32 || !model->post_attention_layernorm_f32 ||
+        !model->gate_proj_f32 || !model->up_proj_f32 || !model->down_proj_f32) {
+        fprintf(stderr, "Failed to allocate F32 weights\n"); return -1;
+    }
     
     for (int layer = 0; layer < n_layers; layer++) {
         // input_layernorm: [1, dim] -> read rows=1, cols=dim
@@ -163,55 +200,64 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
         if (fread(&c, 4, 1, f) != 1) { fprintf(stderr, "layer %d: failed read input_ln cols\n", layer); return -1; }
         if (r != 1 || c != (uint32_t)dim) { fprintf(stderr, "layer %d: input_ln bad shape %ux%u\n", layer, r, c); }
         if (fread(model->input_layernorm + layer * dim, dim * sizeof(uint16_t), 1, f) != 1) { return -1; }
-        
+        for (int i = 0; i < dim; i++) model->input_layernorm_f32[layer * dim + i] = sm2_f16_to_float(model->input_layernorm[layer * dim + i]);
+
         // q_proj: [dim, dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)dim || c != (uint32_t)dim) { fprintf(stderr, "layer %d: q_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->q_proj + layer * dim * dim, dim * dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < dim * dim; i++) model->q_proj_f32[layer * dim * dim + i] = sm2_f16_to_float(model->q_proj[layer * dim * dim + i]);
+
         // k_proj: [kv_dim, dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)kv_dim || c != (uint32_t)dim) { fprintf(stderr, "layer %d: k_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->k_proj + layer * kv_dim * dim, kv_dim * dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < kv_dim * dim; i++) model->k_proj_f32[layer * kv_dim * dim + i] = sm2_f16_to_float(model->k_proj[layer * kv_dim * dim + i]);
+
         // v_proj: [kv_dim, dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)kv_dim || c != (uint32_t)dim) { fprintf(stderr, "layer %d: v_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->v_proj + layer * kv_dim * dim, kv_dim * dim * sizeof(uint16_t), 1, f) != 1) return -1;
+        for (int i = 0; i < kv_dim * dim; i++) model->v_proj_f32[layer * kv_dim * dim + i] = sm2_f16_to_float(model->v_proj[layer * kv_dim * dim + i]);
         
         // o_proj: [dim, dim] (NOT [dim, kv_dim]!)
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)dim || c != (uint32_t)dim) { fprintf(stderr, "layer %d: o_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->o_proj + layer * dim * dim, dim * dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < dim * dim; i++) model->o_proj_f32[layer * dim * dim + i] = sm2_f16_to_float(model->o_proj[layer * dim * dim + i]);
+
         // post_attention_layernorm: [1, dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != 1 || c != (uint32_t)dim) { fprintf(stderr, "layer %d: post_ln bad shape %ux%u\n", layer, r, c); }
         if (fread(model->post_attention_layernorm + layer * dim, dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < dim; i++) model->post_attention_layernorm_f32[layer * dim + i] = sm2_f16_to_float(model->post_attention_layernorm[layer * dim + i]);
+
         // gate_proj: [hidden_dim, dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)hidden_dim || c != (uint32_t)dim) { fprintf(stderr, "layer %d: gate_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->gate_proj + layer * hidden_dim * dim, hidden_dim * dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < hidden_dim * dim; i++) model->gate_proj_f32[layer * hidden_dim * dim + i] = sm2_f16_to_float(model->gate_proj[layer * hidden_dim * dim + i]);
+
         // up_proj: [hidden_dim, dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)hidden_dim || c != (uint32_t)dim) { fprintf(stderr, "layer %d: up_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->up_proj + layer * hidden_dim * dim, hidden_dim * dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < hidden_dim * dim; i++) model->up_proj_f32[layer * hidden_dim * dim + i] = sm2_f16_to_float(model->up_proj[layer * hidden_dim * dim + i]);
+
         // down_proj: [dim, hidden_dim]
         if (fread(&r, 4, 1, f) != 1) return -1;
         if (fread(&c, 4, 1, f) != 1) return -1;
         if (r != (uint32_t)dim || c != (uint32_t)hidden_dim) { fprintf(stderr, "layer %d: down_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->down_proj + layer * dim * hidden_dim, dim * hidden_dim * sizeof(uint16_t), 1, f) != 1) return -1;
-        
+        for (int i = 0; i < dim * hidden_dim; i++) model->down_proj_f32[layer * dim * hidden_dim + i] = sm2_f16_to_float(model->down_proj[layer * dim * hidden_dim + i]);
+
         fprintf(stderr, "DEBUG: Layer %d loaded\n", layer);
     }
     
@@ -224,6 +270,8 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
     model->final_norm = calloc(dim, sizeof(uint16_t));
     if (!model->final_norm) return -1;
     if (fread(model->final_norm, dim * sizeof(uint16_t), 1, f) != 1) { return -1; }
+    model->final_norm_f32 = malloc(dim * sizeof(float));
+    for (int i = 0; i < dim; i++) model->final_norm_f32[i] = sm2_f16_to_float(model->final_norm[i]);
     
     fprintf(stderr, "DEBUG: All weights loaded successfully!\n");
     return 0;

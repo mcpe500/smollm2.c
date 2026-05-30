@@ -16,32 +16,11 @@
 // ============================================================================
 
 static void f16_to_float4(float* out, uint16_t* in) {
-    // Each float16 is 16 bits, pack into uint32 for processing
-    uint32x4_t bits = vmovl_n_u16(vld1_u16(in));
-
-    uint32x4_t sign = vshrq_n_u32(bits, 15);
-    uint32x4_t exp = vshrq_n_u32(bits, 10) & vdupq_n_u32(0x1F);
-    uint32x4_t frac = bits & vdupq_n_u32(0x3FF);
-
-    // Calculate float values
-    // out = (-1)^sign * (1 + frac/1024) * 2^(exp-15)
-    uint32x4_t biased_exp = exp - vdupq_n_u32(15);
-    uint32x4_t mantissa = vaddq_u32(frac, vdupq_n_u32(512));
-
-    // Use vgetq_lane_u32 to extract and compute
-    for (int i = 0; i < 4; i++) {
-        uint32_t s = vgetq_lane_u32(sign, i);
-        uint32_t e = vgetq_lane_u32(biased_exp, i);
-        uint32_t m = vgetq_lane_u32(mantissa, i);
-
-        float result;
-        if (e == 0) {
-            result = (float)m / 1024.0f;
-        } else {
-            result = (1.0f + (float)m / 1024.0f) * powf(2.0f, (float)(e + 15));
-        }
-        out[i] = s ? -result : result;
-    }
+    // Use scalar fallback since NEON vgetq_lane requires constant indices
+    out[0] = sm2_f16_to_float(in[0]);
+    out[1] = sm2_f16_to_float(in[1]);
+    out[2] = sm2_f16_to_float(in[2]);
+    out[3] = sm2_f16_to_float(in[3]);
 }
 
 // Fallback scalar for small batches
@@ -69,8 +48,9 @@ static inline float f16_to_float_scalar(uint16_t h) {
 // Weight matrix b is transposed (column-major access pattern for cache efficiency)
 // ============================================================================
 
-void sm2_matmul_neon_f16(float* out, const float* a, const uint16_t* wb,
+void sm2_matmul_neon_f16(float* out, const float* a, const void* wb_ptr,
                         int m, int n, int k) {
+    const uint16_t* wb = (const uint16_t*)wb_ptr;
     // Process 4 output columns at a time with NEON
     for (int i = 0; i < m; i++) {
         const float* a_row = a + i * k;

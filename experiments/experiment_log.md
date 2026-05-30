@@ -14,3 +14,7 @@ Baseline: ~0.9 tok/s (31 seconds for 92 chars)
 | 4 | 2026-05-30 | F16 lookup table + 4x unrolling | 5.7 tok/s | 6.2 tok/s | ✅ 10% speedup |
 | 5 | 2026-05-30 | Attention 4x unroll (no improvement) | 6.2 tok/s | 6.0 tok/s | ❌ No change |
 | 6 | 2026-05-30 | NEON backend (not used, slower) | 6.0 tok/s | 2.3 tok/s | ❌ Backend not in decode path |
+| 7 | 2026-05-30 | F32 precomputed weights | 4.6 tok/s | 4.6 tok/s | ❌ Same speed, lookup table was already fast |
+| 8 | 2026-05-30 | 8x unrolling |4.6 tok/s | 4.2 tok/s | ❌ No improvement |
+| 9 | 2026-05-30 | LTO + funroll-loops | 4.2 tok/s | 4.6 tok/s | ❌ No improvement |
+| 10 | 2026-05-30 | NEON matmul (unused) | 4.6 tok/s | 4.6 tok/s | ❌ Function not called in decode path |
