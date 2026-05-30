@@ -207,7 +207,7 @@ static int handle_chat(int fd, const char* body, int body_len,
     // Tokenize
     char full_prompt[8192];
     snprintf(full_prompt, sizeof(full_prompt),
-        "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face.<|im_end|>\n"
+        "<|im_start|>system\nGive short answers. Say only the number for math. Examples: 2+2=4, 5*5=25.<|im_end|>\n"
         "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
         message);
 

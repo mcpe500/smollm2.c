@@ -35,8 +35,8 @@ int run_chat_cli(sm2_model* model, const cli_args* args, const sm2_generate_para
     chat_history hist;
     chat_history_init(&hist);
 
-    // Set default system prompt
-    const char* system_prompt = "You are a helpful AI assistant named SmolLM, trained by Hugging Face.";
+    // Set default system prompt - include examples to guide model behavior
+    const char* system_prompt = "Give short answers. Say only the number for math. Examples: 2+2=4, 5*5=25.";
     chat_history_set_system(&hist, system_prompt);
 
     printf("================================\n");

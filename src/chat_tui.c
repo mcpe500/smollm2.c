@@ -382,7 +382,7 @@ int run_chat_tui(sm2_model* model, const cli_args* args) {
     g_args = (cli_args*)args;
 
     chat_history_init(&g_state.history);
-    chat_history_set_system(&g_state.history, "You are a helpful AI assistant named SmolLM, trained by Hugging Face.");
+    chat_history_set_system(&g_state.history, "Give short answers. Say only the number for math. Examples: 2+2=4, 5*5=25.");
 
     g_state.input_buffer[0] = '\0';
     g_state.input_pos = 0;
