@@ -3,6 +3,9 @@
 #include <math.h>
 #include "smollm2.h"
 
+// Forward declaration
+typedef struct sm2_dflash sm2_dflash;
+
 // Verify a block of draft tokens against target model
 // Returns number of accepted tokens from the prefix
 int sm2_dflash_verify_block(

@@ -124,7 +124,8 @@ int sm2_dflash_step(sm2_dflash* df, int* out_token) {
         *out_token = sm2_sample_token(
             df->target_ctx->scratch.logits,
             &df->target_ctx->params,
-            &df->target_ctx->rng_state
+            &df->target_ctx->rng_state,
+            df->target_ctx
         );
     }
     

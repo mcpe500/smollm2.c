@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 // Send SSE data event
 int sse_send(int fd, const char* event, const char* data) {

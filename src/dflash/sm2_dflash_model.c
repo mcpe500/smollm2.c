@@ -3,6 +3,9 @@
 #include <math.h>
 #include "smollm2.h"
 
+// Forward declaration
+typedef struct sm2_dflash sm2_dflash;
+
 // Load DFlash draft model
 // Note: DFlash models are trained separately, not converted from standard checkpoints
 int sm2_dflash_load_model(sm2_dflash* df, const char* path) {

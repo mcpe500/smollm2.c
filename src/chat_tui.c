@@ -250,12 +250,8 @@ static void tui_render() {
 static int generate_response(const char* user_input) {
     chat_history_add_user(&g_state.history, user_input);
 
-    char* prompt = chat_history_build_prompt(&g_state.history, NULL);
-    if (!prompt) return -1;
-
     int tokens[4096];
-    int n_tokens = sm2_tokenizer_encode(g_tok, prompt, tokens, 4096);
-    free(prompt);
+    int n_tokens = chat_history_build_prompt_tokens(&g_state.history, NULL, tokens, 4096, g_tok);
 
     if (n_tokens <= 0) return -1;
 
@@ -382,7 +378,8 @@ int run_chat_tui(sm2_model* model, const cli_args* args) {
     g_args = (cli_args*)args;
 
     chat_history_init(&g_state.history);
-    chat_history_set_system(&g_state.history, "Give short answers. Say only the number for math. Examples: 2+2=4, 5*5=25.");
+    // Set system prompt for coherent responses
+    chat_history_set_system(&g_state.history, "You are a helpful AI assistant named SmolLM, trained by Hugging Face");
 
     g_state.input_buffer[0] = '\0';
     g_state.input_pos = 0;

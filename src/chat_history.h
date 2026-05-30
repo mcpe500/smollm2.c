@@ -4,6 +4,9 @@
 
 #include <stddef.h>
 
+// Forward declaration (actual type in smollm2.h)
+typedef struct sm2_tokenizer sm2_tokenizer;
+
 #define MAX_MESSAGES 200
 #define MAX_MESSAGE_LEN 4096
 #define MAX_TOKENS 2048
@@ -42,5 +45,17 @@ int chat_history_token_count(chat_history* hist);
 
 // Trim history to fit within max_tokens
 void chat_history_trim(chat_history* hist, int max_tokens);
+
+// Special token IDs for SmolLM2 chat template
+// These are the actual vocab token IDs, not string representations
+#define SM2_TOKEN_IM_START 1    // <|im_start|>
+#define SM2_TOKEN_IM_END  2    // <|im_end|>
+#define SM2_TOKEN_NEWLINE 198  // Ċ (newline character)
+
+// Build chat template directly as tokens (more reliable than string encoding)
+// This bypasses the tokenizer to avoid string encoding issues with special tokens
+// Returns number of tokens written, or -1 on error
+int chat_history_build_prompt_tokens(chat_history* hist, const char* new_user_input,
+                                     int* tokens, int max_tokens, sm2_tokenizer* tok);
 
 #endif // CHAT_HISTORY_H

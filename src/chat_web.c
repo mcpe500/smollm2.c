@@ -204,15 +204,32 @@ static int handle_chat(int fd, const char* body, int body_len,
         return -1;
     }
 
-    // Tokenize
-    char full_prompt[8192];
-    snprintf(full_prompt, sizeof(full_prompt),
-        "<|im_start|>system\nGive short answers. Say only the number for math. Examples: 2+2=4, 5*5=25.<|im_end|>\n"
-        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-        message);
-
+    // Build template directly using token IDs (more reliable than string encoding)
     int tokens[4096];
-    int n_tokens = sm2_tokenizer_encode(tok, full_prompt, tokens, 4096);
+    int n = 0;
+
+    // <|im_start|>system
+    tokens[n++] = 1;
+    n += sm2_tokenizer_encode(tok, "system", tokens + n, 4096 - n);
+    tokens[n++] = 198;  // Ċ newline
+    n += sm2_tokenizer_encode(tok, "You are a helpful AI assistant named SmolLM, trained by Hugging Face", tokens + n, 4096 - n);
+    tokens[n++] = 2;    // <|im_end|>
+    tokens[n++] = 198;  // Ċ newline
+
+    // <|im_start|>user
+    tokens[n++] = 1;
+    n += sm2_tokenizer_encode(tok, "user", tokens + n, 4096 - n);
+    tokens[n++] = 198;  // Ċ newline
+    n += sm2_tokenizer_encode(tok, message, tokens + n, 4096 - n);
+    tokens[n++] = 2;    // <|im_end|>
+    tokens[n++] = 198;  // Ċ newline
+
+    // <|im_start|>assistant
+    tokens[n++] = 1;
+    n += sm2_tokenizer_encode(tok, "assistant", tokens + n, 4096 - n);
+    tokens[n++] = 198;  // Ċ newline
+
+    int n_tokens = n;
 
     if (n_tokens <= 0) {
         char err[256];
