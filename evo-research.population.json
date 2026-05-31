@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c027",
-  "stagnation_runs": 1,
+  "active_candidate_id": "c028",
+  "stagnation_runs": 2,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -677,6 +677,31 @@
       ],
       "last_result_ref": 27,
       "notes": []
+    },
+    {
+      "id": "c028",
+      "family": "F16_FAST",
+      "parent_id": null,
+      "operator": "f16_exp_table",
+      "hypothesis": "Precomputed lookup table for exponent bias avoids shift and addition operations",
+      "genome": {
+        "change": "Use lookup table for F16 exponent bias in sm2_f16_to_float",
+        "file": "include/sm2_utils.h"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 28,
+          "status": "keep",
+          "metric": 20.3,
+          "direction": "higher",
+          "confidence": 15.2941176470588,
+          "timestamp": 1780217548338,
+          "description": "Seed F16_FAST: Use lookup table for F16 exponent bias"
+        }
+      ],
+      "last_result_ref": 28,
+      "notes": []
     }
   ],
   "families": [
@@ -706,9 +731,9 @@
     },
     {
       "name": "F16_FAST",
-      "attempts": 3,
+      "attempts": 4,
       "failures": 0,
-      "keeps": 3,
+      "keeps": 4,
       "retired": false,
       "consecutive_failures": 0
     },

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "lastBuilt": "2026-05-31T12:08:54.387Z",
+  "skills": {
+    "mmx-cli": {
+      "name": "mmx-cli",
+      "description": "Use mmx to generate text, images, video, speech, and music via the MiniMax AI platform. Use when the user wants to create media content, chat with MiniMax models, perform web search, or manage MiniMax API resources from the terminal.",
+      "filePath": "/data/data/com.termux/files/home/.pi/agent/skills/mmx-cli/SKILL.md",
+      "baseDir": "/data/data/com.termux/files/home/.pi/agent/skills/mmx-cli",
+      "scope": "user",
+      "hash": "f9abafc4616df74f7235ae49c616e6a470c41cb47c5208c0227bab9c28e26e1b",
+      "compactRules": [],
+      "tokensApprox": 0,
+      "exceedsBudget": false
+    }
+  },
+  "diagnostics": [
+    "pi-loader: skill path does not exist"
+  ]
+}
