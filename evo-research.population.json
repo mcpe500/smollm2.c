@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c007",
-  "stagnation_runs": 1,
+  "active_candidate_id": "c008",
+  "stagnation_runs": 0,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -202,6 +202,31 @@
       ],
       "last_result_ref": 8,
       "notes": []
+    },
+    {
+      "id": "c008",
+      "family": "F16_FAST",
+      "parent_id": null,
+      "operator": "matmul_8x_unroll",
+      "hypothesis": "8x unrolling provides better ILP and reduces loop overhead",
+      "genome": {
+        "change": "8x unroll matmul inner loop (from 4x)",
+        "file": "src/sm2_matmul_fast.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 9,
+          "status": "keep",
+          "metric": 14.5,
+          "direction": "higher",
+          "confidence": 8.428571428571416,
+          "timestamp": 1780205729505,
+          "description": "8x unroll matmul inner loop (mutate c005)"
+        }
+      ],
+      "last_result_ref": 9,
+      "notes": []
     }
   ],
   "families": [
@@ -231,9 +256,9 @@
     },
     {
       "name": "F16_FAST",
-      "attempts": 1,
+      "attempts": 2,
       "failures": 0,
-      "keeps": 1,
+      "keeps": 2,
       "retired": false,
       "consecutive_failures": 0
     }

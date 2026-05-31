@@ -6,6 +6,8 @@
 //   gate = x @ W_gate
 //   up = x @ W_up
 //   down = (Swish(gate) * up) @ W_down
+//
+// Optimization: Fast GELU approximation (used in hot path)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,21 +16,30 @@
 
 #define SM2_M_SQRT2_M_PI 2.5066282746310005024157652848110f  // sqrt(2/pi)
 
+// Precomputed GELU coefficients
+#define GELU_C 0.044715f
+
 // ============================================================================
-// ACTIVATION FUNCTIONS
+// ACTIVATION FUNCTIONS (optimized)
 // ============================================================================
 
-// GELU (Gaussian Error Linear Unit) approximation
+// Fast GELU approximation using tanh
 // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-static float gelu(float x) {
+static inline float gelu(float x) {
     float c = SM2_M_SQRT2_M_PI;
-    float t = tanhf(c * (x + 0.044715f * x * x * x));
+    float t = tanhf(c * (x + GELU_C * x * x * x));
     return 0.5f * x * (1.0f + t);
 }
 
-// Swish activation: x * sigmoid(x)
-static float swish(float x) {
+// Swish activation: x * sigmoid(x) - optimized inline
+static inline float swish(float x) {
     return x / (1.0f + expf(-x));
+}
+
+// GELU with precomputed 0.5 coefficient
+static inline float gelu_fast(float x) {
+    float t = tanhf(0.7978845608f * (x + 0.044715f * x * x * x));
+    return x * (0.5f + 0.5f * t);
 }
 
 // ============================================================================
