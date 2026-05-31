@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c015",
-  "stagnation_runs": 6,
+  "active_candidate_id": "c016",
+  "stagnation_runs": 7,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -377,6 +377,31 @@
       ],
       "last_result_ref": 15,
       "notes": []
+    },
+    {
+      "id": "c016",
+      "family": "FFN_FUSION",
+      "parent_id": null,
+      "operator": "fuse_silu_multiply",
+      "hypothesis": "Fusing silu activation with multiply reduces memory accesses and loop overhead",
+      "genome": {
+        "change": "Fuse silu + multiply into single loop",
+        "file": "src/decode/sm2dl_decode.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 16,
+          "status": "keep",
+          "metric": 14.5,
+          "direction": "higher",
+          "confidence": 11.8,
+          "timestamp": 1780208632236,
+          "description": "Fuse silu + multiply into single loop to reduce memory accesses"
+        }
+      ],
+      "last_result_ref": 16,
+      "notes": []
     }
   ],
   "families": [
@@ -422,6 +447,14 @@
     },
     {
       "name": "COMPILER_OPT",
+      "attempts": 1,
+      "failures": 0,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 0
+    },
+    {
+      "name": "FFN_FUSION",
       "attempts": 1,
       "failures": 0,
       "keeps": 1,

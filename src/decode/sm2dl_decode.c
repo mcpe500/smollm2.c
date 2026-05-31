@@ -99,26 +99,28 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
                  model->n_heads, model->n_kv_heads, spec->rope_theta);
         
         // ---- Attention ----
-        // Simplified GQA attention
+        // Simplified GQA attention with cache-friendly access pattern
         int group_size = model->n_heads / model->n_kv_heads;
+        const float attn_scale = 0.125f;  // 1/sqrt(64)
         
         for (int qh = 0; qh < model->n_heads; qh++) {
             int kv_head = qh / group_size;
+            float* q_base = &q[qh * model->head_dim];
+            float* v_base = &v[kv_head * model->head_dim];
             
-            // Compute attention scores
+            // Compute attention scores and find max
             float scores[256]; // max seq_len
             float max_score = -1e9f;
             int seq_len = ctx->kv.seq_len + 1;
             
             for (int pos = 0; pos < seq_len; pos++) {
+                float* k_pos = &k[kv_head * model->head_dim + pos * model->head_dim];
                 float dot = 0.0f;
                 for (int d = 0; d < model->head_dim; d++) {
-                    dot += q[qh * model->head_dim + d] * 
-                          k[kv_head * model->head_dim + pos * model->head_dim + d];
+                    dot += q_base[d] * k_pos[d];
                 }
-                dot /= sqrtf((float)model->head_dim);
-                scores[pos] = dot;
-                if (dot > max_score) max_score = dot;
+                scores[pos] = dot * attn_scale;
+                if (scores[pos] > max_score) max_score = scores[pos];
             }
             
             // Softmax
@@ -127,14 +129,15 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
                 scores[pos] = expf(scores[pos] - max_score);
                 sum_exp += scores[pos];
             }
+            float inv_sum = 1.0f / sum_exp;
             
-            // Weighted sum
+            // Weighted sum with scaled scores
             for (int d = 0; d < model->head_dim; d++) {
                 float sum = 0.0f;
                 for (int pos = 0; pos < seq_len; pos++) {
-                    sum += scores[pos] * v[kv_head * model->head_dim + pos * model->head_dim + d];
+                    sum += scores[pos] * v_base[pos * model->head_dim + d];
                 }
-                attn_out[qh * model->head_dim + d] = sum / sum_exp;
+                attn_out[qh * model->head_dim + d] = sum * inv_sum;
             }
         }
         
