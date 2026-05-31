@@ -649,35 +649,6 @@ int sm2_decode_next(sm2_context* ctx, int* out_token) {
 }
 
 // ============================================================================
-// DEBUG: Print top N logits
-// ============================================================================
-
-void sm2_debug_print_logits(sm2_context* ctx, int top_n) {
-    float* logits = ctx->scratch.logits;
-    int vocab_size = ctx->model->vocab_size;
-
-    fprintf(stderr, "First 20 logits:");
-    for (int i = 0; i < 20 && i < vocab_size; i++) {
-        fprintf(stderr, " [%d]=%.2f", i, logits[i]);
-    }
-    fprintf(stderr, "\n");
-
-    fprintf(stderr, "Top %d logits:\n", top_n);
-    for (int t = 0; t < top_n; t++) {
-        int max_idx = 0;
-        float max_val = logits[0];
-        for (int i = 1; i < vocab_size; i++) {
-            if (logits[i] > max_val) {
-                max_val = logits[i];
-                max_idx = i;
-            }
-        }
-        fprintf(stderr, "  [%d] = %.4f\n", max_idx, max_val);
-        logits[max_idx] = -1e9f;
-    }
-}
-
-// ============================================================================
 // STREAMING DECODE
 // ============================================================================
 

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "generation": 0,
+  "active_candidate_id": "cand-run-1",
+  "stagnation_runs": 1,
+  "candidates": [
+    {
+      "id": "cand-run-1",
+      "family": "BASELINE",
+      "parent_id": null,
+      "operator": "seed",
+      "hypothesis": "Baseline tok/s before any optimization",
+      "genome": null,
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 1,
+          "status": "discard",
+          "metric": 8.6,
+          "direction": "higher",
+          "confidence": null,
+          "timestamp": 1780201344631,
+          "description": "Baseline tok/s before any optimization"
+        }
+      ],
+      "last_result_ref": 1,
+      "notes": [
+        "candidate_id missing in ASI; derived from run number"
+      ]
+    }
+  ],
+  "families": [
+    {
+      "name": "BASELINE",
+      "attempts": 1,
+      "failures": 1,
+      "keeps": 0,
+      "retired": false,
+      "consecutive_failures": 1
+    }
+  ],
+  "scheduler": {
+    "max_consecutive_family_failures": 3,
+    "novelty_after_stagnation_runs": 5,
+    "elite_limit": 3,
+    "max_consecutive_family_attempts": 2,
+    "explore_every_n_runs": 3,
+    "generation_size": 10,
+    "min_family_attempts_per_generation": 1
+  }
+}

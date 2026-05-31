@@ -1,0 +1,2 @@
+{"type":"config","name":"SmolLM2 Inference Optimization - tok/s","metricName":"tok/s","metricUnit":"tok/s","bestDirection":"higher"}
+{"run":1,"commit":"baselin","metric":8.6,"metrics":{},"status":"discard","description":"Baseline tok/s before any optimization","timestamp":1780201344631,"segment":0,"confidence":null,"asi":{"baseline":true,"family":"BASELINE","tok_s_per_run":[7.1,9.6,9.2],"tok_s_avg":8.6}}
