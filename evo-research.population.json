@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c006",
-  "stagnation_runs": 0,
+  "active_candidate_id": "c007",
+  "stagnation_runs": 1,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -177,6 +177,31 @@
       ],
       "last_result_ref": 7,
       "notes": []
+    },
+    {
+      "id": "c007",
+      "family": "ROPE_OPT",
+      "parent_id": null,
+      "operator": "rope_freq_cache_apply",
+      "hypothesis": "Hoisting freq multiplication and 2x unroll in sm2_rope_apply",
+      "genome": {
+        "change": "Add freq_cache in sm2_rope_apply (2x unroll + freq hoisting)",
+        "file": "src/sm2_rope.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 8,
+          "status": "keep",
+          "metric": 13.1,
+          "direction": "higher",
+          "confidence": 11.777777777777752,
+          "timestamp": 1780205583343,
+          "description": "Add freq_cache in sm2_rope_apply (2x unroll + freq hoisting)"
+        }
+      ],
+      "last_result_ref": 8,
+      "notes": []
     }
   ],
   "families": [
@@ -198,9 +223,9 @@
     },
     {
       "name": "ROPE_OPT",
-      "attempts": 2,
+      "attempts": 3,
       "failures": 0,
-      "keeps": 2,
+      "keeps": 3,
       "retired": false,
       "consecutive_failures": 0
     },

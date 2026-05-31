@@ -48,26 +48,35 @@ static inline float f16_to_f32(uint16_t h) {
 }
 
 // Fast matmul: out = a @ b, where a is [m, k], b is [k, n] F16
-// Uses 4x inner loop unrolling for better ILP
+// Uses 8x inner loop unrolling for better ILP
 void sm2_matmul_f16_fast(float* out, const float* a, const uint16_t* wb, int m, int n, int k) {
     for (int i = 0; i < m; i++) {
         const float* a_row = a + i * k;
 
         for (int j = 0; j < n; j++) {
-            // 4x unrolled accumulation
+            // 8x unrolled accumulation
             float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+            float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
             int l = 0;
 
-            for (; l + 3 < k; l += 4) {
+            for (; l + 7 < k; l += 8) {
                 uint16_t w0 = wb[l * n + j];
                 uint16_t w1 = wb[(l+1) * n + j];
                 uint16_t w2 = wb[(l+2) * n + j];
                 uint16_t w3 = wb[(l+3) * n + j];
+                uint16_t w4 = wb[(l+4) * n + j];
+                uint16_t w5 = wb[(l+5) * n + j];
+                uint16_t w6 = wb[(l+6) * n + j];
+                uint16_t w7 = wb[(l+7) * n + j];
 
                 sum0 += a_row[l] * f16_to_f32(w0);
                 sum1 += a_row[l+1] * f16_to_f32(w1);
                 sum2 += a_row[l+2] * f16_to_f32(w2);
                 sum3 += a_row[l+3] * f16_to_f32(w3);
+                sum4 += a_row[l+4] * f16_to_f32(w4);
+                sum5 += a_row[l+5] * f16_to_f32(w5);
+                sum6 += a_row[l+6] * f16_to_f32(w6);
+                sum7 += a_row[l+7] * f16_to_f32(w7);
             }
 
             // Handle remainder
@@ -75,7 +84,7 @@ void sm2_matmul_f16_fast(float* out, const float* a, const uint16_t* wb, int m, 
                 sum0 += a_row[l] * f16_to_f32(wb[l * n + j]);
             }
 
-            out[i * n + j] = sum0 + sum1 + sum2 + sum3;
+            out[i * n + j] = sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7;
         }
     }
 }
