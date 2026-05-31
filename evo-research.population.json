@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c025",
-  "stagnation_runs": 4,
+  "active_candidate_id": "c027",
+  "stagnation_runs": 1,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -463,7 +463,7 @@
         "change": "Compiler flag exploration with cortex-a76 tune",
         "file": "build"
       },
-      "status": "failed",
+      "status": "retired",
       "fitness_history": [
         {
           "run": 19,
@@ -488,7 +488,7 @@
         "change": "20-run stability test",
         "file": "build"
       },
-      "status": "failed",
+      "status": "retired",
       "fitness_history": [
         {
           "run": 20,
@@ -627,14 +627,64 @@
       ],
       "last_result_ref": 25,
       "notes": []
+    },
+    {
+      "id": "c026",
+      "family": "BASELINE",
+      "parent_id": null,
+      "operator": "no_exceptions_rtti",
+      "hypothesis": "Adding -fno-exceptions -fno-rtti to -Os may reduce binary size and improve cache locality",
+      "genome": {
+        "change": "-Os -fno-exceptions -fno-rtti compiler flags",
+        "file": "Makefile"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 26,
+          "status": "keep",
+          "metric": 21.6,
+          "direction": "higher",
+          "confidence": 16.250000000000007,
+          "timestamp": 1780216602581,
+          "description": "Seed BASELINE: -Os -fno-exceptions -fno-rtti compiler flags"
+        }
+      ],
+      "last_result_ref": 26,
+      "notes": []
+    },
+    {
+      "id": "c027",
+      "family": "OPTIMIZATION",
+      "parent_id": null,
+      "operator": "no_unwind_tables",
+      "hypothesis": "-fno-unwind-tables further reduces binary size",
+      "genome": {
+        "change": "Test -fno-unwind-tables additional flag",
+        "file": "Makefile"
+      },
+      "status": "retired",
+      "fitness_history": [
+        {
+          "run": 27,
+          "status": "discard",
+          "metric": 15.4,
+          "direction": "higher",
+          "confidence": 14.444444444444441,
+          "timestamp": 1780216943422,
+          "description": "Seed OPTIMIZATION: -Os -fno-exceptions -fno-rtti -fno-unwind-tables"
+        }
+      ],
+      "last_result_ref": 27,
+      "notes": []
     }
   ],
   "families": [
     {
       "name": "BASELINE",
-      "attempts": 2,
+      "attempts": 3,
       "failures": 1,
-      "keeps": 1,
+      "keeps": 2,
       "retired": false,
       "consecutive_failures": 0
     },
@@ -704,11 +754,11 @@
     },
     {
       "name": "OPTIMIZATION",
-      "attempts": 2,
-      "failures": 2,
+      "attempts": 3,
+      "failures": 3,
       "keeps": 0,
-      "retired": false,
-      "consecutive_failures": 2
+      "retired": true,
+      "consecutive_failures": 3
     }
   ],
   "scheduler": {
