@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c016",
-  "stagnation_runs": 7,
+  "active_candidate_id": "c020",
+  "stagnation_runs": 11,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -402,6 +402,106 @@
       ],
       "last_result_ref": 16,
       "notes": []
+    },
+    {
+      "id": "c017",
+      "family": "ATTENTION_OPT",
+      "parent_id": null,
+      "operator": "cache_friendly_attention",
+      "hypothesis": "Hoisting base pointers and using cache-friendly access pattern reduces pointer arithmetic overhead",
+      "genome": {
+        "change": "Hoist q_base/v_base pointers, cache-friendly k_pos access, precompute inv_sum",
+        "file": "src/decode/sm2dl_decode.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 17,
+          "status": "keep",
+          "metric": 14.5,
+          "direction": "higher",
+          "confidence": 11.8,
+          "timestamp": 1780209268544,
+          "description": "Hoist base pointers and use cache-friendly access pattern in attention"
+        }
+      ],
+      "last_result_ref": 17,
+      "notes": []
+    },
+    {
+      "id": "c018",
+      "family": "EMBEDDING_OPT",
+      "parent_id": null,
+      "operator": "kv_seq_len_tracking",
+      "hypothesis": "Tracking seq_len in kv struct enables future KV cache integration",
+      "genome": {
+        "file": "src/decode/sm2dl_decode.c",
+        "change": "Add ctx->kv.seq_len++ after each token"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 18,
+          "status": "discard",
+          "metric": 13.7,
+          "direction": "higher",
+          "confidence": 10.727272727272748,
+          "timestamp": 1780210832727,
+          "description": "Track kv.seq_len in decode_next for future KV cache integration"
+        }
+      ],
+      "last_result_ref": 18,
+      "notes": []
+    },
+    {
+      "id": "c019",
+      "family": "OPTIMIZATION",
+      "parent_id": null,
+      "operator": "cortex_a76_tuning",
+      "hypothesis": "Cortex-a76 tuning may improve performance on ARM devices",
+      "genome": {
+        "change": "Compiler flag exploration with cortex-a76 tune",
+        "file": "build"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 19,
+          "status": "discard",
+          "metric": 13.8,
+          "direction": "higher",
+          "confidence": 9.83333333333334,
+          "timestamp": 1780212816772,
+          "description": "Test cortex-a76 CPU tuning and compiler flags"
+        }
+      ],
+      "last_result_ref": 19,
+      "notes": []
+    },
+    {
+      "id": "c020",
+      "family": "OPTIMIZATION",
+      "parent_id": null,
+      "operator": "stability_test",
+      "hypothesis": "Baseline performance verification",
+      "genome": {
+        "change": "20-run stability test",
+        "file": "build"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 20,
+          "status": "discard",
+          "metric": 12.5,
+          "direction": "higher",
+          "confidence": 10.727272727272748,
+          "timestamp": 1780213701568,
+          "description": "20-run stability test to verify current performance"
+        }
+      ],
+      "last_result_ref": 20,
+      "notes": []
     }
   ],
   "families": [
@@ -460,6 +560,30 @@
       "keeps": 1,
       "retired": false,
       "consecutive_failures": 0
+    },
+    {
+      "name": "ATTENTION_OPT",
+      "attempts": 1,
+      "failures": 0,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 0
+    },
+    {
+      "name": "EMBEDDING_OPT",
+      "attempts": 1,
+      "failures": 1,
+      "keeps": 0,
+      "retired": false,
+      "consecutive_failures": 1
+    },
+    {
+      "name": "OPTIMIZATION",
+      "attempts": 2,
+      "failures": 2,
+      "keeps": 0,
+      "retired": false,
+      "consecutive_failures": 2
     }
   ],
   "scheduler": {
