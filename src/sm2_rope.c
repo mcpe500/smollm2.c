@@ -53,11 +53,11 @@ void sm2_rope_apply(float* vec, const float* freqs, int head_dim, int seq_pos) {
     }
 }
 
-// Apply RoPE to query and key vectors (inline) - optimized
+// Apply RoPE to query and key vectors (uses precomputed freq table)
 void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_heads, float rope_theta) {
     int half = head_dim / 2;
 
-    // Rebuild freq table if theta changed (shouldn't happen often)
+    // Rebuild freq table if theta changed (should only happen at init)
     if (rope_theta_global != rope_theta || rope_freq_table_size == 0) {
         rope_theta_global = rope_theta;
         rope_freq_table_size = half;
@@ -71,8 +71,8 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
         for (int i = 0; i < half; i++) {
             // Use precomputed freq * pos
             float freq = rope_freq_table[i] * (float)pos;
-            float cos_theta = cosf(freq);
-            float sin_theta = sinf(freq);
+            float cos_theta = __cosf(freq);  // Fast single-precision cos
+            float sin_theta = __sinf(freq);  // Fast single-precision sin
 
             float x0 = q_head[i];
             float x1 = q_head[i + half];
@@ -86,8 +86,8 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
         float* k_head = k + h * head_dim;
         for (int i = 0; i < half; i++) {
             float freq = rope_freq_table[i] * (float)pos;
-            float cos_theta = cosf(freq);
-            float sin_theta = sinf(freq);
+            float cos_theta = __cosf(freq);  // Fast single-precision cos
+            float sin_theta = __sinf(freq);  // Fast single-precision sin
 
             float x0 = k_head[i];
             float x1 = k_head[i + half];

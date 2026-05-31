@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c001",
+  "active_candidate_id": "c002",
   "stagnation_runs": 0,
   "candidates": [
     {
@@ -52,6 +52,31 @@
       ],
       "last_result_ref": 2,
       "notes": []
+    },
+    {
+      "id": "c002",
+      "family": "DEBUG_REMOVAL",
+      "parent_id": null,
+      "operator": "remove_model_load_debug_prints",
+      "hypothesis": "DEBUG fprintf during model load affects cache/memory layout performance",
+      "genome": {
+        "change": "remove 5 DEBUG fprintf from model loading",
+        "file": "src/sm2_model.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 3,
+          "status": "keep",
+          "metric": 13.8,
+          "direction": "higher",
+          "confidence": 2.260869565217391,
+          "timestamp": 1780201740305,
+          "description": "Remove DEBUG fprintf from model loading (mutate c001)"
+        }
+      ],
+      "last_result_ref": 3,
+      "notes": []
     }
   ],
   "families": [
@@ -65,9 +90,9 @@
     },
     {
       "name": "DEBUG_REMOVAL",
-      "attempts": 1,
+      "attempts": 2,
       "failures": 0,
-      "keeps": 1,
+      "keeps": 2,
       "retired": false,
       "consecutive_failures": 0
     }
