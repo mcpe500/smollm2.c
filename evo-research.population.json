@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c008",
-  "stagnation_runs": 0,
+  "active_candidate_id": "c010",
+  "stagnation_runs": 2,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -227,6 +227,56 @@
       ],
       "last_result_ref": 9,
       "notes": []
+    },
+    {
+      "id": "c009",
+      "family": "ACTIVATION_OPT",
+      "parent_id": null,
+      "operator": "inline_activations",
+      "hypothesis": "Inline activation functions reduce call overhead; fast GELU uses precomputed coefficient",
+      "genome": {
+        "change": "Mark activation functions as inline and add gelu_fast",
+        "file": "src/sm2_mlp.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 10,
+          "status": "keep",
+          "metric": 14.1,
+          "direction": "higher",
+          "confidence": 9.07692307692306,
+          "timestamp": 1780205781156,
+          "description": "Seed new family ACTIVATION_OPT with inline activations"
+        }
+      ],
+      "last_result_ref": 10,
+      "notes": []
+    },
+    {
+      "id": "c010",
+      "family": "ACTIVATION_OPT",
+      "parent_id": null,
+      "operator": "silu_fused_4x",
+      "hypothesis": "Fusing SiLU activation with multiply reduces memory accesses",
+      "genome": {
+        "change": "Fuse SiLU + Multiply into single 4x unrolled loop",
+        "file": "src/sm2_context.c"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 11,
+          "status": "discard",
+          "metric": 12.9,
+          "direction": "higher",
+          "confidence": 8.428571428571416,
+          "timestamp": 1780207023800,
+          "description": "Fuse SiLU + Multiply into single 4x unrolled loop (mutate c009)"
+        }
+      ],
+      "last_result_ref": 11,
+      "notes": []
     }
   ],
   "families": [
@@ -261,6 +311,14 @@
       "keeps": 2,
       "retired": false,
       "consecutive_failures": 0
+    },
+    {
+      "name": "ACTIVATION_OPT",
+      "attempts": 2,
+      "failures": 1,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 1
     }
   ],
   "scheduler": {
