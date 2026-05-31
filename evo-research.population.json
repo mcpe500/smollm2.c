@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c005",
-  "stagnation_runs": 3,
+  "active_candidate_id": "c006",
+  "stagnation_runs": 0,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -152,6 +152,31 @@
       ],
       "last_result_ref": 6,
       "notes": []
+    },
+    {
+      "id": "c006",
+      "family": "ROPE_OPT",
+      "parent_id": null,
+      "operator": "rope_2x_unroll",
+      "hypothesis": "Processing 2 pairs of RoPE dimensions together reduces trig call overhead and improves ILP",
+      "genome": {
+        "change": "2x unroll RoPE inner loop with paired cos/sin",
+        "file": "src/sm2_rope.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 7,
+          "status": "keep",
+          "metric": 13.9,
+          "direction": "higher",
+          "confidence": 7.5714285714285605,
+          "timestamp": 1780205397421,
+          "description": "2x unroll RoPE inner loop with paired cos/sin (mutate c003)"
+        }
+      ],
+      "last_result_ref": 7,
+      "notes": []
     }
   ],
   "families": [
@@ -173,9 +198,9 @@
     },
     {
       "name": "ROPE_OPT",
-      "attempts": 1,
+      "attempts": 2,
       "failures": 0,
-      "keeps": 1,
+      "keeps": 2,
       "retired": false,
       "consecutive_failures": 0
     },

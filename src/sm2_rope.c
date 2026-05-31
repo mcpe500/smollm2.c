@@ -40,10 +40,33 @@ void sm2_rope_build_freqs(float* freqs, int n_heads, int head_dim, int max_seq, 
 void sm2_rope_apply(float* vec, const float* freqs, int head_dim, int seq_pos) {
     int half = head_dim / 2;
 
+    // Precompute freq values for this position
+    float freq_cache[32];
     for (int i = 0; i < half; i++) {
-        float freq = freqs[seq_pos * half + i];
-        float cos_theta = cosf(freq);
-        float sin_theta = sinf(freq);
+        freq_cache[i] = freqs[seq_pos * half + i];
+    }
+
+    // 2x unrolled with cached freq values
+    int i = 0;
+    for (; i + 1 < half; i += 2) {
+        float cos0 = cosf(freq_cache[i]);
+        float sin0 = sinf(freq_cache[i]);
+        float cos1 = cosf(freq_cache[i+1]);
+        float sin1 = sinf(freq_cache[i+1]);
+
+        float x00 = vec[i];
+        float x01 = vec[i + half];
+        float x10 = vec[i+1];
+        float x11 = vec[i+1 + half];
+
+        vec[i] = x00 * cos0 - x01 * sin0;
+        vec[i + half] = x00 * sin0 + x01 * cos0;
+        vec[i+1] = x10 * cos1 - x11 * sin1;
+        vec[i+1 + half] = x10 * sin1 + x11 * cos1;
+    }
+    for (; i < half; i++) {
+        float cos_theta = cosf(freq_cache[i]);
+        float sin_theta = sinf(freq_cache[i]);
 
         float x0 = vec[i];
         float x1 = vec[i + half];
