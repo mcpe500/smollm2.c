@@ -27,9 +27,8 @@ static void init_f16_exp(void) {
     f16_exp_init = 1;
 }
 
-// Fast F16 to float using lookup table
+// Fast F16 to float - inline check removed after first init
 static inline float f16_to_f32(uint16_t h) {
-    if (!f16_exp_init) init_f16_exp();
     unsigned int bits = h;
     int sign = (bits >> 15) & 1;
     int exp = (bits >> 10) & 0x1F;
@@ -45,6 +44,11 @@ static inline float f16_to_f32(uint16_t h) {
     }
 
     return sign ? -result : result;
+}
+
+// Call this once at startup to initialize tables
+static inline void ensure_f16_init(void) {
+    if (!f16_exp_init) init_f16_exp();
 }
 
 // Fast matmul: out = a @ b, where a is [m, k], b is [k, n] F16

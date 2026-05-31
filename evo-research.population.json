@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c012",
-  "stagnation_runs": 4,
+  "active_candidate_id": "c013",
+  "stagnation_runs": 5,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -327,6 +327,31 @@
       ],
       "last_result_ref": 13,
       "notes": []
+    },
+    {
+      "id": "c013",
+      "family": "DEBUG_REMOVAL",
+      "parent_id": null,
+      "operator": "remove_debug_fprintf",
+      "hypothesis": "Removing debug print from model init path may improve timing consistency",
+      "genome": {
+        "change": "Remove DEBUG fprintf from sm2_model.c tokenizer load",
+        "file": "src/sm2_model.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 14,
+          "status": "keep",
+          "metric": 13.6,
+          "direction": "higher",
+          "confidence": 14.749999999999988,
+          "timestamp": 1780207455200,
+          "description": "Remove DEBUG fprintf from tokenizer load (mutate c002)"
+        }
+      ],
+      "last_result_ref": 14,
+      "notes": []
     }
   ],
   "families": [
@@ -340,9 +365,9 @@
     },
     {
       "name": "DEBUG_REMOVAL",
-      "attempts": 3,
+      "attempts": 4,
       "failures": 0,
-      "keeps": 3,
+      "keeps": 4,
       "retired": false,
       "consecutive_failures": 0
     },
