@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c020",
-  "stagnation_runs": 11,
+  "active_candidate_id": "c025",
+  "stagnation_runs": 4,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -502,6 +502,131 @@
       ],
       "last_result_ref": 20,
       "notes": []
+    },
+    {
+      "id": "c021",
+      "family": "COMPILER_OPT",
+      "parent_id": null,
+      "operator": "size_optimization",
+      "hypothesis": "-Os (size optimization) reduces code size and improves cache locality, leading to faster inference on mobile devices",
+      "genome": {
+        "change": "-Os instead of -O3 optimization level",
+        "file": "Makefile"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 21,
+          "status": "keep",
+          "metric": 18.8,
+          "direction": "higher",
+          "confidence": 17.00000000000001,
+          "timestamp": 1780214680908,
+          "description": "Use -Os optimization for better code locality and cache performance"
+        }
+      ],
+      "last_result_ref": 21,
+      "notes": []
+    },
+    {
+      "id": "c022",
+      "family": "ATTENTION_OPT",
+      "parent_id": null,
+      "operator": "inline_rope_attention",
+      "hypothesis": "Inlining RoPE and fusing softmax with weighted sum reduces function call overhead and improves cache locality",
+      "genome": {
+        "change": "Inline RoPE and fused attention softmax in decode",
+        "file": "src/decode/sm2dl_decode.c"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 22,
+          "status": "discard",
+          "metric": 11.6,
+          "direction": "higher",
+          "confidence": 17.000000000000036,
+          "timestamp": 1780215022411,
+          "description": "Inline RoPE and fused attention softmax in decode"
+        }
+      ],
+      "last_result_ref": 22,
+      "notes": []
+    },
+    {
+      "id": "c023",
+      "family": "FFN_FUSION",
+      "parent_id": null,
+      "operator": "hoist_fusion",
+      "hypothesis": "Hoisting struct field loads outside loops and fusing silu with multiply reduces overhead",
+      "genome": {
+        "change": "Hoist struct loads + inline silu fusion in decode",
+        "file": "src/decode/sm2dl_decode.c"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 23,
+          "status": "discard",
+          "metric": 12.4,
+          "direction": "higher",
+          "confidence": 17.00000000000001,
+          "timestamp": 1780215410012,
+          "description": "Hoist struct loads + inline silu fusion in decode"
+        }
+      ],
+      "last_result_ref": 23,
+      "notes": []
+    },
+    {
+      "id": "c024",
+      "family": "EMBEDDING_OPT",
+      "parent_id": null,
+      "operator": "embed_unroll_prefetch",
+      "hypothesis": "8x unroll and prefetching improve embedding lookup throughput",
+      "genome": {
+        "change": "8x unroll + prefetch in embedding_lookup",
+        "file": "src/sm2_context.c"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 24,
+          "status": "discard",
+          "metric": 12.6,
+          "direction": "higher",
+          "confidence": 16.999999999999986,
+          "timestamp": 1780215904272,
+          "description": "Seed EMBEDDING_OPT: 8x unroll + prefetch in embedding_lookup"
+        }
+      ],
+      "last_result_ref": 24,
+      "notes": []
+    },
+    {
+      "id": "c025",
+      "family": "ACTIVATION_OPT",
+      "parent_id": null,
+      "operator": "rope_cos_sin_table",
+      "hypothesis": "Precomputing cos/sin for all positions at model load eliminates trig calls during decode",
+      "genome": {
+        "change": "Precompute full cos/sin table at model load for RoPE",
+        "file": "src/sm2_rope.c"
+      },
+      "status": "failed",
+      "fitness_history": [
+        {
+          "run": 25,
+          "status": "discard",
+          "metric": 12.6,
+          "direction": "higher",
+          "confidence": 17.00000000000001,
+          "timestamp": 1780216159574,
+          "description": "Seed ROPE_OPT: Precompute full cos/sin table at model load"
+        }
+      ],
+      "last_result_ref": 25,
+      "notes": []
     }
   ],
   "families": [
@@ -539,6 +664,22 @@
     },
     {
       "name": "ACTIVATION_OPT",
+      "attempts": 3,
+      "failures": 2,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 2
+    },
+    {
+      "name": "COMPILER_OPT",
+      "attempts": 2,
+      "failures": 0,
+      "keeps": 2,
+      "retired": false,
+      "consecutive_failures": 0
+    },
+    {
+      "name": "FFN_FUSION",
       "attempts": 2,
       "failures": 1,
       "keeps": 1,
@@ -546,36 +687,20 @@
       "consecutive_failures": 1
     },
     {
-      "name": "COMPILER_OPT",
-      "attempts": 1,
-      "failures": 0,
-      "keeps": 1,
-      "retired": false,
-      "consecutive_failures": 0
-    },
-    {
-      "name": "FFN_FUSION",
-      "attempts": 1,
-      "failures": 0,
-      "keeps": 1,
-      "retired": false,
-      "consecutive_failures": 0
-    },
-    {
       "name": "ATTENTION_OPT",
-      "attempts": 1,
-      "failures": 0,
+      "attempts": 2,
+      "failures": 1,
       "keeps": 1,
       "retired": false,
-      "consecutive_failures": 0
+      "consecutive_failures": 1
     },
     {
       "name": "EMBEDDING_OPT",
-      "attempts": 1,
-      "failures": 1,
+      "attempts": 2,
+      "failures": 2,
       "keeps": 0,
       "retired": false,
-      "consecutive_failures": 1
+      "consecutive_failures": 2
     },
     {
       "name": "OPTIMIZATION",
