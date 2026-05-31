@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c003",
-  "stagnation_runs": 1,
+  "active_candidate_id": "c004",
+  "stagnation_runs": 2,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -102,6 +102,31 @@
       ],
       "last_result_ref": 4,
       "notes": []
+    },
+    {
+      "id": "c004",
+      "family": "DEBUG_REMOVAL",
+      "parent_id": null,
+      "operator": "remove_redundant_f16_conversions",
+      "hypothesis": "Redundant F16->F32 conversion in RMSNorm adds overhead even though F32 weights are precomputed",
+      "genome": {
+        "change": "Remove unnecessary F16 conversions in RMSNorm (use F32 directly)",
+        "file": "src/sm2_context.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 5,
+          "status": "keep",
+          "metric": 13.1,
+          "direction": "higher",
+          "confidence": 6.499999999999996,
+          "timestamp": 1780202258610,
+          "description": "Remove redundant F16->F32 conversions in RMSNorm (mutate c002)"
+        }
+      ],
+      "last_result_ref": 5,
+      "notes": []
     }
   ],
   "families": [
@@ -115,9 +140,9 @@
     },
     {
       "name": "DEBUG_REMOVAL",
-      "attempts": 2,
+      "attempts": 3,
       "failures": 0,
-      "keeps": 2,
+      "keeps": 3,
       "retired": false,
       "consecutive_failures": 0
     },

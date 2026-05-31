@@ -2,15 +2,34 @@
 //
 // Optimizations:
 // - Inner loop unrolling (4x)
-// - Inline F16 conversion
+// - Inline F16 conversion with lookup table
 // - Non-Kahan summation (faster but sufficient precision)
 
 #include <stdio.h>
 #include <math.h>
 #include "smollm2.h"
 
-// Convert F16 to float inline (avoid function call overhead)
+// F16 exponent lookup table (computed once)
+static float f16_exp_table[32];
+static int f16_exp_init = 0;
+
+static void init_f16_exp(void) {
+    if (f16_exp_init) return;
+    for (int e = 0; e < 32; e++) {
+        if (e == 0) {
+            f16_exp_table[e] = 1.0f / 1024.0f;
+        } else if (e == 31) {
+            f16_exp_table[e] = 1.0f / 0.0f;
+        } else {
+            f16_exp_table[e] = ldexpf(1.0f, e - 15);
+        }
+    }
+    f16_exp_init = 1;
+}
+
+// Fast F16 to float using lookup table
 static inline float f16_to_f32(uint16_t h) {
+    if (!f16_exp_init) init_f16_exp();
     unsigned int bits = h;
     int sign = (bits >> 15) & 1;
     int exp = (bits >> 10) & 0x1F;
@@ -18,11 +37,11 @@ static inline float f16_to_f32(uint16_t h) {
     float result;
 
     if (exp == 0) {
-        result = (float)frac / 1024.0f;
+        result = (float)frac * f16_exp_table[0];
     } else if (exp == 31) {
         result = (frac == 0) ? 1.0f / 0.0f : 0.0f / 0.0f;
     } else {
-        result = (1.0f + (float)frac / 1024.0f) * powf(2.0f, (float)(exp - 15));
+        result = (1.0f + (float)frac / 1024.0f) * f16_exp_table[exp];
     }
 
     return sign ? -result : result;
