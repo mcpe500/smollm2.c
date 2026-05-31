@@ -48,8 +48,9 @@ static inline float f16_to_f32(uint16_t h) {
 }
 
 // Fast matmul: out = a @ b, where a is [m, k], b is [k, n] F16
-// Uses 8x inner loop unrolling for better ILP
-void sm2_matmul_f16_fast(float* out, const float* a, const uint16_t* wb, int m, int n, int k) {
+// Uses 8x inner loop unrolling with aliasing hints
+void sm2_matmul_f16_fast(float* restrict out, const float* restrict a, 
+                         const uint16_t* restrict wb, int m, int n, int k) {
     for (int i = 0; i < m; i++) {
         const float* a_row = a + i * k;
 

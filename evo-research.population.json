@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c010",
-  "stagnation_runs": 2,
+  "active_candidate_id": "c011",
+  "stagnation_runs": 3,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -277,16 +277,41 @@
       ],
       "last_result_ref": 11,
       "notes": []
+    },
+    {
+      "id": "c011",
+      "family": "BASELINE",
+      "parent_id": null,
+      "operator": "lto_compiler",
+      "hypothesis": "Link-time optimization may enable cross-module inlining and dead code elimination",
+      "genome": {
+        "change": "Test LTO compiler flag with -flto",
+        "file": "Makefile"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 12,
+          "status": "keep",
+          "metric": 13.5,
+          "direction": "higher",
+          "confidence": 13.11111111111108,
+          "timestamp": 1780207068387,
+          "description": "Seed BASELINE family with LTO compiler optimization"
+        }
+      ],
+      "last_result_ref": 12,
+      "notes": []
     }
   ],
   "families": [
     {
       "name": "BASELINE",
-      "attempts": 1,
+      "attempts": 2,
       "failures": 1,
-      "keeps": 0,
+      "keeps": 1,
       "retired": false,
-      "consecutive_failures": 1
+      "consecutive_failures": 0
     },
     {
       "name": "DEBUG_REMOVAL",
