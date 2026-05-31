@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c004",
-  "stagnation_runs": 2,
+  "active_candidate_id": "c005",
+  "stagnation_runs": 3,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -127,6 +127,31 @@
       ],
       "last_result_ref": 5,
       "notes": []
+    },
+    {
+      "id": "c005",
+      "family": "F16_FAST",
+      "parent_id": null,
+      "operator": "f16_exp_lookup_table",
+      "hypothesis": "Replacing powf with lookup table for F16 conversion speeds up matmul",
+      "genome": {
+        "change": "Use lookup table for F16 exponent computation in matmul_fast",
+        "file": "src/sm2_matmul_fast.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 6,
+          "status": "keep",
+          "metric": 13.3,
+          "direction": "higher",
+          "confidence": 10.400000000000002,
+          "timestamp": 1780205231893,
+          "description": "Use lookup table for F16 exponent computation in matmul_fast"
+        }
+      ],
+      "last_result_ref": 6,
+      "notes": []
     }
   ],
   "families": [
@@ -148,6 +173,14 @@
     },
     {
       "name": "ROPE_OPT",
+      "attempts": 1,
+      "failures": 0,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 0
+    },
+    {
+      "name": "F16_FAST",
       "attempts": 1,
       "failures": 0,
       "keeps": 1,

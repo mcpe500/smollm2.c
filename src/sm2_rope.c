@@ -66,10 +66,29 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
         }
     }
 
+    // Process Q heads with 2x unrolling for cos/sin computation
     for (int h = 0; h < n_heads; h++) {
         float* q_head = q + h * head_dim;
-        for (int i = 0; i < half; i++) {
-            // Use precomputed freq * pos
+        int i = 0;
+        for (; i + 1 < half; i += 2) {
+            float freq0 = rope_freq_table[i] * (float)pos;
+            float freq1 = rope_freq_table[i+1] * (float)pos;
+            float cos0 = cosf(freq0);
+            float sin0 = sinf(freq0);
+            float cos1 = cosf(freq1);
+            float sin1 = sinf(freq1);
+
+            float x00 = q_head[i];
+            float x01 = q_head[i + half];
+            float x10 = q_head[i+1];
+            float x11 = q_head[i+1 + half];
+
+            q_head[i] = x00 * cos0 - x01 * sin0;
+            q_head[i + half] = x00 * sin0 + x01 * cos0;
+            q_head[i+1] = x10 * cos1 - x11 * sin1;
+            q_head[i+1 + half] = x10 * sin1 + x11 * cos1;
+        }
+        for (; i < half; i++) {
             float freq = rope_freq_table[i] * (float)pos;
             float cos_theta = cosf(freq);
             float sin_theta = sinf(freq);
@@ -82,9 +101,29 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
         }
     }
 
+    // Process K heads
     for (int h = 0; h < n_kv_heads; h++) {
         float* k_head = k + h * head_dim;
-        for (int i = 0; i < half; i++) {
+        int i = 0;
+        for (; i + 1 < half; i += 2) {
+            float freq0 = rope_freq_table[i] * (float)pos;
+            float freq1 = rope_freq_table[i+1] * (float)pos;
+            float cos0 = cosf(freq0);
+            float sin0 = sinf(freq0);
+            float cos1 = cosf(freq1);
+            float sin1 = sinf(freq1);
+
+            float x00 = k_head[i];
+            float x01 = k_head[i + half];
+            float x10 = k_head[i+1];
+            float x11 = k_head[i+1 + half];
+
+            k_head[i] = x00 * cos0 - x01 * sin0;
+            k_head[i + half] = x00 * sin0 + x01 * cos0;
+            k_head[i+1] = x10 * cos1 - x11 * sin1;
+            k_head[i+1 + half] = x10 * sin1 + x11 * cos1;
+        }
+        for (; i < half; i++) {
             float freq = rope_freq_table[i] * (float)pos;
             float cos_theta = cosf(freq);
             float sin_theta = sinf(freq);
