@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c013",
-  "stagnation_runs": 5,
+  "active_candidate_id": "c015",
+  "stagnation_runs": 6,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -352,6 +352,31 @@
       ],
       "last_result_ref": 14,
       "notes": []
+    },
+    {
+      "id": "c015",
+      "family": "COMPILER_OPT",
+      "parent_id": null,
+      "operator": "ofast_flag",
+      "hypothesis": "Ofast enables aggressive floating-point optimizations that may speed up inference",
+      "genome": {
+        "change": "Use -Ofast compiler flag",
+        "file": "build command"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 15,
+          "status": "keep",
+          "metric": 14.5,
+          "direction": "higher",
+          "confidence": 14.749999999999988,
+          "timestamp": 1780208296102,
+          "description": "Use -Ofast compiler flag for aggressive FP optimizations"
+        }
+      ],
+      "last_result_ref": 15,
+      "notes": []
     }
   ],
   "families": [
@@ -394,6 +419,14 @@
       "keeps": 1,
       "retired": false,
       "consecutive_failures": 1
+    },
+    {
+      "name": "COMPILER_OPT",
+      "attempts": 1,
+      "failures": 0,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 0
     }
   ],
   "scheduler": {

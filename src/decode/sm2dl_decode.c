@@ -190,13 +190,12 @@ int sm2dl_forward_one_token(sm2_context* ctx) {
         }
         
         // Apply silu to gate: silu(x) = x * sigmoid(x)
+        // Inline: silu(x) = x / (1 + exp(-x))
         for (int i = 0; i < hidden; i++) {
-            float s = 1.0f / (1.0f + expf(-q[i]));
-            q[i] = q[i] * s;
-        }
-        
-        // Multiply: gate = silu(gate) * up
-        for (int i = 0; i < hidden; i++) {
+            float x = q[i];
+            float s = 1.0f / (1.0f + expf(-x));
+            q[i] = x * s;
+            // Multiply with up projection (reuse k buffer)
             q[i] = q[i] * k[i];
         }
         
