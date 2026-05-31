@@ -321,8 +321,6 @@ int sm2_load_model(const char* path, sm2_model** out_model) {
                 free(model->tokenizer);
                 model->tokenizer = NULL;
                 fprintf(stderr, "Warning: Failed to load tokenizer, using byte-token fallback\n");
-            } else {
-                fprintf(stderr, "DEBUG: Tokenizer loaded successfully\n");
             }
         }
     }

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c011",
-  "stagnation_runs": 3,
+  "active_candidate_id": "c012",
+  "stagnation_runs": 4,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -302,6 +302,31 @@
       ],
       "last_result_ref": 12,
       "notes": []
+    },
+    {
+      "id": "c012",
+      "family": "F16_FAST",
+      "parent_id": null,
+      "operator": "matmul_restrict",
+      "hypothesis": "Restrict keyword helps compiler optimize pointer aliasing assumptions",
+      "genome": {
+        "change": "Add restrict keyword to matmul function parameters",
+        "file": "src/sm2_matmul_fast.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 13,
+          "status": "keep",
+          "metric": 13.7,
+          "direction": "higher",
+          "confidence": 14.749999999999988,
+          "timestamp": 1780207312776,
+          "description": "Add restrict keyword to matmul function parameters (mutate c008)"
+        }
+      ],
+      "last_result_ref": 13,
+      "notes": []
     }
   ],
   "families": [
@@ -331,9 +356,9 @@
     },
     {
       "name": "F16_FAST",
-      "attempts": 2,
+      "attempts": 3,
       "failures": 0,
-      "keeps": 2,
+      "keeps": 3,
       "retired": false,
       "consecutive_failures": 0
     },
