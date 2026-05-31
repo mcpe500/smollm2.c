@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "cand-run-1",
-  "stagnation_runs": 1,
+  "active_candidate_id": "c001",
+  "stagnation_runs": 0,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -27,6 +27,31 @@
       "notes": [
         "candidate_id missing in ASI; derived from run number"
       ]
+    },
+    {
+      "id": "c001",
+      "family": "DEBUG_REMOVAL",
+      "parent_id": null,
+      "operator": "remove_sm2_debug_print_logits",
+      "hypothesis": "Debug print function in hot path adds overhead even when not called directly",
+      "genome": {
+        "file": "src/sm2_context.c",
+        "change": "remove sm2_debug_print_logits function (25 lines)"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 2,
+          "status": "keep",
+          "metric": 10.9,
+          "direction": "higher",
+          "confidence": null,
+          "timestamp": 1780201522887,
+          "description": "Remove debug print logits function from hot path"
+        }
+      ],
+      "last_result_ref": 2,
+      "notes": []
     }
   ],
   "families": [
@@ -37,6 +62,14 @@
       "keeps": 0,
       "retired": false,
       "consecutive_failures": 1
+    },
+    {
+      "name": "DEBUG_REMOVAL",
+      "attempts": 1,
+      "failures": 0,
+      "keeps": 1,
+      "retired": false,
+      "consecutive_failures": 0
     }
   ],
   "scheduler": {

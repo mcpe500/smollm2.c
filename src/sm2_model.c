@@ -129,7 +129,6 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
     uint32_t rows, cols;
     if (fread(&rows, 4, 1, f) != 1) { fprintf(stderr, "Failed to read tok_embeddings rows\n"); return -1; }
     if (fread(&cols, 4, 1, f) != 1) { fprintf(stderr, "Failed to read tok_embeddings cols\n"); return -1; }
-    fprintf(stderr, "DEBUG: tok_embeddings header: rows=%u, cols=%u\n", rows, cols);
 
     size_t embed_size = (size_t)rows * cols * sizeof(uint16_t);
     model->tok_embeddings = calloc(1, sizeof(sm2_tensor_f16));
@@ -257,15 +256,12 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
         if (r != (uint32_t)dim || c != (uint32_t)hidden_dim) { fprintf(stderr, "layer %d: down_proj bad shape %ux%u\n", layer, r, c); }
         if (fread(model->down_proj + layer * dim * hidden_dim, dim * hidden_dim * sizeof(uint16_t), 1, f) != 1) return -1;
         for (int i = 0; i < dim * hidden_dim; i++) model->down_proj_f32[layer * dim * hidden_dim + i] = sm2_f16_to_float(model->down_proj[layer * dim * hidden_dim + i]);
-
-        fprintf(stderr, "DEBUG: Layer %d loaded\n", layer);
     }
     
     // ========== 3. Load final_norm ==========
     uint32_t r, c;
     if (fread(&r, 4, 1, f) != 1) { fprintf(stderr, "Failed to read final_norm rows\n"); return -1; }
     if (fread(&c, 4, 1, f) != 1) { fprintf(stderr, "Failed to read final_norm cols\n"); return -1; }
-    fprintf(stderr, "DEBUG: final_norm header: rows=%u, cols=%u\n", r, c);
     
     model->final_norm = calloc(dim, sizeof(uint16_t));
     if (!model->final_norm) return -1;
@@ -273,7 +269,6 @@ static int sm2_load_weights_f16(FILE* f, sm2_model* model, const sm2_file_header
     model->final_norm_f32 = malloc(dim * sizeof(float));
     for (int i = 0; i < dim; i++) model->final_norm_f32[i] = sm2_f16_to_float(model->final_norm[i]);
     
-    fprintf(stderr, "DEBUG: All weights loaded successfully!\n");
     return 0;
 }
 
