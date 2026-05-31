@@ -71,8 +71,8 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
         for (int i = 0; i < half; i++) {
             // Use precomputed freq * pos
             float freq = rope_freq_table[i] * (float)pos;
-            float cos_theta = __cosf(freq);  // Fast single-precision cos
-            float sin_theta = __sinf(freq);  // Fast single-precision sin
+            float cos_theta = cosf(freq);
+            float sin_theta = sinf(freq);
 
             float x0 = q_head[i];
             float x1 = q_head[i + half];
@@ -86,8 +86,8 @@ void sm2_rope(float* q, float* k, int head_dim, int pos, int n_heads, int n_kv_h
         float* k_head = k + h * head_dim;
         for (int i = 0; i < half; i++) {
             float freq = rope_freq_table[i] * (float)pos;
-            float cos_theta = __cosf(freq);  // Fast single-precision cos
-            float sin_theta = __sinf(freq);  // Fast single-precision sin
+            float cos_theta = cosf(freq);
+            float sin_theta = sinf(freq);
 
             float x0 = k_head[i];
             float x1 = k_head[i + half];

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "generation": 0,
-  "active_candidate_id": "c002",
-  "stagnation_runs": 0,
+  "active_candidate_id": "c003",
+  "stagnation_runs": 1,
   "candidates": [
     {
       "id": "cand-run-1",
@@ -77,6 +77,31 @@
       ],
       "last_result_ref": 3,
       "notes": []
+    },
+    {
+      "id": "c003",
+      "family": "ROPE_OPT",
+      "parent_id": null,
+      "operator": "rope_fast_trig",
+      "hypothesis": "Fast single-precision trig functions are faster than standard cosf/sinf",
+      "genome": {
+        "change": "Replace cosf/sinf with __cosf/__sinf (fast single-precision)",
+        "file": "src/sm2_rope.c"
+      },
+      "status": "elite",
+      "fitness_history": [
+        {
+          "run": 4,
+          "status": "keep",
+          "metric": 13,
+          "direction": "higher",
+          "confidence": 3.5862068965517224,
+          "timestamp": 1780202038397,
+          "description": "Replace cosf/sinf with fast single-precision __cosf/__sinf"
+        }
+      ],
+      "last_result_ref": 4,
+      "notes": []
     }
   ],
   "families": [
@@ -93,6 +118,14 @@
       "attempts": 2,
       "failures": 0,
       "keeps": 2,
+      "retired": false,
+      "consecutive_failures": 0
+    },
+    {
+      "name": "ROPE_OPT",
+      "attempts": 1,
+      "failures": 0,
+      "keeps": 1,
       "retired": false,
       "consecutive_failures": 0
     }

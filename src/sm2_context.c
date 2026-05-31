@@ -325,7 +325,7 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     for (int i = 0; i < dim; i++) sum_sq += x_in[i] * x_in[i];
     float rms = sqrtf(sum_sq / (float)dim + 1e-5f);
     for (int i = 0; i < dim; i++) {
-        uint16_t w = model->input_layernorm[ln_off + i];
+        // Use F32 directly - no F16 conversion needed
         xb_out[i] = (x_in[i] / rms) * model->input_layernorm_f32[ln_off + i];
     }
 
@@ -428,7 +428,7 @@ static void layer_forward(float* xb_out, const float* x_in, int layer,
     for (int i = 0; i < dim; i++) sum_sq += xb_out[i] * xb_out[i];
     rms = sqrtf(sum_sq / (float)dim + 1e-5f);
     for (int i = 0; i < dim; i++) {
-        uint16_t w = model->post_attention_layernorm[post_off + i];
+        // Use F32 directly - no F16 conversion needed
         xb_out[i] = (xb_out[i] / rms) * model->post_attention_layernorm_f32[post_off + i];
     }
 
