@@ -1,6 +1,7 @@
 // main.c — smollm2 CLI
 
 #include "gguf.h"
+#include "tokenizer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,23 +150,26 @@ static int do_inspect(const char* path) {
 // ----------------------------------------------------------------------------
 static void usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s [--inspect] [-m <gguf-path>] [-p <prompt>] [-n <tokens>]\n"
+        "Usage: %s [--inspect] [--tok-test <text>] [-m <gguf-path>] [-p <prompt>] [-n <tokens>]\n"
         "\n"
-        "  --inspect        Print GGUF metadata + tensor list, then exit.\n"
-        "  -m <path>        GGUF model file. Default: auto-resolve from Ollama manifest.\n"
-        "  -p <prompt>      Prompt (TODO: implemented in step 7).\n"
-        "  -n <tokens>      Max tokens to generate (TODO).\n",
+        "  --inspect         Print GGUF metadata + tensor list, then exit.\n"
+        "  --tok-test <text> Encode text, print token IDs, decode back, print.\n"
+        "  -m <path>         GGUF model file. Default: auto-resolve from Ollama manifest.\n"
+        "  -p <prompt>       Prompt (TODO: implemented in step 7).\n"
+        "  -n <tokens>       Max tokens to generate (TODO).\n",
         prog);
 }
 
 int main(int argc, char** argv) {
     const char* model_path = NULL;
+    const char* tok_test_text = NULL;
     int inspect = 0;
     const char* prompt = NULL;
     int n_tokens = 50;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--inspect") == 0) inspect = 1;
+        else if (strcmp(argv[i], "--tok-test") == 0 && i + 1 < argc) tok_test_text = argv[++i];
         else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) prompt = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
@@ -178,6 +182,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    int resolver_allocated = 0;
     if (!model_path) {
         model_path = resolve_ollama_model_path();
         if (!model_path) {
@@ -186,18 +191,78 @@ int main(int argc, char** argv) {
                 "pass -m <gguf-path>\n");
             return 1;
         }
+        resolver_allocated = 1;
     }
 
+    int rc = 1;
+
     if (inspect) {
-        int rc = do_inspect(model_path);
-        if (!argv[1] || strcmp(argv[1], "--inspect") != 0) {
-            // model_path was heap-allocated by resolver
+        rc = do_inspect(model_path);
+        goto cleanup;
+    }
+
+    if (tok_test_text) {
+        gguf_ctx ctx;
+        if (gguf_load(model_path, &ctx) < 0) {
+            fprintf(stderr, "failed to load %s\n", model_path);
+            goto cleanup;
         }
-        return rc;
+        tokenizer* tok = NULL;
+        if (tokenizer_load(&tok, &ctx) < 0) {
+            fprintf(stderr, "tokenizer load failed\n");
+            gguf_free(&ctx);
+            goto cleanup;
+        }
+        int ids[1024];
+        int n = tokenizer_encode(tok, tok_test_text, ids, 1024);
+        printf("input  (%zu bytes): %s\n", strlen(tok_test_text), tok_test_text);
+        printf("tokens (%d):", n);
+        for (int i = 0; i < n; i++) printf(" %d", ids[i]);
+        printf("\n");
+
+        char buf[4096];
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            char tmp[512];
+            int m = tokenizer_decode(tok, ids[i], tmp, sizeof(tmp));
+            if (m > 0 && total + m < (int)sizeof(buf)) {
+                memcpy(buf + total, tmp, m);
+                total += m;
+            }
+        }
+        buf[total] = '\0';
+        printf("decode (%d bytes): %s\n", total, buf);
+        // Hex of decode bytes for sanity
+        printf("hex   :");
+        for (int i = 0; i < total; i++) printf(" %02x", (unsigned char)buf[i]);
+        printf("\n");
+
+        // Token strings
+        printf("token strings:");
+        for (int i = 0; i < n; i++) {
+            char tmp[512];
+            int m = tokenizer_decode(tok, ids[i], tmp, sizeof(tmp));
+            printf(" [%d]='", ids[i]);
+            for (int j = 0; j < m; j++) {
+                unsigned char b = (unsigned char)tmp[j];
+                if (b >= 32 && b < 127) putchar(b);
+                else printf("\\x%02x", b);
+            }
+            printf("'");
+        }
+        printf("\n");
+
+        tokenizer_free(tok);
+        gguf_free(&ctx);
+        rc = 0;
+        goto cleanup;
     }
 
     // TODO: Step 7 implements -p / -n.
     (void)prompt; (void)n_tokens;
-    fprintf(stderr, "inference not yet implemented; use --inspect\n");
-    return 1;
+    fprintf(stderr, "inference not yet implemented; use --inspect or --tok-test\n");
+
+cleanup:
+    if (resolver_allocated) free((void*)model_path);
+    return rc;
 }

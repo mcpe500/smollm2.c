@@ -1,0 +1,9 @@
+rm -f src/gguf.o src/tokenizer.o src/main.o smollm2
+gcc -std=c99 -O2 -march=native -Wall -Wextra -c -o src/gguf.o src/gguf.c
+gcc -std=c99 -O2 -march=native -Wall -Wextra -c -o src/tokenizer.o src/tokenizer.c
+src/tokenizer.c:501:46: warning: missing field 'fb' initializer [-Wmissing-field-initializers]
+  501 |     encode_state s = { t, out, max_out, 0, 0 };
+      |                                              ^
+1 warning generated.
+gcc -std=c99 -O2 -march=native -Wall -Wextra -c -o src/main.o src/main.c
+gcc -std=c99 -O2 -march=native -Wall -Wextra -o smollm2 src/gguf.o src/tokenizer.o src/main.o -lm

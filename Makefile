@@ -6,6 +6,7 @@ LDFLAGS = -lm
 
 SRC = \
     src/gguf.c \
+    src/tokenizer.c \
     src/main.c
 
 OBJ = $(SRC:.c=.o)
