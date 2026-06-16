@@ -263,7 +263,8 @@ static void handle_generate(int fd, const char* body,
     // Build chat template
     char tmpl[4096];
     snprintf(tmpl, sizeof(tmpl),
-        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n", prompt);
     int prompt_ids[1024];
     int prompt_len = tokenizer_encode(tok, tmpl, prompt_ids, 1024);
     if (prompt_len <= 0) {

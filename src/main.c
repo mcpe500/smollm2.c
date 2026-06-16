@@ -161,7 +161,8 @@ static int do_inspect(const char* path) {
 
 static void build_prompt(const char* user_text, char* out, int max_out) {
     snprintf(out, max_out,
-        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n",
         user_text);
 }
 
@@ -354,7 +355,7 @@ int main(int argc, char** argv) {
     int web_port = 8080;
     const char* prompt = NULL;
     int n_tokens = 200;
-    sample_params sp = {0.0f, 0.9f, 0, 1.0f, 0};
+    sample_params sp = {0.8f, 0.9f, 0, 1.1f, 0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--inspect") == 0) inspect = 1;

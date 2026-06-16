@@ -8,6 +8,13 @@
 
 static unsigned g_rng = 0;
 
+static float* g_topp_probs = NULL;
+static int topp_cmp(const void* a, const void* b) {
+    float pa = g_topp_probs[*(const int*)a];
+    float pb = g_topp_probs[*(const int*)b];
+    return (pa < pb) - (pa > pb);
+}
+
 static float rng_f32(void) {
     g_rng ^= g_rng << 13;
     g_rng ^= g_rng >> 17;
@@ -19,15 +26,7 @@ int sample_token(float* logits, int vocab, const sample_params* p,
                  const int* history, int hist_len) {
     if (!logits || vocab <= 0 || !p) return 0;
 
-    /* Greedy shortcut */
-    if (p->temperature <= 0.0f) {
-        int best = 0;
-        for (int v = 1; v < vocab; v++)
-            if (logits[v] > logits[best]) best = v;
-        return best;
-    }
-
-    /* Repetition penalty */
+    /* Repetition penalty (applied before greedy too) */
     if (p->rep_penalty > 1.0f && history && hist_len > 0) {
         for (int i = 0; i < hist_len; i++) {
             int t = history[i];
@@ -39,6 +38,15 @@ int sample_token(float* logits, int vocab, const sample_params* p,
             }
         }
     }
+
+    /* Greedy shortcut */
+    if (p->temperature <= 0.0f) {
+        int best = 0;
+        for (int v = 1; v < vocab; v++)
+            if (logits[v] > logits[best]) best = v;
+        return best;
+    }
+
 
     /* Temperature */
     float inv_t = 1.0f / p->temperature;
@@ -81,40 +89,25 @@ int sample_token(float* logits, int vocab, const sample_params* p,
         if (sum > 0.0f) { inv_sum = 1.0f/sum; for (int v=0;v<vocab;v++) logits[v]*=inv_sum; }
     }
 
-    /* Top-p: zero out tail below cumulative threshold */
+    /* Top-p (nucleus sampling): qsort indices by prob desc, keep cumsum >= top_p */
     if (p->top_p > 0.0f && p->top_p < 1.0f) {
-        /* sort descending by prob then truncate - use scratch sort on pairs */
-        /* for vocab=49152 a full sort is expensive; use a simpler threshold scan */
-        /* find the prob threshold such that cumsum >= top_p */
-        /* approximation: iterate sorted descending using max-heap would be ideal,
-           but for simplicity we do two passes (find threshold, then zero out) */
+        static int idx[49152];
+        static float probs_copy[49152];
+        int n = vocab < 49152 ? vocab : 49152;
+        for (int v = 0; v < n; v++) idx[v] = v;
+        memcpy(probs_copy, logits, (size_t)n * sizeof(float));
+        g_topp_probs = probs_copy;
+        qsort(idx, (size_t)n, sizeof(int), topp_cmp);
         float cum = 0.0f;
-        float threshold = 0.0f;
-        /* first pass: collect top probs until cumsum >= top_p */
-        float tmp;
-        /* simple approach: repeatedly find max unselected */
-        float* sorted = (float*)malloc((size_t)vocab * sizeof(float));
-        if (sorted) {
-            memcpy(sorted, logits, (size_t)vocab * sizeof(float));
-            /* partial sort: just scan and accumulate until top_p hit */
-            for (int pass = 0; pass < vocab; pass++) {
-                float mx = -FLT_MAX; int mi = 0;
-                for (int v = 0; v < vocab; v++) if (sorted[v] > mx) { mx = sorted[v]; mi = v; }
-                if (mx <= 0.0f) break;
-                cum += mx;
-                sorted[mi] = -FLT_MAX;
-                threshold = mx;
-                if (cum >= p->top_p) break;
-            }
-            free(sorted);
-            sum = 0.0f;
-            for (int v = 0; v < vocab; v++) {
-                if (logits[v] < threshold) logits[v] = 0.0f;
-                sum += logits[v];
-            }
-            if (sum > 0.0f) { inv_sum=1.0f/sum; for(int v=0;v<vocab;v++) logits[v]*=inv_sum; }
+        int cutoff = n;
+        for (int i = 0; i < n; i++) {
+            cum += probs_copy[idx[i]];
+            if (cum >= p->top_p) { cutoff = i + 1; break; }
         }
-        (void)tmp;
+        for (int i = cutoff; i < n; i++) logits[idx[i]] = 0.0f;
+        sum = 0.0f;
+        for (int v = 0; v < n; v++) sum += logits[v];
+        if (sum > 0.0f) { inv_sum = 1.0f/sum; for (int v = 0; v < n; v++) logits[v] *= inv_sum; }
     }
 
     /* Seed RNG if not seeded */

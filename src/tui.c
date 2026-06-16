@@ -79,30 +79,107 @@ static void hist_append_bytes(const char* s, int n, int color) {
 // ---------------------------------------------------------------------------
 static volatile int g_interrupted = 0;
 
+/* Count how many screen rows a history line occupies with word-wrap at cols. */
+static int line_visual_rows(const char* line, int cols) {
+    if (cols < 1) cols = 1;
+    int len = (int)strlen(line);
+    if (len == 0) return 1;
+    int rows = 0, col = 0;
+    for (int i = 0; i < len; ) {
+        /* find end of next word */
+        int ws = i;
+        while (ws < len && line[ws] == ' ') ws++;  /* leading spaces */
+        int we = ws;
+        while (we < len && line[we] != ' ') we++;  /* word chars */
+        int word_len = we - i;  /* spaces + word */
+        if (word_len == 0) break;
+        if (col == 0) {
+            /* always place at least one word per row even if it overflows */
+            int placed = (word_len <= cols) ? word_len : cols;
+            col += placed;
+            if (col >= cols) { rows++; col = 0; }
+            i += placed;
+        } else if (col + word_len <= cols) {
+            col += word_len;
+            if (col >= cols) { rows++; col = 0; }
+            i = we;
+        } else {
+            /* doesn't fit on current row, wrap */
+            rows++; col = 0;
+        }
+    }
+    if (col > 0) rows++;
+    return rows > 0 ? rows : 1;
+}
+
+/* Total screen rows consumed by entries [0..count). */
+static int count_visual_rows(int count, int cols) {
+    int total = 0;
+    for (int i = 0; i < count; i++)
+        total += line_visual_rows(g_hist.lines[i], cols);
+    return total;
+}
+
 static void render(WINDOW* hist_win, WINDOW* input_win,
                    const char* input_buf, int history_rows) {
     int cols = getmaxx(hist_win);
+    if (cols < 1) cols = 1;
 
-    // Determine visible range
-    int visible = history_rows;
+    /* Convert scroll (line index) to visual-row offset and clamp. */
+    int total_vrows = count_visual_rows(g_hist.count, cols);
+    /* g_hist.scroll is a logical line index; we render from there. */
     int first = g_hist.scroll;
-    if (first + visible > g_hist.count)
-        first = g_hist.count - visible;
     if (first < 0) first = 0;
+    if (first >= g_hist.count && g_hist.count > 0)
+        first = g_hist.count - 1;
     g_hist.scroll = first;
+    (void)total_vrows;
 
     werase(hist_win);
-    for (int row = 0; row < visible; row++) {
-        int idx = first + row;
-        if (idx >= g_hist.count) break;
+    int screen_row = 0;
+    for (int idx = first; idx < g_hist.count && screen_row < history_rows; idx++) {
+        const char* line = g_hist.lines[idx];
+        int len = (int)strlen(line);
         int c = g_hist.colors[idx];
-        if (c == 1) wattron(hist_win, COLOR_PAIR(1) | A_BOLD);
-        else if (c == 2) wattron(hist_win, COLOR_PAIR(2));
-        else wattron(hist_win, COLOR_PAIR(3));
-        mvwaddnstr(hist_win, row, 0, g_hist.lines[idx], cols - 1);
-        if (c == 1) wattroff(hist_win, COLOR_PAIR(1) | A_BOLD);
-        else if (c == 2) wattroff(hist_win, COLOR_PAIR(2));
-        else wattroff(hist_win, COLOR_PAIR(3));
+        attr_t attr = (c == 1) ? (COLOR_PAIR(1) | A_BOLD)
+                    : (c == 2) ? COLOR_PAIR(2)
+                               : COLOR_PAIR(3);
+        wattron(hist_win, attr);
+        if (len == 0) {
+            screen_row++;
+        } else {
+            int i = 0;
+            int col = 0;
+            while (i < len && screen_row < history_rows) {
+                /* Gather word-wrap chunk: spaces then word */
+                int ws = i;
+                while (ws < len && line[ws] == ' ') ws++;
+                int we = ws;
+                while (we < len && line[we] != ' ') we++;
+                int word_len = we - i;
+                if (word_len == 0) break;
+
+                if (col == 0) {
+                    /* start of row: print up to cols chars */
+                    int chunk = (word_len <= cols) ? word_len : cols;
+                    mvwaddnstr(hist_win, screen_row, col, line + i, chunk);
+                    col += chunk;
+                    i += chunk;
+                    if (col >= cols) { screen_row++; col = 0; }
+                } else if (col + word_len <= cols) {
+                    mvwaddnstr(hist_win, screen_row, col, line + i, word_len);
+                    col += word_len;
+                    i = we;
+                    if (col >= cols) { screen_row++; col = 0; }
+                } else {
+                    /* wrap: skip leading spaces at start of new row */
+                    screen_row++; col = 0;
+                    while (i < len && line[i] == ' ') i++;
+                }
+            }
+            if (col > 0) screen_row++;
+        }
+        wattroff(hist_win, attr);
     }
     wrefresh(hist_win);
 
@@ -112,8 +189,18 @@ static void render(WINDOW* hist_win, WINDOW* input_win,
 }
 
 static void scroll_to_bottom(int history_rows) {
-    g_hist.scroll = g_hist.count - history_rows;
-    if (g_hist.scroll < 0) g_hist.scroll = 0;
+    /* Walk backwards through lines until we've accumulated history_rows
+       worth of visual rows, then set scroll to that line index. */
+    int cols = 80;  /* conservative fallback; render() uses actual cols */
+    int vrows = 0;
+    int first = 0;
+    for (int i = g_hist.count - 1; i >= 0; i--) {
+        int lv = line_visual_rows(g_hist.lines[i], cols);
+        if (vrows + lv > history_rows) { first = i + 1; break; }
+        vrows += lv;
+        if (i == 0) first = 0;
+    }
+    g_hist.scroll = first;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +244,8 @@ static char g_chat_tmpl[CHAT_BUF_MAX];
 
 static void build_prompt(const char* user_text) {
     snprintf(g_chat_tmpl, sizeof(g_chat_tmpl),
-        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n",
         user_text);
 }
 
