@@ -1,43 +1,29 @@
-# Binaries
-smollm2-cli
-smollm2d
-
-# Object files
+# Build artifacts
+smollm2
+*.o
 obj/
 
-# Model files (download during build/convert)
-*.safetensors
+# Model files (read directly from ~/.ollama/models/)
 *.sm2
+*.safetensors
 *.gguf
 *.bin
 
-# Tokenizer (download during build)
+# Tokenizer (read from GGUF)
 tokenizer.json
-
-# Build artifacts
-*.o
-*.a
-*.so
-*.dylib
 
 # Python cache
 __pycache__/
 *.pyc
-.pytest_cache/
 
-# Editor
+# Editor / OS
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Large data files
-*.pt
-*.pth
-*.onnx
-
-# OS
 .DS_Store
 Thumbs.db
-.skynex/production-gate.json
-.skynex/audit.log
+
+# Claude Code local files (not project instructions)
+CLAUDE.md
+.claude/
