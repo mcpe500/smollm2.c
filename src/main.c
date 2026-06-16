@@ -2,11 +2,16 @@
 
 #include "gguf.h"
 #include "tokenizer.h"
+#include "forward.h"
+#include "sampling.h"
+#include "tui.h"
+#include "web.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 // ----------------------------------------------------------------------------
 // Default model resolution: read Ollama manifest, find model layer digest,
@@ -146,33 +151,225 @@ static int do_inspect(const char* path) {
 }
 
 // ----------------------------------------------------------------------------
+// --logits <prompt>  : run prefill, print argmax of last-position logits.
+//                      Step 5 verification gate vs `ollama run smollm2:135m`.
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// -p / -n / --temp / --top-p / --top-k / --rep-penalty : generate text
+// ----------------------------------------------------------------------------
+#define CHAT_TEMPLATE_MAX 4096
+
+static void build_prompt(const char* user_text, char* out, int max_out) {
+    snprintf(out, max_out,
+        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+        user_text);
+}
+
+static int do_generate(const char* path, const char* user_text,
+                       int max_new, const sample_params* sp) {
+    gguf_ctx ctx;
+    if (gguf_load(path, &ctx) < 0) {
+        fprintf(stderr, "failed to load model\n"); return 1;
+    }
+    tokenizer* tok = NULL;
+    if (tokenizer_load(&tok, &ctx) < 0) {
+        fprintf(stderr, "tokenizer load failed\n"); gguf_free(&ctx); return 1;
+    }
+    forward_ctx* fwd = NULL;
+    if (forward_load(&fwd, &ctx, 2048) < 0) {
+        fprintf(stderr, "forward load failed\n");
+        tokenizer_free(tok); gguf_free(&ctx); return 1;
+    }
+
+    char prompt_buf[CHAT_TEMPLATE_MAX];
+    build_prompt(user_text, prompt_buf, sizeof(prompt_buf));
+
+    int prompt_ids[1024];
+    int prompt_len = tokenizer_encode(tok, prompt_buf, prompt_ids, 1024);
+    if (prompt_len <= 0) {
+        fprintf(stderr, "empty prompt\n");
+        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx); return 1;
+    }
+
+    int vocab = forward_vocab_size(fwd);
+    float* logits = malloc((size_t)vocab * sizeof(float));
+    int*   gen    = malloc((size_t)max_new * sizeof(int));
+    if (!logits || !gen) {
+        fprintf(stderr, "alloc failed\n");
+        free(logits); free(gen);
+        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx); return 1;
+    }
+
+    /* Prefill */
+    clock_t t0 = clock();
+    if (forward_prefill(fwd, prompt_ids, prompt_len, logits) < 0) {
+        fprintf(stderr, "prefill failed\n");
+        free(logits); free(gen);
+        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx); return 1;
+    }
+
+    /* Decode loop */
+    int pos = prompt_len;
+    int gen_n = 0;
+    char dec_buf[512];
+    while (gen_n < max_new) {
+        int next = sample_token(logits, vocab, sp, gen, gen_n);
+        if (next == 2) break;  /* <|im_end|> */
+        gen[gen_n++] = next;
+        int m = tokenizer_decode(tok, next, dec_buf, sizeof(dec_buf));
+        fwrite(dec_buf, 1, m, stdout);
+        fflush(stdout);
+        if (pos < 2047) {
+            if (forward_decode(fwd, next, pos, logits) < 0) break;
+            pos++;
+        } else break;
+    }
+    double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+    fprintf(stdout, "\n[%d tokens, %.1fs, %.1f tok/s]\n",
+            gen_n, secs, gen_n > 0 ? gen_n / secs : 0.0);
+
+    free(logits); free(gen);
+    forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+static int do_logits(const char* path, const char* prompt, int max_seq) {
+    gguf_ctx ctx;
+    if (gguf_load(path, &ctx) < 0) {
+        fprintf(stderr, "failed to load %s\n", path);
+        return 1;
+    }
+    tokenizer* tok = NULL;
+    if (tokenizer_load(&tok, &ctx) < 0) {
+        fprintf(stderr, "tokenizer load failed\n");
+        gguf_free(&ctx);
+        return 1;
+    }
+    forward_ctx* fwd = NULL;
+    if (forward_load(&fwd, &ctx, max_seq) < 0) {
+        fprintf(stderr, "forward load failed\n");
+        tokenizer_free(tok);
+        gguf_free(&ctx);
+        return 1;
+    }
+
+    int ids[1024];
+    int n = tokenizer_encode(tok, prompt, ids, 1024);
+    if (n <= 0) {
+        fprintf(stderr, "empty prompt encoding\n");
+        forward_free(fwd);
+        tokenizer_free(tok);
+        gguf_free(&ctx);
+        return 1;
+    }
+    if (n > max_seq) {
+        fprintf(stderr, "prompt too long: %d tokens > max_seq %d\n", n, max_seq);
+        n = max_seq;
+    }
+
+    int vocab = forward_vocab_size(fwd);
+    float* logits = malloc((size_t)vocab * sizeof(float));
+    if (!logits) {
+        fprintf(stderr, "logits alloc failed\n");
+        forward_free(fwd);
+        tokenizer_free(tok);
+        gguf_free(&ctx);
+        return 1;
+    }
+
+    clock_t t0 = clock();
+    if (forward_prefill(fwd, ids, n, logits) < 0) {
+        fprintf(stderr, "forward_prefill failed\n");
+        free(logits);
+        forward_free(fwd);
+        tokenizer_free(tok);
+        gguf_free(&ctx);
+        return 1;
+    }
+    double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+
+    int best = 0;
+    for (int v = 1; v < vocab; v++) {
+        if (logits[v] > logits[best]) best = v;
+    }
+
+    printf("prompt tokens (%d):", n);
+    for (int i = 0; i < n; i++) printf(" %d", ids[i]);
+    printf("\n");
+
+    char buf[512];
+    int m = tokenizer_decode(tok, best, buf, sizeof(buf));
+    printf("argmax: %d  logit=%.4f  decoded(%d bytes): \"", best, logits[best], m);
+    for (int i = 0; i < m; i++) {
+        unsigned char b = (unsigned char)buf[i];
+        if (b >= 32 && b < 127) putchar(b);
+        else printf("\\x%02x", b);
+    }
+    printf("\"\n");
+
+    printf("prefill: %.3fs for %d tokens (%.2f tok/s scalar)\n",
+           secs, n, n / secs);
+
+    free(logits);
+    forward_free(fwd);
+    tokenizer_free(tok);
+    gguf_free(&ctx);
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
 // Usage
 // ----------------------------------------------------------------------------
 static void usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s [--inspect] [--tok-test <text>] [-m <gguf-path>] [-p <prompt>] [-n <tokens>]\n"
+        "Usage: %s [-p <prompt>] [-n <tokens>] [options]\n"
+        "       %s --tui\n"
+        "       %s --web [--port <port>]\n"
         "\n"
-        "  --inspect         Print GGUF metadata + tensor list, then exit.\n"
-        "  --tok-test <text> Encode text, print token IDs, decode back, print.\n"
-        "  -m <path>         GGUF model file. Default: auto-resolve from Ollama manifest.\n"
-        "  -p <prompt>       Prompt (TODO: implemented in step 7).\n"
-        "  -n <tokens>       Max tokens to generate (TODO).\n",
-        prog);
+        "  -p <prompt>          Generate a response to prompt.\n"
+        "  -n <tokens>          Max tokens to generate (default: 200).\n"
+        "  --temp <float>       Temperature (default: 0.0 = greedy).\n"
+        "  --top-p <float>      Top-p nucleus sampling (default: 0.9).\n"
+        "  --top-k <int>        Top-k sampling (default: 0 = off).\n"
+        "  --rep-penalty <float> Repetition penalty (default: 1.0 = off).\n"
+        "  --tui                Launch full-screen ncurses TUI chat.\n"
+        "  --web                Start HTTP WebUI server (default port 8080).\n"
+        "  --port <port>        WebUI port (use with --web).\n"
+        "  -m <path>            GGUF model file (default: auto-resolve Ollama).\n"
+        "  --inspect            Print model metadata.\n"
+        "  --tok-test <text>    Tokenizer round-trip test.\n"
+        "  --logits <prompt>    Print argmax logit for prompt.\n"
+        "  -h / --help          Show this help.\n",
+        prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
-    const char* model_path = NULL;
+    const char* model_path   = NULL;
     const char* tok_test_text = NULL;
+    const char* logits_prompt = NULL;
     int inspect = 0;
+    int do_tui  = 0;
+    int do_web  = 0;
+    int web_port = 8080;
     const char* prompt = NULL;
-    int n_tokens = 50;
+    int n_tokens = 200;
+    sample_params sp = {0.0f, 0.9f, 0, 1.0f, 0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--inspect") == 0) inspect = 1;
         else if (strcmp(argv[i], "--tok-test") == 0 && i + 1 < argc) tok_test_text = argv[++i];
+        else if (strcmp(argv[i], "--logits") == 0 && i + 1 < argc) logits_prompt = argv[++i];
         else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) prompt = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) sp.temperature = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) sp.top_p = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) sp.top_k = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) sp.rep_penalty = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--tui") == 0) do_tui = 1;
+        else if (strcmp(argv[i], "--web") == 0) do_web = 1;
+        else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) web_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else {
@@ -258,9 +455,28 @@ int main(int argc, char** argv) {
         goto cleanup;
     }
 
-    // TODO: Step 7 implements -p / -n.
-    (void)prompt; (void)n_tokens;
-    fprintf(stderr, "inference not yet implemented; use --inspect or --tok-test\n");
+    if (logits_prompt) {
+        rc = do_logits(model_path, logits_prompt, 2048);
+        goto cleanup;
+    }
+
+    if (prompt) {
+        rc = do_generate(model_path, prompt, n_tokens, &sp);
+        goto cleanup;
+    }
+
+    if (do_tui) {
+        rc = tui_run(model_path, &sp);
+        goto cleanup;
+    }
+
+    if (do_web) {
+        rc = web_run(model_path, web_port, &sp);
+        goto cleanup;
+    }
+
+    fprintf(stderr, "No action specified. Use -p <prompt>, --tui, or --web.\n");
+    usage(argv[0]);
 
 cleanup:
     if (resolver_allocated) free((void*)model_path);

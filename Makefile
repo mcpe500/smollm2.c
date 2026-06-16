@@ -2,11 +2,15 @@
 
 CC      = gcc
 CFLAGS  = -std=c99 -O2 -march=native -Wall -Wextra
-LDFLAGS = -lm
+LDFLAGS = -lm -lncurses
 
 SRC = \
     src/gguf.c \
     src/tokenizer.c \
+    src/forward.c \
+    src/sampling.c \
+    src/tui.c \
+    src/web.c \
     src/main.c
 
 OBJ = $(SRC:.c=.o)
