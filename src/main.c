@@ -330,10 +330,10 @@ static void usage(const char* prog) {
         "\n"
         "  -p <prompt>          Generate a response to prompt.\n"
         "  -n <tokens>          Max tokens to generate (default: 200).\n"
-        "  --temp <float>       Temperature (default: 0.0 = greedy).\n"
-        "  --top-p <float>      Top-p nucleus sampling (default: 0.9).\n"
-        "  --top-k <int>        Top-k sampling (default: 0 = off).\n"
-        "  --rep-penalty <float> Repetition penalty (default: 1.0 = off).\n"
+        "  --temp <float>       Temperature (default: 0.8).\n"
+        "  --top-p <float>      Top-p nucleus sampling (default: 0.0 = off).\n"
+        "  --top-k <int>        Top-k sampling (default: 10).\n"
+        "  --rep-penalty <float> Repetition penalty (default: 1.1).\n"
         "  --tui                Launch full-screen ncurses TUI chat.\n"
         "  --web                Start HTTP WebUI server (default port 8080).\n"
         "  --port <port>        WebUI port (use with --web).\n"
@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
     int web_port = 8080;
     const char* prompt = NULL;
     int n_tokens = 200;
-    sample_params sp = {0.8f, 0.9f, 0, 1.1f, 0};
+    sample_params sp = {0.8f, 0.0f, 10, 1.1f, 0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--inspect") == 0) inspect = 1;

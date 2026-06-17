@@ -26,6 +26,10 @@ int sample_token(float* logits, int vocab, const sample_params* p,
                  const int* history, int hist_len) {
     if (!logits || vocab <= 0 || !p) return 0;
 
+    /* Suppress special tokens: im_end(2) and im_start(1) during generation.
+       Matches llama.cpp behavior: EOS is never sampled mid-generation. */
+    if (vocab > 2) { logits[1] = -1e30f; logits[2] = -1e30f; }
+
     /* Repetition penalty (applied before greedy too) */
     if (p->rep_penalty > 1.0f && history && hist_len > 0) {
         for (int i = 0; i < hist_len; i++) {

@@ -1,4 +1,4 @@
-// forward.c — SmolLM2 transformer forward pass (scalar, no NEON)
+// forward.c — SmolLM2 transformer forward pass (F16 weights, NEON matmul)
 
 #include "forward.h"
 #include "gguf.h"
@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -19,18 +20,18 @@ struct forward_ctx {
     int ffn_hidden, vocab_size, max_seq;
     float rms_eps, rope_theta;
 
-    // weights (F32, dequantized at load)
-    float* w_token_embd;  // [vocab * dim]
-    float* w_norm;        // [dim]  (output_norm)
-    float* w_attn_norm;   // [n_layers * dim]
-    float* w_q;           // [n_layers * dim * dim]
-    float* w_k;           // [n_layers * kv_dim * dim]
-    float* w_v;           // [n_layers * kv_dim * dim]
-    float* w_o;           // [n_layers * dim * dim]
-    float* w_ffn_norm;    // [n_layers * dim]
-    float* w_gate;        // [n_layers * ffn_hidden * dim]
-    float* w_up;          // [n_layers * ffn_hidden * dim]
-    float* w_down;        // [n_layers * dim * ffn_hidden]
+    // weights: token_embd/norms stored F32; heavy matmul weights kept as F16
+    float*    w_token_embd;  // [vocab * dim]        F32
+    float*    w_norm;        // [dim]                F32
+    float*    w_attn_norm;   // [n_layers * dim]     F32
+    uint16_t* w_q;           // [n_layers * dim * dim]        F16
+    uint16_t* w_k;           // [n_layers * kv_dim * dim]     F16
+    uint16_t* w_v;           // [n_layers * kv_dim * dim]     F16
+    uint16_t* w_o;           // [n_layers * dim * dim]        F16
+    float*    w_ffn_norm;    // [n_layers * dim]     F32
+    uint16_t* w_gate;        // [n_layers * ffn_hidden * dim] F16
+    uint16_t* w_up;          // [n_layers * ffn_hidden * dim] F16
+    uint16_t* w_down;        // [n_layers * dim * ffn_hidden] F16
 
     // KV cache
     float* k_cache;       // [n_layers * max_seq * kv_dim]
@@ -83,7 +84,7 @@ static float f16_to_f32(uint16_t h) {
 }
 
 static int load_tensor_f16(const gguf_ctx* g, const char* name,
-                           float* dst, size_t count) {
+                           uint16_t* dst, size_t count) {
     const gguf_tensor_info* t = gguf_tensor_get(g, name);
     if (!t) {
         fprintf(stderr, "forward: missing tensor %s\n", name);
@@ -94,8 +95,7 @@ static int load_tensor_f16(const gguf_ctx* g, const char* name,
                 name, (unsigned)t->dtype);
         return -1;
     }
-    const uint16_t* src = (const uint16_t*)gguf_tensor_data(g, t);
-    for (size_t i = 0; i < count; i++) dst[i] = f16_to_f32(src[i]);
+    memcpy(dst, gguf_tensor_data(g, t), count * sizeof(uint16_t));
     return 0;
 }
 
@@ -125,26 +125,20 @@ static void rmsnorm(float* out, const float* x, const float* w,
     for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
 }
 
-// GGUF weight layout: ne[0]=in_dim (innermost/contiguous per row), ne[1]=out_dim.
-// y[o] = sum_i W[o*in_dim + i] * x[i]
-static void matmul(float* y, const float* x, const float* W,
-                   int in_dim, int out_dim) {
+// Matmul with F32 weights (used for tied embedding logit projection)
+static void matmul_f32(float* y, const float* x, const float* W,
+                       int in_dim, int out_dim) {
 #ifdef __ARM_NEON
     for (int o = 0; o < out_dim; o++) {
         const float* wrow = W + (size_t)o * in_dim;
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
-        float32x4_t acc2 = vdupq_n_f32(0.0f);
-        float32x4_t acc3 = vdupq_n_f32(0.0f);
         int i = 0;
-        for (; i <= in_dim - 16; i += 16) {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(wrow+i),    vld1q_f32(x+i));
-            acc1 = vfmaq_f32(acc1, vld1q_f32(wrow+i+4),  vld1q_f32(x+i+4));
-            acc2 = vfmaq_f32(acc2, vld1q_f32(wrow+i+8),  vld1q_f32(x+i+8));
-            acc3 = vfmaq_f32(acc3, vld1q_f32(wrow+i+12), vld1q_f32(x+i+12));
+        for (; i <= in_dim - 8; i += 8) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(wrow+i),   vld1q_f32(x+i));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(wrow+i+4), vld1q_f32(x+i+4));
         }
-        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-        float sum = vaddvq_f32(acc0);
+        float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
         for (; i < in_dim; i++) sum += wrow[i] * x[i];
         y[o] = sum;
     }
@@ -153,6 +147,39 @@ static void matmul(float* y, const float* x, const float* W,
         const float* wrow = W + (size_t)o * in_dim;
         double acc = 0.0;
         for (int i = 0; i < in_dim; i++) acc += (double)wrow[i] * (double)x[i];
+        y[o] = (float)acc;
+    }
+#endif
+}
+
+// Matmul with F16 weights: y[o] = sum_i f16_to_f32(W[o*in_dim+i]) * x[i]
+// Keeps weights in F16 storage, converts on-the-fly matching training precision.
+static void matmul(float* y, const float* x, const uint16_t* W,
+                   int in_dim, int out_dim) {
+#ifdef __ARM_NEON
+    for (int o = 0; o < out_dim; o++) {
+        const uint16_t* wrow = W + (size_t)o * in_dim;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i <= in_dim - 16; i += 16) {
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vld1_f16((const __fp16*)(wrow+i))),    vld1q_f32(x+i));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vld1_f16((const __fp16*)(wrow+i+4))),  vld1q_f32(x+i+4));
+            acc2 = vfmaq_f32(acc2, vcvt_f32_f16(vld1_f16((const __fp16*)(wrow+i+8))),  vld1q_f32(x+i+8));
+            acc3 = vfmaq_f32(acc3, vcvt_f32_f16(vld1_f16((const __fp16*)(wrow+i+12))), vld1q_f32(x+i+12));
+        }
+        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        float sum = vaddvq_f32(acc0);
+        for (; i < in_dim; i++) sum += f16_to_f32(wrow[i]) * x[i];
+        y[o] = sum;
+    }
+#else
+    for (int o = 0; o < out_dim; o++) {
+        const uint16_t* wrow = W + (size_t)o * in_dim;
+        double acc = 0.0;
+        for (int i = 0; i < in_dim; i++) acc += (double)f16_to_f32(wrow[i]) * (double)x[i];
         y[o] = (float)acc;
     }
 #endif
@@ -235,14 +262,14 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->w_token_embd = malloc(s_embd  * sizeof(float));
     f->w_norm       = malloc(f->dim  * sizeof(float));
     f->w_attn_norm  = malloc(s_norm  * sizeof(float));
-    f->w_q          = malloc(s_q     * sizeof(float));
-    f->w_k          = malloc(s_kv    * sizeof(float));
-    f->w_v          = malloc(s_kv    * sizeof(float));
-    f->w_o          = malloc(s_q     * sizeof(float));
+    f->w_q          = malloc(s_q     * sizeof(uint16_t));
+    f->w_k          = malloc(s_kv    * sizeof(uint16_t));
+    f->w_v          = malloc(s_kv    * sizeof(uint16_t));
+    f->w_o          = malloc(s_q     * sizeof(uint16_t));
     f->w_ffn_norm   = malloc(s_norm  * sizeof(float));
-    f->w_gate       = malloc(s_gu    * sizeof(float));
-    f->w_up         = malloc(s_gu    * sizeof(float));
-    f->w_down       = malloc(s_down  * sizeof(float));
+    f->w_gate       = malloc(s_gu    * sizeof(uint16_t));
+    f->w_up         = malloc(s_gu    * sizeof(uint16_t));
+    f->w_down       = malloc(s_down  * sizeof(uint16_t));
     f->k_cache      = malloc(s_cache * sizeof(float));
     f->v_cache      = malloc(s_cache * sizeof(float));
 
@@ -271,7 +298,15 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     }
 
     int rc = 0;
-    rc |= load_tensor_f16(g, "token_embd.weight",  f->w_token_embd, s_embd);
+    /* token_embd stays F32 — used for both embedding lookup and tied logit projection */
+    {
+        const gguf_tensor_info* t = gguf_tensor_get(g, "token_embd.weight");
+        if (!t) { fprintf(stderr, "forward: missing token_embd.weight\n"); rc = -1; }
+        else {
+            const uint16_t* src = (const uint16_t*)gguf_tensor_data(g, t);
+            for (size_t i = 0; i < s_embd; i++) f->w_token_embd[i] = f16_to_f32(src[i]);
+        }
+    }
     rc |= load_tensor_f32(g, "output_norm.weight", f->w_norm,       (size_t)f->dim);
 
     char name[128];
@@ -346,15 +381,15 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
 
     // 2. Transformer layers
     for (int L = 0; L < nl; L++) {
-        const float* wq  = f->w_q        + (size_t)L * dim   * dim;
-        const float* wk  = f->w_k        + (size_t)L * kvdim * dim;
-        const float* wv  = f->w_v        + (size_t)L * kvdim * dim;
-        const float* wo  = f->w_o        + (size_t)L * dim   * dim;
-        const float* wan = f->w_attn_norm + (size_t)L * dim;
-        const float* wfn = f->w_ffn_norm + (size_t)L * dim;
-        const float* wg  = f->w_gate     + (size_t)L * ffn * dim;
-        const float* wu  = f->w_up       + (size_t)L * ffn * dim;
-        const float* wd  = f->w_down     + (size_t)L * dim * ffn;
+        const uint16_t* wq  = f->w_q        + (size_t)L * dim   * dim;
+        const uint16_t* wk  = f->w_k        + (size_t)L * kvdim * dim;
+        const uint16_t* wv  = f->w_v        + (size_t)L * kvdim * dim;
+        const uint16_t* wo  = f->w_o        + (size_t)L * dim   * dim;
+        const float*    wan = f->w_attn_norm + (size_t)L * dim;
+        const float*    wfn = f->w_ffn_norm + (size_t)L * dim;
+        const uint16_t* wg  = f->w_gate     + (size_t)L * ffn * dim;
+        const uint16_t* wu  = f->w_up       + (size_t)L * ffn * dim;
+        const uint16_t* wd  = f->w_down     + (size_t)L * dim * ffn;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
@@ -422,7 +457,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
     rmsnorm(f->x_norm,
             f->x_buf + (size_t)(n_tokens - 1) * dim,
             f->w_norm, dim, eps);
-    matmul(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
+    matmul_f32(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
 
     return 0;
 }
@@ -460,15 +495,15 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     memcpy(x, f->w_token_embd + (size_t)token * dim, dim * sizeof(float));
 
     for (int L = 0; L < nl; L++) {
-        const float* wq  = f->w_q        + (size_t)L * dim   * dim;
-        const float* wk  = f->w_k        + (size_t)L * kvdim * dim;
-        const float* wv  = f->w_v        + (size_t)L * kvdim * dim;
-        const float* wo  = f->w_o        + (size_t)L * dim   * dim;
-        const float* wan = f->w_attn_norm + (size_t)L * dim;
-        const float* wfn = f->w_ffn_norm + (size_t)L * dim;
-        const float* wg  = f->w_gate     + (size_t)L * ffn * dim;
-        const float* wu  = f->w_up       + (size_t)L * ffn * dim;
-        const float* wd  = f->w_down     + (size_t)L * dim * ffn;
+        const uint16_t* wq  = f->w_q        + (size_t)L * dim   * dim;
+        const uint16_t* wk  = f->w_k        + (size_t)L * kvdim * dim;
+        const uint16_t* wv  = f->w_v        + (size_t)L * kvdim * dim;
+        const uint16_t* wo  = f->w_o        + (size_t)L * dim   * dim;
+        const float*    wan = f->w_attn_norm + (size_t)L * dim;
+        const float*    wfn = f->w_ffn_norm + (size_t)L * dim;
+        const uint16_t* wg  = f->w_gate     + (size_t)L * ffn * dim;
+        const uint16_t* wu  = f->w_up       + (size_t)L * ffn * dim;
+        const uint16_t* wd  = f->w_down     + (size_t)L * dim * ffn;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
@@ -526,7 +561,7 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     }
 
     rmsnorm(f->x_norm, x, f->w_norm, dim, eps);
-    matmul(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
+    matmul_f32(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
     return 0;
 }
 
