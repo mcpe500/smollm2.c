@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#include <stdint.h>
+#include <time.h>
 
 static unsigned g_rng = 0;
 
@@ -114,8 +116,16 @@ int sample_token(float* logits, int vocab, const sample_params* p,
         if (sum > 0.0f) { inv_sum = 1.0f/sum; for (int v = 0; v < n; v++) logits[v] *= inv_sum; }
     }
 
-    /* Seed RNG if not seeded */
-    if (g_rng == 0) g_rng = (p->seed != 0) ? p->seed : 12345u;
+    /* Seed RNG if not seeded — mix time + pointer for varied outputs per run */
+    if (g_rng == 0) {
+        if (p->seed != 0) {
+            g_rng = p->seed;
+        } else {
+            unsigned t = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)logits;
+            t ^= t << 13; t ^= t >> 17; t ^= t << 5;
+            g_rng = t ? t : 12345u;
+        }
+    }
 
     /* Multinomial sample */
     float r = rng_f32();

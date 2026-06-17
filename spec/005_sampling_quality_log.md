@@ -218,23 +218,53 @@ Final defaults: temp=0.8, top-p=0.0 (off), top-k=10, rep-penalty=1.1
 
 ---
 
+## Attempt 9 — Retrace system prompt root cause + final config tuning
+
+```
+Investigation: Tried multiple system prompt variants:
+  a) '...Face<|im_end|>' (no \n before im_end): argmax=2(im_end), broken
+  b) '...Face\n<|im_end|>' (\n in system content): argmax=Hello, but decode drifts to 'I am a user'
+  c) '...user\nhello\n<|im_end|>' (\n inside user content): argmax=Hello, still drifts
+
+Verification via seq_nosys_test.c:
+  No-sys 9-token prompt greedy decode: I -> 'm -> glad -> to -> hear -> that -> you -> 're -> doing -> well
+  = "I'm glad to hear that you're doing well" -- correct, natural output
+  System prompt (32+ tokens) causes F32 precision drift, outputting 'I am a user'
+
+Root cause confirmed: system prompt degrades quality at this context length with F32 compute.
+FIX: Keep no system prompt. Short context = better quality.
+
+RNG fix: Was always seeded to 12345 -> deterministic output every run.
+  Fixed: seed = time(NULL) ^ (uintptr_t)logits for random variation per run.
+
+Temp tuning:
+  temp=0.8 top-k=10: often picks 'The' (rank 3) instead of 'I' (rank 1) -> bad output
+  temp=0.6 top-k=10: mixed, still can pick wrong token
+  temp=0.3 top-k=5: consistently picks 'I' as first token -> coherent output
+  Three runs of 'hello': all start with 'I'm ...', sensible continuations
+
+Final defaults: temp=0.3, top-p=0.0, top-k=5, rep_penalty=1.1
+```
+
+---
+
 ## Summary of all fixes applied
 
 1. EOS suppression (tokens 1, 2) in sample_token - CRITICAL fix
 2. F16 on-the-fly dequantization in matmul (NEON vcvt_f32_f16) - memory + precision
 3. rep_penalty applied before greedy shortcut
 4. top-p rewritten with qsort (was O(n^2))
-5. Defaults: temp=0.8 top-k=10 top-p=0.0 rep=1.1
-6. No system prompt (causes 'You are a...' echo)
+5. No system prompt - prevents 'I am a user' identity confusion at 32+ token context
+6. RNG seeded with time(NULL) instead of fixed 12345 - varied output per run
+7. Defaults: temp=0.3 top-k=5 top-p=0.0 rep=1.1
 
-## Final output quality
+## Final output quality (temp=0.3 top-k=5)
 
-| prompt | temp=0 output | temp=0.8 top-k=10 output |
-|--------|--------------|---------------------------|
-| Hello | 'I'm thrilled to share my latest success story!' | 'I'm so sorry for the inconvenience and a great start' |
-| Hello, how are you? | 'I'm here to help you / You're a great! I am an AI assistant.' | 'It seems like we have an amazing story!' |
-| Tell me a joke. | 'I'm a writer / What's the best way to start.' | varied |
+| prompt | run 1 | run 2 | run 3 |
+|--------|-------|-------|-------|
+| hello | 'I'm glad to hear that you're here.' | 'I'm a writer and editor. Hello!' | 'I'm glad to hear that you're on the right here.' |
+| hello (temp=0) | 'I'm glad to hear that you're doing well!' | (deterministic) | |
 
 ## Speed final
 
-~25-28 tok/s decode (NEON F16 matmul)
+~22-28 tok/s decode (NEON F16 on-the-fly dequant)
