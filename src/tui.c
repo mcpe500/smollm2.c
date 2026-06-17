@@ -274,7 +274,7 @@ static void generate_response(model_t* m, const sample_params* sp,
     hist_add("Bot: ", 2);
     char dec_buf[512];
 
-    for (int step = 0; step < 512; step++) {
+    for (int step = 0; step < 200; step++) {
         if (g_interrupted) {
             hist_add(" [interrupted]", 3);
             break;
@@ -326,7 +326,7 @@ static void show_help(WINDOW* parent) {
 // ---------------------------------------------------------------------------
 // Main TUI loop
 // ---------------------------------------------------------------------------
-int tui_run(const char* model_path, const sample_params* sp) {
+int tui_run(const char* model_path, sample_params* sp) {
     model_t m;
     memset(&m, 0, sizeof(m));
 
@@ -436,6 +436,43 @@ int tui_run(const char* model_path, const sample_params* sp) {
                 hist_add("Conversation reset.", 3);
                 forward_reset(m.fwd);
                 m.pos = 0; m.gen_n = 0;
+                input_len = 0; input_buf[0] = '\0';
+                render(hist_win, input_win, input_buf, history_rows);
+                continue;
+            }
+            if (strncmp(input_buf, "/temp ", 6) == 0) {
+                sp->temperature = (float)atof(input_buf + 6);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Temperature set to %.2f", sp->temperature);
+                hist_add(msg, 3);
+                input_len = 0; input_buf[0] = '\0';
+                render(hist_win, input_win, input_buf, history_rows);
+                continue;
+            }
+            if (strncmp(input_buf, "/topk ", 6) == 0) {
+                sp->top_k = atoi(input_buf + 6);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Top-k set to %d", sp->top_k);
+                hist_add(msg, 3);
+                input_len = 0; input_buf[0] = '\0';
+                render(hist_win, input_win, input_buf, history_rows);
+                continue;
+            }
+            if (strncmp(input_buf, "/topp ", 6) == 0) {
+                sp->top_p = (float)atof(input_buf + 6);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Top-p set to %.2f", sp->top_p);
+                hist_add(msg, 3);
+                input_len = 0; input_buf[0] = '\0';
+                render(hist_win, input_win, input_buf, history_rows);
+                continue;
+            }
+            if (strcmp(input_buf, "/settings") == 0) {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                    "temp=%.2f top-p=%.2f top-k=%d rep-penalty=%.2f",
+                    sp->temperature, sp->top_p, sp->top_k, sp->rep_penalty);
+                hist_add(msg, 3);
                 input_len = 0; input_buf[0] = '\0';
                 render(hist_win, input_win, input_buf, history_rows);
                 continue;
