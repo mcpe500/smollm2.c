@@ -174,3 +174,67 @@ compensates for the wider F32 data type.
 - Add `--seed` CLI flag for reproducible outputs
 - Multi-turn context: append assistant response back into context for follow-up questions
 - Step 9 spec: context window management for multi-turn conversation
+
+---
+
+## Attempt 6 — Root cause: EOS suppression
+
+```
+Finding: Python F64 reference implementation gives SAME wrong result as our C model
+         (im_end as rank 1 for 31-token prompt). This proves our forward pass is CORRECT.
+         The difference from Ollama is that llama.cpp suppresses EOS token during generation.
+
+Fix: In sample_token(), set logits[1] = logits[2] = -1e30 before sampling.
+     This matches llama.cpp behavior: special tokens cannot be generated mid-sequence.
+
+Result: Generation no longer terminates immediately for long prompts.
+Output 'Hello' -n 30 --temp 0: 'I'm thrilled to share my latest success story! I've been working with you.'
+Output 'Hello, how are you?' --temp 0: 'I'm here to help you / You're a great! I am an AI assistant.'
+```
+
+---
+
+## Attempt 7 — System prompt with EOS suppression
+
+```
+Config: system prompt re-enabled, EOS suppressed, temp=0.8
+Result: 'You are a Librarian' / 'You are a Doctor' / 'You are a consulting professional'
+Problem: rank 2 after EOS suppression = 'You' (token 2683), so model echoes 'You are...'
+         which is the start of the system prompt. Does not produce assistant behavior.
+Decision: REMOVED system prompt. Without it, rank 1 = 'I' which gives coherent responses.
+```
+
+---
+
+## Attempt 8 — top-k defaults tuning
+
+```
+top-k=40: 'The original line was "This sentence is a long...' - garbage
+top-k=10: 'I'm so sorry for the inconvenience and a great startin'' - coherent!
+top-p=0.9: slow and chaotic (qsort O(n log n) but threshold picking is imprecise)
+
+Final defaults: temp=0.8, top-p=0.0 (off), top-k=10, rep-penalty=1.1
+```
+
+---
+
+## Summary of all fixes applied
+
+1. EOS suppression (tokens 1, 2) in sample_token - CRITICAL fix
+2. F16 on-the-fly dequantization in matmul (NEON vcvt_f32_f16) - memory + precision
+3. rep_penalty applied before greedy shortcut
+4. top-p rewritten with qsort (was O(n^2))
+5. Defaults: temp=0.8 top-k=10 top-p=0.0 rep=1.1
+6. No system prompt (causes 'You are a...' echo)
+
+## Final output quality
+
+| prompt | temp=0 output | temp=0.8 top-k=10 output |
+|--------|--------------|---------------------------|
+| Hello | 'I'm thrilled to share my latest success story!' | 'I'm so sorry for the inconvenience and a great start' |
+| Hello, how are you? | 'I'm here to help you / You're a great! I am an AI assistant.' | 'It seems like we have an amazing story!' |
+| Tell me a joke. | 'I'm a writer / What's the best way to start.' | varied |
+
+## Speed final
+
+~25-28 tok/s decode (NEON F16 matmul)
