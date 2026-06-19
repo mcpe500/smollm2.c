@@ -53,6 +53,15 @@ Our baseline: ~24 tok/s decode (temp=0.3 top-k=5), output coherent but no system
 - Attention softmax: expf in inner loop
 - `matmul_f32` for logit projection: vocab=49152 rows × 576 cols — expensive!
 
+## SESSION SUMMARY (2026-06-19)
+- **Best result**: F16 logit projection (+1 tok/s, kept in commit 86747aa)
+- **True steady-state baseline**: 24.5 tok/s (after CPU warmup/throttle)
+- **Ollama reference**: 13.7 tok/s. We are 1.8x faster.
+- **Root cause of limit**: Single-core memory bandwidth ~5 GB/s, weights are 202MB F16. Theoretical max = 202MB * 24.7 = 4.99 GB/s. We're at the limit.
+- **Threading**: All forms tried (mutex/cond pool, spinlock, pthread_create). All slower due to sync overhead or CPU contention on mobile.
+- **INT8 quantization**: Slower because INT8->F32 dequant overhead > bandwidth savings. vdotq_s32 would help but requires INT8 activations too.
+- **Conclusion**: F16 with 4-acc NEON unroll-16 is optimal for this platform.
+
 ## What's Been Tried
 - NEON F16 matmul with 4 accumulators, unroll-16: ~24 tok/s (was ~5 tok/s scalar)
 - top-p rewritten with qsort
