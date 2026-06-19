@@ -634,16 +634,25 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
     const float  inv_sqrt_hd  = 1.0f / sqrtf((float)hd);
 
     // 2. Transformer layers
+    int nb_d = (dim  + Q8_BLOCK - 1) / Q8_BLOCK;
+    int nb_f = (ffn + Q8_BLOCK - 1) / Q8_BLOCK;
     for (int L = 0; L < nl; L++) {
-        const uint16_t* wq  = f->w_q        + (size_t)L * dim   * dim;
-        const uint16_t* wk  = f->w_k        + (size_t)L * kvdim * dim;
-        const uint16_t* wv  = f->w_v        + (size_t)L * kvdim * dim;
-        const uint16_t* wo  = f->w_o        + (size_t)L * dim   * dim;
-        const float*    wan = f->w_attn_norm + (size_t)L * dim;
-        const float*    wfn = f->w_ffn_norm + (size_t)L * dim;
-        const uint16_t* wg  = f->w_gate     + (size_t)L * ffn * dim;
-        const uint16_t* wu  = f->w_up       + (size_t)L * ffn * dim;
-        const uint16_t* wd  = f->w_down     + (size_t)L * dim * ffn;
+        const int8_t* q8q   = f->q8_q    + (size_t)L * dim   * dim;
+        const float*  sq    = f->q8_sq   + (size_t)L * dim   * nb_d;
+        const int8_t* q8k   = f->q8_k    + (size_t)L * kvdim * dim;
+        const float*  sk    = f->q8_sk   + (size_t)L * kvdim * nb_d;
+        const int8_t* q8v   = f->q8_v    + (size_t)L * kvdim * dim;
+        const float*  sv    = f->q8_sv   + (size_t)L * kvdim * nb_d;
+        const int8_t* q8o   = f->q8_o    + (size_t)L * dim   * dim;
+        const float*  so    = f->q8_so   + (size_t)L * dim   * nb_d;
+        const float*   wan  = f->w_attn_norm + (size_t)L * dim;
+        const float*   wfn  = f->w_ffn_norm  + (size_t)L * dim;
+        const int8_t* q8g   = f->q8_gate + (size_t)L * ffn  * dim;
+        const float*  sg    = f->q8_sgate+ (size_t)L * ffn  * nb_d;
+        const int8_t* q8u   = f->q8_up   + (size_t)L * ffn  * dim;
+        const float*  su    = f->q8_sup  + (size_t)L * ffn  * nb_d;
+        const int8_t* q8d   = f->q8_down + (size_t)L * dim  * ffn;
+        const float*  sd    = f->q8_sdown+ (size_t)L * dim  * nb_f;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
@@ -652,9 +661,10 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
 
             // --- attention block ---
             rmsnorm(f->x_norm, xt, wan, dim, eps);
-            matmul(f->q, f->x_norm, wq, dim, dim);
-            matmul(f->k, f->x_norm, wk, dim, kvdim);
-            matmul(f->v, f->x_norm, wv, dim, kvdim);
+            float xn_sc[32]; quantize_row_to_q8_blocked(f->xq_buf, xn_sc, f->x_norm, dim);
+            matmul_q8_dot(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
+            matmul_q8_dot(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
+            matmul_q8_dot(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
             rope_neox(f->q, t, nh,  hd, f->rope_theta);
             rope_neox(f->k, t, nkv, hd, f->rope_theta);
             memcpy(kc + (size_t)t * kvdim, f->k, kvdim * sizeof(float));
@@ -690,19 +700,22 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                 }
             }
 
-            matmul(f->o_proj, f->attn_out, wo, dim, dim);
+            float ao_sc_p[32]; quantize_row_to_q8_blocked(f->xq_buf, ao_sc_p, f->attn_out, dim);
+            matmul_q8_dot(f->o_proj, f->xq_buf, ao_sc_p, q8o, so, dim, dim);
             for (int i = 0; i < dim; i++) xt[i] += f->o_proj[i];
 
             // --- FFN block (SwiGLU) ---
             rmsnorm(f->x_norm, xt, wfn, dim, eps);
-            matmul(f->ffn_gate, f->x_norm, wg, dim, ffn);
-            matmul(f->ffn_up,   f->x_norm, wu, dim, ffn);
+            float xf_sc[32]; quantize_row_to_q8_blocked(f->xq_buf, xf_sc, f->x_norm, dim);
+            matmul_q8_dot(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
+            matmul_q8_dot(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
             for (int i = 0; i < ffn; i++) {
                 float g = f->ffn_gate[i];
                 float sig = 1.0f / (1.0f + expf(-g));
                 f->ffn_gate[i] = g * sig * f->ffn_up[i];
             }
-            matmul(f->ffn_mid, f->ffn_gate, wd, ffn, dim);
+            float fg_sc[32]; quantize_row_to_q8_blocked(f->xq_buf, fg_sc, f->ffn_gate, ffn);
+            matmul_q8_dot(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
             for (int i = 0; i < dim; i++) xt[i] += f->ffn_mid[i];
         }
     }
