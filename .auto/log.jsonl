@@ -1,0 +1,1 @@
+{"type":"config","name":"smollm2.c — maximize decode tok/s vs Ollama","metricName":"tok_s","metricUnit":"","bestDirection":"higher"}
