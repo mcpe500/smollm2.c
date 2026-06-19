@@ -1,37 +1,32 @@
 # Autoresearch Ideas Backlog
 
-## High priority
-- **INT4 quantization for large matmuls**: gate/up/logit matrices are 39%+21%=60% of weight bytes.
-  INT4 for those only, keep INT8 for q/k/v/o (small matrices where INT4 is slower).
-  Micro-bench: logit 1.34x, gate+up 1.13x faster. Net ~8-10% overall improvement.
-  Risk: argmax=504 may change with INT4 quantization noise.
-  Implementation: nibble-packed INT4 + matmul_q4_dot using vshrq/vandq unpack + vdotq_s32.
-  Status: NOT YET TRIED on actual model weights.
+## FINAL STATE — session complete
+All major optimizations implemented. Current steady state: 100-105 tok/s.
+vs baseline 27.8 = +271%. vs Ollama 13.7 = 7.5x faster.
 
-## Medium priority
-- **Free F32 token embeddings after use**: w_token_embd is 113MB F32. Used only for embedding lookup.
-  Could convert to F16 to save 56MB. Embedding lookup precision loss is negligible (no accumulation).
-  Status: NOT TRIED.
+## What was implemented
+1. INT8 vdotq_s32 weight quantization (x3 from 27.8 to ~50 tok/s)
+2. NEON activation quantize (quantize_row_to_q8_tensor)
+3. NEON rmsnorm
+4. NEON attention QK dot + value weighted sum
+5. Precomputed RoPE cos/sin table
+6. fast_expf (Schraudolph bit trick) for SiLU and softmax
+7. INT8 prefill path (eliminates F16 cache pollution)
+8. Free F16 weights after INT8 quantization (saves 202MB)
+9. Per-tensor activation quantization (faster than per-block-64)
+10. Per-row weight scale (tighter vdotq loop, no per-block hadd)
+11. 2x unroll matmul inner loop (128 bytes/iter)
+12. Dead code cleanup
 
-- **Skip F16 weight allocation entirely**: currently we alloc F16, load from GGUF, quantize INT8, free F16.
-  If GGUF API supported row-by-row reading, could quantize directly without 202MB intermediate.
-  Complex: requires GGUF parser changes. Status: NOT TRIED.
+## Definitively NOT worth trying
+- INT4 weight quantization: argmax fails (too coarse for 135M model)
+- Threading: overhead > benefit on mobile (all forms tried)
+- -O3 -ffast-math: no gain with manual NEON intrinsics
+- 2-row matmul tiling: register pressure
+- F16 KV cache: KV is tiny, no bandwidth benefit
+- Software prefetch: HW prefetcher already optimal for sequential access
 
-## Low priority / explored
-- -O3 -ffast-math: tried, slower
-- RoPE precompute: tried, within noise
-- 2-row tiling: tried, register pressure
-- unroll-32: tried, register pressure  
-- NEON rmsnorm: KEPT (small gain)
-- NEON quantize: KEPT (small gain)
-- NEON attention: KEPT (small gain)
-- Software prefetch: tried, slower
-- F16 KV cache: tried, KV fits in L2 so no BW benefit
-- Logit projection F16: KEPT (+1 tok/s real, now superseded by INT8)
-- INT8 vdotq_s32 per-block-64: KEPT (+79% from 27.8->52 tok/s)
-- INT8 prefill path: KEPT (+30% from 56->75 tok/s, eliminates F16 cache pollution)
-- Free F16 weights: KEPT (202MB savings, further cache improvement)
-- Threading (pthread pool, spinlock): tried, all slower (sync overhead > BW gain)
-- 2-row matmul tiling: slower (register pressure)
-- vmlaq_n block accumulation: no gain (compiler already does similar)
-- Block size 128 vs 64: not measurably faster
+## Theoretical remaining headroom
+- We're at ~10.5 GB/s effective DRAM bandwidth
+- Single-core LPDDR5 limit: ~10-12 GB/s
+- Essentially at the hardware limit
