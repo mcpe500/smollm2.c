@@ -22,7 +22,9 @@ struct forward_ctx {
 
     // weights: token_embd/norms stored F32; heavy matmul weights kept as F16
     float*    w_token_embd;     // [vocab * dim]  F32 — used for embedding lookup
-    uint16_t* w_token_embd_f16; // [vocab * dim]  F16 — used for logit projection (half bandwidth)
+    uint16_t* w_token_embd_f16; // [vocab * dim]  F16 — kept as fallback
+    int8_t*   q8_embd;          // [vocab * dim]  INT8 — used for logit projection
+    float*    q8_sembd;         // [vocab]         per-row scale for logit INT8
     float*    w_norm;        // [dim]                F32
     float*    w_attn_norm;   // [n_layers * dim]     F32
     uint16_t* w_q;           // [n_layers * dim * dim]        F16 (kept for prefill)
@@ -361,6 +363,8 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
 
     f->w_token_embd     = malloc(s_embd * sizeof(float));
     f->w_token_embd_f16 = malloc(s_embd * sizeof(uint16_t));
+    f->q8_embd          = malloc(s_embd * sizeof(int8_t));
+    f->q8_sembd         = malloc((size_t)f->vocab_size * sizeof(float));
     f->w_norm       = malloc(f->dim  * sizeof(float));
     f->w_attn_norm  = malloc(s_norm  * sizeof(float));
     f->w_q          = malloc(s_q     * sizeof(uint16_t));
@@ -398,7 +402,8 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->ffn_mid  = malloc(f->dim         * sizeof(float));
     f->scores   = malloc((size_t)max_seq * sizeof(float));
 
-    if (!f->w_token_embd || !f->w_token_embd_f16 || !f->w_norm || !f->w_attn_norm || !f->w_q ||
+    if (!f->w_token_embd || !f->w_token_embd_f16 || !f->q8_embd || !f->q8_sembd ||
+        !f->w_norm || !f->w_attn_norm || !f->w_q ||
         !f->w_k || !f->w_v || !f->w_o || !f->w_ffn_norm ||
         !f->w_gate || !f->w_up || !f->w_down ||
         !f->q8_q || !f->q8_sq || !f->q8_k || !f->q8_sk || !f->q8_v || !f->q8_sv ||
@@ -422,6 +427,8 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
             const uint16_t* src = (const uint16_t*)gguf_tensor_data(g, t);
             memcpy(f->w_token_embd_f16, src, s_embd * sizeof(uint16_t));
             for (size_t i = 0; i < s_embd; i++) f->w_token_embd[i] = f16_to_f32(src[i]);
+            /* Also quantize token_embd to INT8 for fast logit projection */
+            quantize_f16_rows_to_q8(f->q8_embd, f->q8_sembd, src, f->vocab_size, f->dim);
         }
     }
     rc |= load_tensor_f32(g, "output_norm.weight", f->w_norm,       (size_t)f->dim);
@@ -584,7 +591,10 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
     rmsnorm(f->x_norm,
             f->x_buf + (size_t)(n_tokens - 1) * dim,
             f->w_norm, dim, eps);
-    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
+    {
+        float xls = quantize_row_to_q8(f->xq_buf, f->x_norm, dim);
+        matmul_q8_dot(logits_out, f->xq_buf, xls, f->q8_embd, f->q8_sembd, dim, vocab);
+    }
 
     return 0;
 }
@@ -703,7 +713,10 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     }
 
     rmsnorm(f->x_norm, x, f->w_norm, dim, eps);
-    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
+    {
+        float xls = quantize_row_to_q8(f->xq_buf, f->x_norm, dim);
+        matmul_q8_dot(logits_out, f->xq_buf, xls, f->q8_embd, f->q8_sembd, dim, vocab);
+    }
     return 0;
 }
 
@@ -724,6 +737,7 @@ void forward_free(forward_ctx* f) {
     free(f->k_cache);
     free(f->v_cache);
     free(f->w_token_embd_f16);
+    free(f->q8_embd); free(f->q8_sembd);
     free(f->x_buf);
     free(f->x_norm);
     free(f->q);
