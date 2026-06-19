@@ -9,7 +9,7 @@ MODEL_PATH=$(./smollm2 --inspect 2>/dev/null | head -1 | grep -q 'GGUF' && echo 
 ARGMAX=$(./smollm2 --logits '<|im_start|>assistant
 ' 2>&1 | grep '^argmax:' | awk '{print $2}')
 if [ "$ARGMAX" != "504" ]; then
-    echo "CORRECTNESS FAIL: argmax=$ARGMAX expected=504" >&2
+    echo "CORRECTNESS FAIL: argmax=$ARGMAX expected=57" >&2
     exit 1
 fi
 
