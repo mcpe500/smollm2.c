@@ -73,6 +73,62 @@ struct forward_ctx {
 /* Quantize a float row to int8 per-block-64 for activation quantization.
    dst_scales[b] = amax(block b) / 127.0f
    Returns number of blocks. */
+#ifdef __ARM_NEON
+static int quantize_row_to_q8_blocked(int8_t* dst, float* dst_scales,
+                                       const float* src, int n) {
+    int n_blocks = (n + Q8_BLOCK - 1) / Q8_BLOCK;
+    for (int b = 0; b < n_blocks; b++) {
+        int start = b * Q8_BLOCK;
+        /* Block always exactly Q8_BLOCK elements (zero-padded at alloc); safe to read */
+        const float* s = src + start;
+        /* NEON abs-max over 64 floats = 16 vld + 16 vabs + 15 vmax + 1 horizontal */
+        float32x4_t mx0 = vdupq_n_f32(0), mx1 = vdupq_n_f32(0);
+        float32x4_t mx2 = vdupq_n_f32(0), mx3 = vdupq_n_f32(0);
+        int nleft = n - start; if (nleft > Q8_BLOCK) nleft = Q8_BLOCK;
+        int i = 0;
+        for (; i <= nleft - 16; i += 16) {
+            mx0 = vmaxq_f32(mx0, vabsq_f32(vld1q_f32(s+i)));
+            mx1 = vmaxq_f32(mx1, vabsq_f32(vld1q_f32(s+i+4)));
+            mx2 = vmaxq_f32(mx2, vabsq_f32(vld1q_f32(s+i+8)));
+            mx3 = vmaxq_f32(mx3, vabsq_f32(vld1q_f32(s+i+12)));
+        }
+        float32x4_t mx = vmaxq_f32(vmaxq_f32(mx0,mx1), vmaxq_f32(mx2,mx3));
+        float amax = vmaxvq_f32(mx);
+        for (; i < nleft; i++) { float a = s[i] < 0 ? -s[i] : s[i]; if (a > amax) amax = a; }
+        float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        float inv   = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+        dst_scales[b] = scale;
+        /* Quantize: round-to-nearest, clamp to [-127, 127] */
+        int8_t* d = dst + start;
+        float32x4_t vinv = vdupq_n_f32(inv);
+        int j = 0;
+        for (; j <= nleft - 16; j += 16) {
+            float32x4_t v0 = vmulq_f32(vld1q_f32(s+j),    vinv);
+            float32x4_t v1 = vmulq_f32(vld1q_f32(s+j+4),  vinv);
+            float32x4_t v2 = vmulq_f32(vld1q_f32(s+j+8),  vinv);
+            float32x4_t v3 = vmulq_f32(vld1q_f32(s+j+12), vinv);
+            /* Round to nearest int */
+            int32x4_t i0 = vcvtnq_s32_f32(v0); int32x4_t i1 = vcvtnq_s32_f32(v1);
+            int32x4_t i2 = vcvtnq_s32_f32(v2); int32x4_t i3 = vcvtnq_s32_f32(v3);
+            /* Clamp to [-127,127] */
+            int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
+            i0 = vmaxq_s32(lo, vminq_s32(hi, i0)); i1 = vmaxq_s32(lo, vminq_s32(hi, i1));
+            i2 = vmaxq_s32(lo, vminq_s32(hi, i2)); i3 = vmaxq_s32(lo, vminq_s32(hi, i3));
+            /* Pack int32 -> int16 -> int8 */
+            int16x8_t s01 = vcombine_s16(vmovn_s32(i0), vmovn_s32(i1));
+            int16x8_t s23 = vcombine_s16(vmovn_s32(i2), vmovn_s32(i3));
+            vst1q_s8(d+j, vcombine_s8(vmovn_s16(s01), vmovn_s16(s23)));
+        }
+        for (; j < nleft; j++) {
+            int q = (int)(s[j] * inv + 0.5f);
+            if (q > 127) q = 127; if (q < -127) q = -127;
+            d[j] = (int8_t)q;
+        }
+        for (int k = nleft; k < Q8_BLOCK; k++) d[k] = 0;
+    }
+    return n_blocks;
+}
+#else
 static int quantize_row_to_q8_blocked(int8_t* dst, float* dst_scales,
                                        const float* src, int n) {
     int n_blocks = (n + Q8_BLOCK - 1) / Q8_BLOCK;
@@ -97,6 +153,7 @@ static int quantize_row_to_q8_blocked(int8_t* dst, float* dst_scales,
     }
     return n_blocks;
 }
+#endif
 
 static float f16_to_f32(uint16_t h) {
     uint32_t sign = ((uint32_t)(h & 0x8000u)) << 16;
