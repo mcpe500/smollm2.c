@@ -13,16 +13,16 @@ if [ "$ARGMAX" != "504" ]; then
     exit 1
 fi
 
-# Run 3 decode trials, take median tok/s
+# Run 5 decode trials, take median tok/s for lower noise
 TOKS=""
-for i in 1 2 3; do
+for i in 1 2 3 4 5; do
     OUT=$(./smollm2 -p "Hello, how are you?" -n 50 --temp 0.0 2>&1)
     T=$(echo "$OUT" | grep -o '[0-9.]* tok/s' | grep -o '[0-9.]*')
     TOKS="$TOKS $T"
 done
 
-# Median of 3
-MED=$(echo $TOKS | tr ' ' '\n' | grep -v '^$' | sort -n | sed -n '2p')
+# Median of 5
+MED=$(echo $TOKS | tr ' ' '\n' | grep -v '^$' | sort -n | sed -n '3p')
 
 # Prefill speed
 PREFILL=$(./smollm2 --logits 'Hello' 2>&1 | grep 'prefill:' | grep -o '[0-9.]* tok/s' | grep -o '[0-9.]*')

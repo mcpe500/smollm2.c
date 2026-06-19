@@ -21,7 +21,8 @@ struct forward_ctx {
     float rms_eps, rope_theta;
 
     // weights: token_embd/norms stored F32; heavy matmul weights kept as F16
-    float*    w_token_embd;  // [vocab * dim]        F32
+    float*    w_token_embd;     // [vocab * dim]  F32 — used for embedding lookup
+    uint16_t* w_token_embd_f16; // [vocab * dim]  F16 — used for logit projection (half bandwidth)
     float*    w_norm;        // [dim]                F32
     float*    w_attn_norm;   // [n_layers * dim]     F32
     uint16_t* w_q;           // [n_layers * dim * dim]        F16
@@ -264,7 +265,8 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     size_t s_down  = (size_t)f->n_layers  * f->dim    * f->ffn_hidden;
     size_t s_cache = (size_t)f->n_layers  * max_seq  * f->kv_dim;
 
-    f->w_token_embd = malloc(s_embd  * sizeof(float));
+    f->w_token_embd     = malloc(s_embd * sizeof(float));
+    f->w_token_embd_f16 = malloc(s_embd * sizeof(uint16_t));
     f->w_norm       = malloc(f->dim  * sizeof(float));
     f->w_attn_norm  = malloc(s_norm  * sizeof(float));
     f->w_q          = malloc(s_q     * sizeof(uint16_t));
@@ -290,7 +292,7 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->ffn_mid  = malloc(f->dim         * sizeof(float));
     f->scores   = malloc((size_t)max_seq * sizeof(float));
 
-    if (!f->w_token_embd || !f->w_norm || !f->w_attn_norm || !f->w_q ||
+    if (!f->w_token_embd || !f->w_token_embd_f16 || !f->w_norm || !f->w_attn_norm || !f->w_q ||
         !f->w_k || !f->w_v || !f->w_o || !f->w_ffn_norm ||
         !f->w_gate || !f->w_up || !f->w_down ||
         !f->k_cache || !f->v_cache ||
@@ -303,12 +305,13 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     }
 
     int rc = 0;
-    /* token_embd stays F32 — used for both embedding lookup and tied logit projection */
+    /* token_embd: keep F32 for embedding lookup, also keep F16 for logit projection (half bandwidth) */
     {
         const gguf_tensor_info* t = gguf_tensor_get(g, "token_embd.weight");
         if (!t) { fprintf(stderr, "forward: missing token_embd.weight\n"); rc = -1; }
         else {
             const uint16_t* src = (const uint16_t*)gguf_tensor_data(g, t);
+            memcpy(f->w_token_embd_f16, src, s_embd * sizeof(uint16_t));
             for (size_t i = 0; i < s_embd; i++) f->w_token_embd[i] = f16_to_f32(src[i]);
         }
     }
@@ -462,7 +465,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
     rmsnorm(f->x_norm,
             f->x_buf + (size_t)(n_tokens - 1) * dim,
             f->w_norm, dim, eps);
-    matmul_f32(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
+    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
 
     return 0;
 }
@@ -566,7 +569,7 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     }
 
     rmsnorm(f->x_norm, x, f->w_norm, dim, eps);
-    matmul_f32(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
+    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
     return 0;
 }
 
@@ -585,6 +588,7 @@ void forward_free(forward_ctx* f) {
     free(f->w_down);
     free(f->k_cache);
     free(f->v_cache);
+    free(f->w_token_embd_f16);
     free(f->x_buf);
     free(f->x_norm);
     free(f->q);
