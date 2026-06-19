@@ -133,12 +133,17 @@ static void matmul_f32(float* y, const float* x, const float* W,
         const float* wrow = W + (size_t)o * in_dim;
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
         int i = 0;
-        for (; i <= in_dim - 8; i += 8) {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(wrow+i),   vld1q_f32(x+i));
-            acc1 = vfmaq_f32(acc1, vld1q_f32(wrow+i+4), vld1q_f32(x+i+4));
+        for (; i <= in_dim - 16; i += 16) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(wrow+i),    vld1q_f32(x+i));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(wrow+i+4),  vld1q_f32(x+i+4));
+            acc2 = vfmaq_f32(acc2, vld1q_f32(wrow+i+8),  vld1q_f32(x+i+8));
+            acc3 = vfmaq_f32(acc3, vld1q_f32(wrow+i+12), vld1q_f32(x+i+12));
         }
-        float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        float sum = vaddvq_f32(acc0);
         for (; i < in_dim; i++) sum += wrow[i] * x[i];
         y[o] = sum;
     }
