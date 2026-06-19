@@ -624,12 +624,11 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->w_down       = malloc(s_down  * sizeof(uint16_t));
     /* INT8 quantized weights + per-row scales for vdotq_s32 decode */
     /* Per-block-64 scale: n_blocks = ceil(in_cols / Q8_BLOCK) per row */
-    int nb_dim = (f->dim        + Q8_BLOCK - 1) / Q8_BLOCK; /* =9 for dim=576 */
-    int nb_ffn = (f->ffn_hidden + Q8_BLOCK - 1) / Q8_BLOCK; /* =24 for ffn=1536 */
-    size_t sq_sc   = (size_t)f->n_layers * f->dim        * nb_dim;
-    size_t skv_sc  = (size_t)f->n_layers * f->kv_dim     * nb_dim;
-    size_t sgu_sc  = (size_t)f->n_layers * f->ffn_hidden * nb_dim;
-    size_t sdn_sc  = (size_t)f->n_layers * f->dim        * nb_ffn;
+    /* Per-row scale: 1 float per output row (simpler, faster than per-block-64) */
+    size_t sq_sc   = (size_t)f->n_layers * f->dim;         /* one scale per q-row */
+    size_t skv_sc  = (size_t)f->n_layers * f->kv_dim;      /* one scale per k/v-row */
+    size_t sgu_sc  = (size_t)f->n_layers * f->ffn_hidden;  /* one scale per gate/up row */
+    size_t sdn_sc  = (size_t)f->n_layers * f->dim;         /* one scale per down row */
     f->q8_q    = malloc(s_q    * sizeof(int8_t));  f->q8_sq    = malloc(sq_sc  * sizeof(float));
     f->q8_k    = malloc(s_kv   * sizeof(int8_t));  f->q8_sk    = malloc(skv_sc * sizeof(float));
     f->q8_v    = malloc(s_kv   * sizeof(int8_t));  f->q8_sv    = malloc(skv_sc * sizeof(float));
@@ -695,37 +694,36 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
         size_t off_gu  = (size_t)L * f->ffn_hidden * f->dim;
         size_t off_d   = (size_t)L * f->dim    * f->ffn_hidden;
 
-        int nb_d = (f->dim        + Q8_BLOCK - 1) / Q8_BLOCK;
-        int nb_f = (f->ffn_hidden + Q8_BLOCK - 1) / Q8_BLOCK;
-        size_t off_q_sc  = (size_t)L * f->dim        * nb_d;
-        size_t off_kv_sc = (size_t)L * f->kv_dim     * nb_d;
-        size_t off_gu_sc = (size_t)L * f->ffn_hidden * nb_d;
-        size_t off_dn_sc = (size_t)L * f->dim        * nb_f;
+        /* Per-row scale: off_*_sc = L * n_rows */
+        size_t off_q_sc  = (size_t)L * f->dim;
+        size_t off_kv_sc = (size_t)L * f->kv_dim;
+        size_t off_gu_sc = (size_t)L * f->ffn_hidden;
+        size_t off_dn_sc = (size_t)L * f->dim;
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight",   L);
         rc |= load_tensor_f32(g, name, f->w_attn_norm + off_n, (size_t)f->dim);
         snprintf(name, sizeof(name), "blk.%d.attn_q.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_q        + off_q,  (size_t)f->dim    * f->dim);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_q+off_q, f->q8_sq+off_q_sc, f->w_q+off_q, f->dim, f->dim);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_q+off_q, f->q8_sq+off_q_sc, f->w_q+off_q, f->dim, f->dim);
         snprintf(name, sizeof(name), "blk.%d.attn_k.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_k        + off_kv, (size_t)f->kv_dim * f->dim);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_k+off_kv, f->q8_sk+off_kv_sc, f->w_k+off_kv, f->kv_dim, f->dim);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_k+off_kv, f->q8_sk+off_kv_sc, f->w_k+off_kv, f->kv_dim, f->dim);
         snprintf(name, sizeof(name), "blk.%d.attn_v.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_v        + off_kv, (size_t)f->kv_dim * f->dim);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_v+off_kv, f->q8_sv+off_kv_sc, f->w_v+off_kv, f->kv_dim, f->dim);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_v+off_kv, f->q8_sv+off_kv_sc, f->w_v+off_kv, f->kv_dim, f->dim);
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight",L);
         rc |= load_tensor_f16(g, name, f->w_o        + off_q,  (size_t)f->dim    * f->dim);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_o+off_q, f->q8_so+off_q_sc, f->w_o+off_q, f->dim, f->dim);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_o+off_q, f->q8_so+off_q_sc, f->w_o+off_q, f->dim, f->dim);
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight",   L);
         rc |= load_tensor_f32(g, name, f->w_ffn_norm + off_n,  (size_t)f->dim);
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight",   L);
         rc |= load_tensor_f16(g, name, f->w_gate     + off_gu, (size_t)f->ffn_hidden * f->dim);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_gate+off_gu, f->q8_sgate+off_gu_sc, f->w_gate+off_gu, f->ffn_hidden, f->dim);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_gate+off_gu, f->q8_sgate+off_gu_sc, f->w_gate+off_gu, f->ffn_hidden, f->dim);
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_up       + off_gu, (size_t)f->ffn_hidden * f->dim);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_up+off_gu, f->q8_sup+off_gu_sc, f->w_up+off_gu, f->ffn_hidden, f->dim);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_up+off_gu, f->q8_sup+off_gu_sc, f->w_up+off_gu, f->ffn_hidden, f->dim);
         snprintf(name, sizeof(name), "blk.%d.ffn_down.weight",   L);
         rc |= load_tensor_f16(g, name, f->w_down     + off_d,  (size_t)f->dim    * f->ffn_hidden);
-        if (!rc) quantize_f16_rows_to_q8(f->q8_down+off_d, f->q8_sdown+off_dn_sc, f->w_down+off_d, f->dim, f->ffn_hidden);
+        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_down+off_d, f->q8_sdown+off_dn_sc, f->w_down+off_d, f->dim, f->ffn_hidden);
     }
 
     if (rc != 0) {
@@ -794,26 +792,24 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
     const size_t cache_stride = (size_t)f->max_seq * kvdim;
     const float  inv_sqrt_hd  = 1.0f / sqrtf((float)hd);
 
-    // 2. Transformer layers
-    int nb_d = (dim  + Q8_BLOCK - 1) / Q8_BLOCK;
-    int nb_f = (ffn + Q8_BLOCK - 1) / Q8_BLOCK;
+    // 2. Transformer layers (per-row weight scales)
     for (int L = 0; L < nl; L++) {
         const int8_t* q8q   = f->q8_q    + (size_t)L * dim   * dim;
-        const float*  sq    = f->q8_sq   + (size_t)L * dim   * nb_d;
+        const float*  sq    = f->q8_sq   + (size_t)L * dim;
         const int8_t* q8k   = f->q8_k    + (size_t)L * kvdim * dim;
-        const float*  sk    = f->q8_sk   + (size_t)L * kvdim * nb_d;
+        const float*  sk    = f->q8_sk   + (size_t)L * kvdim;
         const int8_t* q8v   = f->q8_v    + (size_t)L * kvdim * dim;
-        const float*  sv    = f->q8_sv   + (size_t)L * kvdim * nb_d;
+        const float*  sv    = f->q8_sv   + (size_t)L * kvdim;
         const int8_t* q8o   = f->q8_o    + (size_t)L * dim   * dim;
-        const float*  so    = f->q8_so   + (size_t)L * dim   * nb_d;
+        const float*  so    = f->q8_so   + (size_t)L * dim;
         const float*   wan  = f->w_attn_norm + (size_t)L * dim;
         const float*   wfn  = f->w_ffn_norm  + (size_t)L * dim;
         const int8_t* q8g   = f->q8_gate + (size_t)L * ffn  * dim;
-        const float*  sg    = f->q8_sgate+ (size_t)L * ffn  * nb_d;
+        const float*  sg    = f->q8_sgate+ (size_t)L * ffn;
         const int8_t* q8u   = f->q8_up   + (size_t)L * ffn  * dim;
-        const float*  su    = f->q8_sup  + (size_t)L * ffn  * nb_d;
+        const float*  su    = f->q8_sup  + (size_t)L * ffn;
         const int8_t* q8d   = f->q8_down + (size_t)L * dim  * ffn;
-        const float*  sd    = f->q8_sdown+ (size_t)L * dim  * nb_f;
+        const float*  sd    = f->q8_sdown+ (size_t)L * dim;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
@@ -823,9 +819,9 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             // --- attention block ---
             rmsnorm(f->x_norm, xt, wan, dim, eps);
             float xn_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-            matmul_q8_dot(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
-            matmul_q8_dot(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
-            matmul_q8_dot(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
+            matmul_q8_dot_perrow(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
+            matmul_q8_dot_perrow(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
+            matmul_q8_dot_perrow(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
             rope_neox_table(f->q, t, nh,  hd, f->rope_cos, f->rope_sin);
             rope_neox_table(f->k, t, nkv, hd, f->rope_cos, f->rope_sin);
             memcpy(kc + (size_t)t * kvdim, f->k, kvdim * sizeof(float));
@@ -862,20 +858,20 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             }
 
             float ao_sc_p = quantize_row_to_q8_tensor(f->xq_buf, f->attn_out, dim);
-            matmul_q8_dot(f->o_proj, f->xq_buf, ao_sc_p, q8o, so, dim, dim);
+            matmul_q8_dot_perrow(f->o_proj, f->xq_buf, ao_sc_p, q8o, so, dim, dim);
             for (int i = 0; i < dim; i++) xt[i] += f->o_proj[i];
 
             // --- FFN block (SwiGLU) ---
             rmsnorm(f->x_norm, xt, wfn, dim, eps);
             float xf_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-            matmul_q8_dot(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
-            matmul_q8_dot(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
+            matmul_q8_dot_perrow(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
+            matmul_q8_dot_perrow(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
             for (int i = 0; i < ffn; i++) {
                 float g = f->ffn_gate[i];
                 f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
             }
             float fg_sc = quantize_row_to_q8_tensor(f->xq_buf, f->ffn_gate, ffn);
-            matmul_q8_dot(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
+            matmul_q8_dot_perrow(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
             for (int i = 0; i < dim; i++) xt[i] += f->ffn_mid[i];
         }
     }
@@ -924,34 +920,32 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     float* x = f->x_buf;  /* reuse first slot */
     memcpy(x, f->w_token_embd + (size_t)token * dim, dim * sizeof(float));
 
-    int nb_d = (dim  + Q8_BLOCK - 1) / Q8_BLOCK;  /* =9 for dim=576 */
-    int nb_f = (ffn  + Q8_BLOCK - 1) / Q8_BLOCK;  /* =24 for ffn=1536 */
     for (int L = 0; L < nl; L++) {
         const int8_t*  q8q  = f->q8_q    + (size_t)L * dim   * dim;
-        const float*   sq   = f->q8_sq   + (size_t)L * dim   * nb_d;
+        const float*   sq   = f->q8_sq   + (size_t)L * dim;
         const int8_t*  q8k  = f->q8_k    + (size_t)L * kvdim * dim;
-        const float*   sk   = f->q8_sk   + (size_t)L * kvdim * nb_d;
+        const float*   sk   = f->q8_sk   + (size_t)L * kvdim;
         const int8_t*  q8v  = f->q8_v    + (size_t)L * kvdim * dim;
-        const float*   sv   = f->q8_sv   + (size_t)L * kvdim * nb_d;
+        const float*   sv   = f->q8_sv   + (size_t)L * kvdim;
         const int8_t*  q8o  = f->q8_o    + (size_t)L * dim   * dim;
-        const float*   so   = f->q8_so   + (size_t)L * dim   * nb_d;
+        const float*   so   = f->q8_so   + (size_t)L * dim;
         const float*   wan  = f->w_attn_norm + (size_t)L * dim;
         const float*   wfn  = f->w_ffn_norm  + (size_t)L * dim;
         const int8_t*  q8g  = f->q8_gate + (size_t)L * ffn * dim;
-        const float*   sg   = f->q8_sgate+ (size_t)L * ffn  * nb_d;
+        const float*   sg   = f->q8_sgate+ (size_t)L * ffn;
         const int8_t*  q8u  = f->q8_up   + (size_t)L * ffn * dim;
-        const float*   su   = f->q8_sup  + (size_t)L * ffn  * nb_d;
+        const float*   su   = f->q8_sup  + (size_t)L * ffn;
         const int8_t*  q8d  = f->q8_down + (size_t)L * dim * ffn;
-        const float*   sd   = f->q8_sdown+ (size_t)L * dim  * nb_f;
+        const float*   sd   = f->q8_sdown+ (size_t)L * dim;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
         rmsnorm(f->x_norm, x, wan, dim, eps);
         /* Quantize x_norm per-block-64, reuse for q/k/v */
         float xn_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
-        matmul_q8_dot(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
-        matmul_q8_dot(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
+        matmul_q8_dot_perrow(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
+        matmul_q8_dot_perrow(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
+        matmul_q8_dot_perrow(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
         rope_neox_table(f->q, pos, nh,  hd, f->rope_cos, f->rope_sin);
         rope_neox_table(f->k, pos, nkv, hd, f->rope_cos, f->rope_sin);
         memcpy(kc + (size_t)pos * kvdim, f->k, kvdim * sizeof(float));
@@ -1017,21 +1011,21 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
 
         /* Quantize attn_out for output projection */
         float ao_sc = quantize_row_to_q8_tensor(f->xq_buf, f->attn_out, dim);
-        matmul_q8_dot(f->o_proj, f->xq_buf, ao_sc, q8o, so, dim, dim);
+        matmul_q8_dot_perrow(f->o_proj, f->xq_buf, ao_sc, q8o, so, dim, dim);
         for (int i = 0; i < dim; i++) x[i] += f->o_proj[i];
 
         rmsnorm(f->x_norm, x, wfn, dim, eps);
         /* Quantize x_norm per-block-64 for gate+up */
         float xf_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
-        matmul_q8_dot(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
+        matmul_q8_dot_perrow(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
+        matmul_q8_dot_perrow(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
         for (int i = 0; i < ffn; i++) {
             float g = f->ffn_gate[i];
             f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
         }
         /* Quantize ffn_gate (post-SwiGLU) per-block-64 for down projection */
         float fg_sc = quantize_row_to_q8_tensor(f->xq_buf, f->ffn_gate, ffn);
-        matmul_q8_dot(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
+        matmul_q8_dot_perrow(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
         for (int i = 0; i < dim; i++) x[i] += f->ffn_mid[i];
     }
 
