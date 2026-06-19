@@ -62,6 +62,8 @@ struct forward_ctx {
     float* ffn_up;        // [ffn_hidden]
     float* ffn_mid;       // [dim]
     float* scores;        // [max_seq]
+    float* rope_cos;      // [max_seq * head_dim/2]  precomputed RoPE cosines
+    float* rope_sin;      // [max_seq * head_dim/2]  precomputed RoPE sines
 };
 
 // ---------------------------------------------------------------------------
@@ -410,6 +412,23 @@ static void matmul_q8_dot(float* y, const int8_t* xq, const float* x_scales,
 }
 
 // GPT-NeoX RoPE: pair (i, i+hd/2) for each head independently
+/* rope_neox using precomputed cos/sin table (faster than powf+cosf+sinf per step) */
+static void rope_neox_table(float* v, int pos, int n_heads, int head_dim,
+                             const float* rope_cos, const float* rope_sin) {
+    int half = head_dim / 2;
+    const float* cv = rope_cos + (size_t)pos * half;
+    const float* sv = rope_sin + (size_t)pos * half;
+    for (int h = 0; h < n_heads; h++) {
+        float* vh = v + (size_t)h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float a = vh[i], b = vh[i + half];
+            vh[i]        = a * cv[i] - b * sv[i];
+            vh[i + half] = a * sv[i] + b * cv[i];
+        }
+    }
+}
+
+/* Legacy: used during load if needed */
 static void rope_neox(float* v, int pos, int n_heads, int head_dim, float theta) {
     int half = head_dim / 2;
     for (int h = 0; h < n_heads; h++) {
@@ -419,8 +438,7 @@ static void rope_neox(float* v, int pos, int n_heads, int head_dim, float theta)
             float angle = (float)pos * freq;
             float c = cosf(angle);
             float s = sinf(angle);
-            float a = vh[i];
-            float b = vh[i + half];
+            float a = vh[i], b = vh[i + half];
             vh[i]        = a * c - b * s;
             vh[i + half] = a * s + b * c;
         }
@@ -529,6 +547,9 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->ffn_up   = malloc(f->ffn_hidden  * sizeof(float));
     f->ffn_mid  = malloc(f->dim         * sizeof(float));
     f->scores   = malloc((size_t)max_seq * sizeof(float));
+    int half_hd = f->head_dim / 2;
+    f->rope_cos = malloc((size_t)max_seq * half_hd * sizeof(float));
+    f->rope_sin = malloc((size_t)max_seq * half_hd * sizeof(float));
 
     if (!f->w_token_embd || !f->w_token_embd_f16 || !f->q8_embd || !f->q8_sembd ||
         !f->w_norm || !f->w_attn_norm || !f->w_q ||
@@ -540,7 +561,7 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
         !f->k_cache || !f->v_cache ||
         !f->x_buf || !f->x_norm || !f->q || !f->k || !f->v ||
         !f->attn_out || !f->o_proj || !f->ffn_gate || !f->ffn_up ||
-        !f->ffn_mid || !f->scores) {
+        !f->ffn_mid || !f->scores || !f->rope_cos || !f->rope_sin) {
         fprintf(stderr, "forward: alloc failed\n");
         forward_free(f);
         return -1;
@@ -605,6 +626,19 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     if (rc != 0) {
         forward_free(f);
         return -1;
+    }
+
+    /* Precompute RoPE cos/sin tables for all positions up to max_seq. */
+    {
+        int half = f->head_dim / 2;
+        for (int pos = 0; pos < max_seq; pos++) {
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(f->rope_theta, (2.0f * (float)i) / (float)f->head_dim);
+                float angle = (float)pos * freq;
+                f->rope_cos[pos * half + i] = cosf(angle);
+                f->rope_sin[pos * half + i] = sinf(angle);
+            }
+        }
     }
 
     /* Free F16 weight arrays — no longer needed after INT8 quantization.
@@ -687,8 +721,8 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             matmul_q8_dot(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
             matmul_q8_dot(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
             matmul_q8_dot(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
-            rope_neox(f->q, t, nh,  hd, f->rope_theta);
-            rope_neox(f->k, t, nkv, hd, f->rope_theta);
+            rope_neox_table(f->q, t, nh,  hd, f->rope_cos, f->rope_sin);
+            rope_neox_table(f->k, t, nkv, hd, f->rope_cos, f->rope_sin);
             memcpy(kc + (size_t)t * kvdim, f->k, kvdim * sizeof(float));
             memcpy(vc + (size_t)t * kvdim, f->v, kvdim * sizeof(float));
 
@@ -813,8 +847,8 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
         matmul_q8_dot(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
         matmul_q8_dot(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
         matmul_q8_dot(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
-        rope_neox(f->q, pos, nh,  hd, f->rope_theta);
-        rope_neox(f->k, pos, nkv, hd, f->rope_theta);
+        rope_neox_table(f->q, pos, nh,  hd, f->rope_cos, f->rope_sin);
+        rope_neox_table(f->k, pos, nkv, hd, f->rope_cos, f->rope_sin);
         memcpy(kc + (size_t)pos * kvdim, f->k, kvdim * sizeof(float));
         memcpy(vc + (size_t)pos * kvdim, f->v, kvdim * sizeof(float));
 
@@ -932,6 +966,6 @@ void forward_free(forward_ctx* f) {
     free(f->ffn_gate);
     free(f->ffn_up);
     free(f->ffn_mid);
-    free(f->scores);
+    free(f->scores); free(f->rope_cos); free(f->rope_sin);
     free(f);
 }
