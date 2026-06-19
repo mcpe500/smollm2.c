@@ -596,6 +596,17 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
         return -1;
     }
 
+    /* Free F16 weight arrays — no longer needed after INT8 quantization.
+       Saves ~202 MB RAM and improves cache locality for inference. */
+    free(f->w_q);     f->w_q     = NULL;
+    free(f->w_k);     f->w_k     = NULL;
+    free(f->w_v);     f->w_v     = NULL;
+    free(f->w_o);     f->w_o     = NULL;
+    free(f->w_gate);  f->w_gate  = NULL;
+    free(f->w_up);    f->w_up    = NULL;
+    free(f->w_down);  f->w_down  = NULL;
+    free(f->w_token_embd_f16); f->w_token_embd_f16 = NULL;
+
     *out = f;
     return 0;
 }
