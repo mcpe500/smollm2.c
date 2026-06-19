@@ -125,8 +125,21 @@ static float quantize_row_to_q8_tensor(int8_t* dst, const float* src, int n) {
     for (int k = n; k < ((n + Q8_BLOCK - 1) & ~(Q8_BLOCK-1)); k++) dst[k] = 0;
     return scale;
 }
+#else
+static float quantize_row_to_q8_tensor(int8_t* dst, const float* src, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) { float a = src[i]<0?-src[i]:src[i]; if(a>amax)amax=a; }
+    float scale = (amax>0.0f)?amax/127.0f:1.0f;
+    float inv   = (amax>0.0f)?127.0f/amax:0.0f;
+    for (int i = 0; i < n; i++) {
+        int q = (int)(src[i]*inv+0.5f); if(q>127)q=127; if(q<-127)q=-127; dst[i]=(int8_t)q;
+    }
+    return scale;
+}
+#endif
 
-/* Legacy per-block quantize (still used for F16 weight quantization at load time) */
+/* per-block activation quantize: dead code, excluded from build */
+#if 0
 static int quantize_row_to_q8_blocked(int8_t* dst, float* dst_scales,
                                        const float* src, int n) {
     int n_blocks = (n + Q8_BLOCK - 1) / Q8_BLOCK;
@@ -204,20 +217,7 @@ static int quantize_row_to_q8_blocked(int8_t* dst, float* dst_scales,
     }
     return n_blocks;
 }
-static float quantize_row_to_q8_tensor(int8_t* dst, const float* src, int n) {
-    float amax = 0.0f;
-    for (int i = 0; i < n; i++) { float a = src[i]<0?-src[i]:src[i]; if(a>amax) amax=a; }
-    float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
-    float inv   = (amax > 0.0f) ? 127.0f / amax : 0.0f;
-    for (int i = 0; i < n; i++) {
-        int q = (int)(src[i]*inv+0.5f); if(q>127)q=127; if(q<-127)q=-127;
-        dst[i]=(int8_t)q;
-    }
-    int aligned = (n + Q8_BLOCK - 1) & ~(Q8_BLOCK-1);
-    for (int i = n; i < aligned; i++) dst[i] = 0;
-    return scale;
-}
-#endif
+#endif /* #if 0 block */
 
 static float f16_to_f32(uint16_t h) {
     uint32_t sign = ((uint32_t)(h & 0x8000u)) << 16;
@@ -405,85 +405,7 @@ static void quantize_f16_rows_to_q8_perrow(int8_t* dst_q, float* dst_scale,
     }
 }
 
-/* Quantize a F16 weight matrix to INT8 per-block-64 (in the input dimension).
-   dst_scale: [out_rows * n_blocks] where n_blocks = ceil(in_cols / Q8_BLOCK) */
-static void quantize_f16_rows_to_q8(int8_t* dst_q, float* dst_scale,
-                                    const uint16_t* src_f16,
-                                    int out_rows, int in_cols) {
-    int n_blocks = (in_cols + Q8_BLOCK - 1) / Q8_BLOCK;
-    for (int o = 0; o < out_rows; o++) {
-        const uint16_t* row = src_f16 + (size_t)o * in_cols;
-        int8_t* drow = dst_q + (size_t)o * in_cols;
-        float* dscale = dst_scale + (size_t)o * n_blocks;
-        for (int b = 0; b < n_blocks; b++) {
-            int start = b * Q8_BLOCK;
-            int end   = start + Q8_BLOCK < in_cols ? start + Q8_BLOCK : in_cols;
-            float amax = 0.0f;
-            for (int i = start; i < end; i++) {
-                float v = f16_to_f32(row[i]);
-                float a = v < 0 ? -v : v;
-                if (a > amax) amax = a;
-            }
-            float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
-            float inv   = (amax > 0.0f) ? 127.0f / amax : 0.0f;
-            dscale[b] = scale;
-            for (int i = start; i < end; i++) {
-                float v = f16_to_f32(row[i]);
-                int q = (int)(v * inv + 0.5f);
-                if (q >  127) q =  127;
-                if (q < -127) q = -127;
-                drow[i] = (int8_t)q;
-            }
-            for (int i = end; i < start + Q8_BLOCK; i++) drow[i] = 0;
-        }
-    }
-}
 
-/* INT8 x INT8 -> float matmul using vdotq_s32, per-block-64 weight scaling.
-   xq: [in_dim] INT8 activation (quantized per-tensor, single x_scale)
-   x_scale: single float activation scale
-   W: [out_dim * in_dim] INT8, wscales: [out_dim * n_blocks] float per-block-64
-   result[o] = x_scale * sum_b( dot(W[o][b*64..], xq[b*64..]) * wscales[o*nblk+b] ) */
-__attribute__((target("+dotprod")))
-static void matmul_q8_dot(float* y, const int8_t* xq, float x_scale,
-                          const int8_t* W, const float* wscales,
-                          int in_dim, int out_dim) {
-    int n_blocks = (in_dim + Q8_BLOCK - 1) / Q8_BLOCK;
-#ifdef __ARM_NEON
-    for (int o = 0; o < out_dim; o++) {
-        const int8_t* wr = W + (size_t)o * in_dim;
-        const float*  ws = wscales + (size_t)o * n_blocks;
-        float result = 0.0f;
-        for (int b = 0; b < n_blocks; b++) {
-            int off = b * Q8_BLOCK;
-            const int8_t* wb = wr + off;
-            const int8_t* xb = xq + off;
-            int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
-            int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
-            acc0 = vdotq_s32(acc0, vld1q_s8(wb),    vld1q_s8(xb));
-            acc1 = vdotq_s32(acc1, vld1q_s8(wb+16), vld1q_s8(xb+16));
-            acc2 = vdotq_s32(acc2, vld1q_s8(wb+32), vld1q_s8(xb+32));
-            acc3 = vdotq_s32(acc3, vld1q_s8(wb+48), vld1q_s8(xb+48));
-            int32_t sum32 = vaddvq_s32(vaddq_s32(vaddq_s32(acc0,acc1),vaddq_s32(acc2,acc3)));
-            result += (float)sum32 * ws[b];
-        }
-        y[o] = result * x_scale;
-    }
-#else
-    for (int o = 0; o < out_dim; o++) {
-        const int8_t* wr = W + (size_t)o * in_dim;
-        const float*  ws = wscales + (size_t)o * n_blocks;
-        float result = 0.0f;
-        for (int b = 0; b < n_blocks; b++) {
-            int off = b * Q8_BLOCK, end_b = off + Q8_BLOCK < in_dim ? off + Q8_BLOCK : in_dim;
-            int32_t sum32 = 0;
-            for (int i = off; i < end_b; i++) sum32 += (int32_t)wr[i] * (int32_t)xq[i];
-            result += (float)sum32 * ws[b];
-        }
-        y[o] = result * x_scale;
-    }
-#endif
-}
 
 /* Per-row weight scale matmul: W uses single scale per row (faster than per-block-64).
    Accumulates ALL elements in one tight loop: no per-block hadd/scale overhead.
