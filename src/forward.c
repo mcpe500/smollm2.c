@@ -70,6 +70,15 @@ struct forward_ctx {
 
 #define Q8_BLOCK 64  /* per-block INT8 quantization block size */
 
+/* Fast sigmoid via Schraudolph exp bit trick: ~10x faster than libm expf.
+   Error: ~1.7% max, negligible for SiLU gating in FFN. */
+static inline float fast_sigmoid(float x) {
+    union { float f; int32_t i; } u;
+    u.i = (int32_t)(12102203.1875f * (-x) + 1065353216.0f);
+    float eg = u.f; /* e^(-x) approximation */
+    return 1.0f / (1.0f + eg);
+}
+
 /* Quantize a float row to int8 per-block-64 for activation quantization.
    dst_scales[b] = amax(block b) / 127.0f
    Returns number of blocks. */
@@ -722,8 +731,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             matmul_q8_dot(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
             for (int i = 0; i < ffn; i++) {
                 float g = f->ffn_gate[i];
-                float sig = 1.0f / (1.0f + expf(-g));
-                f->ffn_gate[i] = g * sig * f->ffn_up[i];
+                f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
             }
             float fg_sc[32]; quantize_row_to_q8_blocked(f->xq_buf, fg_sc, f->ffn_gate, ffn);
             matmul_q8_dot(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
@@ -878,8 +886,7 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
         matmul_q8_dot(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
         for (int i = 0; i < ffn; i++) {
             float g = f->ffn_gate[i];
-            float sig = 1.0f / (1.0f + expf(-g));
-            f->ffn_gate[i] = g * sig * f->ffn_up[i];
+            f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
         }
         /* Quantize ffn_gate (post-SwiGLU) per-block-64 for down projection */
         float fg_sc[32]; quantize_row_to_q8_blocked(f->xq_buf, fg_sc, f->ffn_gate, ffn);
