@@ -219,11 +219,35 @@ static int load_tensor_f32(const gguf_ctx* g, const char* name,
 
 static void rmsnorm(float* out, const float* x, const float* w,
                     int n, float eps) {
+#ifdef __ARM_NEON
+    float32x4_t vss0 = vdupq_n_f32(0), vss1 = vdupq_n_f32(0);
+    float32x4_t vss2 = vdupq_n_f32(0), vss3 = vdupq_n_f32(0);
+    int i = 0;
+    for (; i <= n - 16; i += 16) {
+        float32x4_t v0 = vld1q_f32(x+i),   v1 = vld1q_f32(x+i+4);
+        float32x4_t v2 = vld1q_f32(x+i+8), v3 = vld1q_f32(x+i+12);
+        vss0 = vfmaq_f32(vss0, v0, v0); vss1 = vfmaq_f32(vss1, v1, v1);
+        vss2 = vfmaq_f32(vss2, v2, v2); vss3 = vfmaq_f32(vss3, v3, v3);
+    }
+    float ss = vaddvq_f32(vaddq_f32(vaddq_f32(vss0,vss1),vaddq_f32(vss2,vss3)));
+    for (; i < n; i++) ss += x[i] * x[i];
+    float inv = 1.0f / sqrtf(ss / (float)n + eps);
+    float32x4_t vinv = vdupq_n_f32(inv);
+    i = 0;
+    for (; i <= n - 16; i += 16) {
+        vst1q_f32(out+i,    vmulq_f32(vmulq_f32(vld1q_f32(x+i),    vld1q_f32(w+i)),    vinv));
+        vst1q_f32(out+i+4,  vmulq_f32(vmulq_f32(vld1q_f32(x+i+4),  vld1q_f32(w+i+4)),  vinv));
+        vst1q_f32(out+i+8,  vmulq_f32(vmulq_f32(vld1q_f32(x+i+8),  vld1q_f32(w+i+8)),  vinv));
+        vst1q_f32(out+i+12, vmulq_f32(vmulq_f32(vld1q_f32(x+i+12), vld1q_f32(w+i+12)), vinv));
+    }
+    for (; i < n; i++) out[i] = x[i] * w[i] * inv;
+#else
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
     ss /= n;
     float inv = 1.0f / sqrtf((float)ss + eps);
     for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
+#endif
 }
 
 // Matmul with F32 weights (used for tied embedding logit projection)
