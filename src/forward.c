@@ -790,14 +790,29 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
             float* oh = f->attn_out + h * hd;
 
             float max_s = -INFINITY;
+#ifdef __ARM_NEON
+            for (int s = 0; s <= pos; s++) {
+                const float* ks = kc + (size_t)s * kvdim + kvh * hd;
+                float32x4_t a0=vdupq_n_f32(0),a1=vdupq_n_f32(0);
+                float32x4_t a2=vdupq_n_f32(0),a3=vdupq_n_f32(0);
+                for (int i = 0; i <= hd-16; i += 16) {
+                    a0=vfmaq_f32(a0,vld1q_f32(qh+i),   vld1q_f32(ks+i));
+                    a1=vfmaq_f32(a1,vld1q_f32(qh+i+4), vld1q_f32(ks+i+4));
+                    a2=vfmaq_f32(a2,vld1q_f32(qh+i+8), vld1q_f32(ks+i+8));
+                    a3=vfmaq_f32(a3,vld1q_f32(qh+i+12),vld1q_f32(ks+i+12));
+                }
+                float d = vaddvq_f32(vaddq_f32(vaddq_f32(a0,a1),vaddq_f32(a2,a3))) * inv_sqrt_hd;
+                f->scores[s] = d; if (d > max_s) max_s = d;
+            }
+#else
             for (int s = 0; s <= pos; s++) {
                 const float* ks = kc + (size_t)s * kvdim + kvh * hd;
                 float d = 0.0f;
                 for (int i = 0; i < hd; i++) d += qh[i] * ks[i];
-                d *= inv_sqrt_hd;
-                f->scores[s] = d;
+                d *= inv_sqrt_hd; f->scores[s] = d;
                 if (d > max_s) max_s = d;
             }
+#endif
             float sum = 0.0f;
             for (int s = 0; s <= pos; s++) {
                 float e = expf(f->scores[s] - max_s);
@@ -806,11 +821,25 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
             }
             float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
             for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+#ifdef __ARM_NEON
+            for (int s = 0; s <= pos; s++) {
+                float w = f->scores[s] * inv_sum;
+                const float* vs = vc + (size_t)s * kvdim + kvh * hd;
+                float32x4_t vw = vdupq_n_f32(w);
+                for (int i = 0; i <= hd-16; i += 16) {
+                    vst1q_f32(oh+i,    vfmaq_f32(vld1q_f32(oh+i),    vw, vld1q_f32(vs+i)));
+                    vst1q_f32(oh+i+4,  vfmaq_f32(vld1q_f32(oh+i+4),  vw, vld1q_f32(vs+i+4)));
+                    vst1q_f32(oh+i+8,  vfmaq_f32(vld1q_f32(oh+i+8),  vw, vld1q_f32(vs+i+8)));
+                    vst1q_f32(oh+i+12, vfmaq_f32(vld1q_f32(oh+i+12), vw, vld1q_f32(vs+i+12)));
+                }
+            }
+#else
             for (int s = 0; s <= pos; s++) {
                 float w = f->scores[s] * inv_sum;
                 const float* vs = vc + (size_t)s * kvdim + kvh * hd;
                 for (int i = 0; i < hd; i++) oh[i] += w * vs[i];
             }
+#endif
         }
 
         /* Quantize attn_out for output projection */
