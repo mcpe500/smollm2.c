@@ -70,13 +70,15 @@ struct forward_ctx {
 
 #define Q8_BLOCK 64  /* per-block INT8 quantization block size */
 
-/* Fast sigmoid via Schraudolph exp bit trick: ~10x faster than libm expf.
-   Error: ~1.7% max, negligible for SiLU gating in FFN. */
-static inline float fast_sigmoid(float x) {
+/* Fast exp via Schraudolph bit trick: ~10x faster than libm expf.
+   Error: ~1.7% max, acceptable for sigmoid gating and attention softmax. */
+static inline float fast_expf(float x) {
     union { float f; int32_t i; } u;
-    u.i = (int32_t)(12102203.1875f * (-x) + 1065353216.0f);
-    float eg = u.f; /* e^(-x) approximation */
-    return 1.0f / (1.0f + eg);
+    u.i = (int32_t)(12102203.1875f * x + 1065353216.0f);
+    return u.f;
+}
+static inline float fast_sigmoid(float x) {
+    return 1.0f / (1.0f + fast_expf(-x));
 }
 
 /* Quantize a float row to int8 per-block-64 for activation quantization.
@@ -706,7 +708,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                 }
                 float sum = 0.0f;
                 for (int s = 0; s <= t; s++) {
-                    float e = expf(f->scores[s] - max_s);
+                    float e = fast_expf(f->scores[s] - max_s);
                     f->scores[s] = e;
                     sum += e;
                 }
@@ -847,7 +849,7 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
 #endif
             float sum = 0.0f;
             for (int s = 0; s <= pos; s++) {
-                float e = expf(f->scores[s] - max_s);
+                float e = fast_expf(f->scores[s] - max_s);
                 f->scores[s] = e;
                 sum += e;
             }
