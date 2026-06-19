@@ -379,9 +379,32 @@ static void matmul(float* y, const float* x, const uint16_t* W,
 #endif
 }
 
-/* Quantize a F16 weight matrix to INT8 per-row with scale per row.
-   Called once at load time for each weight tensor.
-   scale[o] = max_abs_in_row / 127.0f so that w_f = w_q8 * scale */
+/* Quantize a F16 weight matrix to INT8 per-row: one scale per output row.
+   dst_scale: [out_rows]
+   Faster at inference than per-block-64 (no per-block hadd/scale in matmul). */
+static void quantize_f16_rows_to_q8_perrow(int8_t* dst_q, float* dst_scale,
+                                            const uint16_t* src_f16,
+                                            int out_rows, int in_cols) {
+    for (int o = 0; o < out_rows; o++) {
+        const uint16_t* row = src_f16 + (size_t)o * in_cols;
+        float amax = 0.0f;
+        for (int i = 0; i < in_cols; i++) {
+            float v = f16_to_f32(row[i]);
+            float a = v < 0 ? -v : v; if (a > amax) amax = a;
+        }
+        float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        float inv   = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+        dst_scale[o] = scale;
+        int8_t* drow = dst_q + (size_t)o * in_cols;
+        for (int i = 0; i < in_cols; i++) {
+            float v = f16_to_f32(row[i]);
+            int q = (int)(v * inv + 0.5f);
+            if (q > 127) q = 127; if (q < -127) q = -127;
+            drow[i] = (int8_t)q;
+        }
+    }
+}
+
 /* Quantize a F16 weight matrix to INT8 per-block-64 (in the input dimension).
    dst_scale: [out_rows * n_blocks] where n_blocks = ceil(in_cols / Q8_BLOCK) */
 static void quantize_f16_rows_to_q8(int8_t* dst_q, float* dst_scale,
@@ -458,6 +481,37 @@ static void matmul_q8_dot(float* y, const int8_t* xq, float x_scale,
             result += (float)sum32 * ws[b];
         }
         y[o] = result * x_scale;
+    }
+#endif
+}
+
+/* Per-row weight scale matmul: W uses single scale per row (faster than per-block-64).
+   Accumulates ALL elements in one tight loop: no per-block hadd/scale overhead.
+   W must be quantized with per-row scale: wscales[o] = max_abs(W[o]) / 127.0f */
+__attribute__((target("+dotprod")))
+static void matmul_q8_dot_perrow(float* y, const int8_t* xq, float x_scale,
+                                  const int8_t* W, const float* wscales,
+                                  int in_dim, int out_dim) {
+#ifdef __ARM_NEON
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t* wr = W + (size_t)o * in_dim;
+        int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+        int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
+        for (int i = 0; i <= in_dim - 64; i += 64) {
+            acc0 = vdotq_s32(acc0, vld1q_s8(wr+i),    vld1q_s8(xq+i));
+            acc1 = vdotq_s32(acc1, vld1q_s8(wr+i+16), vld1q_s8(xq+i+16));
+            acc2 = vdotq_s32(acc2, vld1q_s8(wr+i+32), vld1q_s8(xq+i+32));
+            acc3 = vdotq_s32(acc3, vld1q_s8(wr+i+48), vld1q_s8(xq+i+48));
+        }
+        int32_t sum32 = vaddvq_s32(vaddq_s32(vaddq_s32(acc0,acc1),vaddq_s32(acc2,acc3)));
+        y[o] = (float)sum32 * x_scale * wscales[o];
+    }
+#else
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t* wr = W + (size_t)o * in_dim;
+        int32_t sum32 = 0;
+        for (int i = 0; i < in_dim; i++) sum32 += (int32_t)wr[i] * (int32_t)xq[i];
+        y[o] = (float)sum32 * x_scale * wscales[o];
     }
 #endif
 }
@@ -555,9 +609,9 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
 
     f->w_token_embd     = malloc(s_embd * sizeof(float));
     f->w_token_embd_f16 = malloc(s_embd * sizeof(uint16_t));
+    /* Per-row logit weights: one scale per vocab row (faster inference) */
     f->q8_embd          = malloc(s_embd * sizeof(int8_t));
-    int nb_d_embd = (f->dim + Q8_BLOCK - 1) / Q8_BLOCK;
-    f->q8_sembd         = malloc((size_t)f->vocab_size * nb_d_embd * sizeof(float));
+    f->q8_sembd         = malloc((size_t)f->vocab_size * sizeof(float));
     f->w_norm       = malloc(f->dim  * sizeof(float));
     f->w_attn_norm  = malloc(s_norm  * sizeof(float));
     f->w_q          = malloc(s_q     * sizeof(uint16_t));
@@ -628,7 +682,7 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
             memcpy(f->w_token_embd_f16, src, s_embd * sizeof(uint16_t));
             for (size_t i = 0; i < s_embd; i++) f->w_token_embd[i] = f16_to_f32(src[i]);
             /* Also quantize token_embd to INT8 for fast logit projection */
-            quantize_f16_rows_to_q8(f->q8_embd, f->q8_sembd, src, f->vocab_size, f->dim);
+            quantize_f16_rows_to_q8_perrow(f->q8_embd, f->q8_sembd, src, f->vocab_size, f->dim);
         }
     }
     rc |= load_tensor_f32(g, "output_norm.weight", f->w_norm,       (size_t)f->dim);
@@ -832,7 +886,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             f->w_norm, dim, eps);
     {
         float xls = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot(logits_out, f->xq_buf, xls, f->q8_embd, f->q8_sembd, dim, vocab);
+        matmul_q8_dot_perrow(logits_out, f->xq_buf, xls, f->q8_embd, f->q8_sembd, dim, vocab);
     }
 
     return 0;
@@ -984,7 +1038,7 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     rmsnorm(f->x_norm, x, f->w_norm, dim, eps);
     {
         float xl_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot(logits_out, f->xq_buf, xl_sc, f->q8_embd, f->q8_sembd, dim, vocab);
+        matmul_q8_dot_perrow(logits_out, f->xq_buf, xl_sc, f->q8_embd, f->q8_sembd, dim, vocab);
     }
     return 0;
 }
