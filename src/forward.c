@@ -497,7 +497,19 @@ static void matmul_q8_dot_perrow(float* y, const int8_t* xq, float x_scale,
         const int8_t* wr = W + (size_t)o * in_dim;
         int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
         int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
-        for (int i = 0; i <= in_dim - 64; i += 64) {
+        int i = 0;
+        /* Unroll: process 128 bytes per iteration to hide loop overhead */
+        for (; i <= in_dim - 128; i += 128) {
+            acc0 = vdotq_s32(acc0, vld1q_s8(wr+i),     vld1q_s8(xq+i));
+            acc1 = vdotq_s32(acc1, vld1q_s8(wr+i+16),  vld1q_s8(xq+i+16));
+            acc2 = vdotq_s32(acc2, vld1q_s8(wr+i+32),  vld1q_s8(xq+i+32));
+            acc3 = vdotq_s32(acc3, vld1q_s8(wr+i+48),  vld1q_s8(xq+i+48));
+            acc0 = vdotq_s32(acc0, vld1q_s8(wr+i+64),  vld1q_s8(xq+i+64));
+            acc1 = vdotq_s32(acc1, vld1q_s8(wr+i+80),  vld1q_s8(xq+i+80));
+            acc2 = vdotq_s32(acc2, vld1q_s8(wr+i+96),  vld1q_s8(xq+i+96));
+            acc3 = vdotq_s32(acc3, vld1q_s8(wr+i+112), vld1q_s8(xq+i+112));
+        }
+        for (; i <= in_dim - 64; i += 64) {
             acc0 = vdotq_s32(acc0, vld1q_s8(wr+i),    vld1q_s8(xq+i));
             acc1 = vdotq_s32(acc1, vld1q_s8(wr+i+16), vld1q_s8(xq+i+16));
             acc2 = vdotq_s32(acc2, vld1q_s8(wr+i+32), vld1q_s8(xq+i+32));
