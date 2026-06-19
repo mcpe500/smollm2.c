@@ -13,7 +13,11 @@ if [ "$ARGMAX" != "504" ]; then
     exit 1
 fi
 
-# Run 5 decode trials, take median tok/s for lower noise
+# Run decode trials: 2 warmup (discarded) then 5 measured, take median.
+# This avoids CPU boost spike on first run and measures steady-state performance.
+for i in 1 2; do
+    ./smollm2 -p "Hello, how are you?" -n 50 --temp 0.0 > /dev/null 2>&1
+done
 TOKS=""
 for i in 1 2 3 4 5; do
     OUT=$(./smollm2 -p "Hello, how are you?" -n 50 --temp 0.0 2>&1)
@@ -21,7 +25,7 @@ for i in 1 2 3 4 5; do
     TOKS="$TOKS $T"
 done
 
-# Median of 5
+# Sort and take median (3rd of 5)
 MED=$(echo $TOKS | tr ' ' '\n' | grep -v '^$' | sort -n | sed -n '3p')
 
 # Prefill speed

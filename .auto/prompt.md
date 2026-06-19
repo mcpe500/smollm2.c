@@ -58,6 +58,22 @@ Our baseline: ~24 tok/s decode (temp=0.3 top-k=5), output coherent but no system
 - top-p rewritten with qsort
 - EOS suppression for natural generation
 - F32 token_embd (needed for tied logit projection accuracy)
+- **KEPT**: F16 logit projection (w_token_embd_f16): +1 tok/s → baseline now 28.8 tok/s
+- -O3 -ffast-math: no gain (within noise)
+- Precompute RoPE table: no gain (RoPE not bottleneck)
+- 2-row matmul tiling: slower (register pressure)
+- unroll-32 with vld1q_f16: slower (register pressure)
+- NEON attention QK dot + value accum: noisy, no clear gain
+- matmul_f32 4-acc upgrade: within noise
+- NEON rmsnorm: within noise
+- Software prefetch (distance=2): slower (HW prefetcher already handles sequential)
+- F16 KV cache: slower (KV cache fits in L2, F32→F16 overhead outweighs bandwidth saving)
+
+## Benchmark Context
+- **Our engine**: 28.8 tok/s baseline (F16 logit proj commit)
+- **Ollama smollm2:135m**: 13.7 tok/s avg (same device, CPU inference)
+- **We are already 2.1x faster than Ollama**
+- Noise floor: ~2 tok/s. Need >30 tok/s to be a clear win over baseline.
 
 ## Ideas to Try
 - Precompute RoPE sin/cos table at load time
