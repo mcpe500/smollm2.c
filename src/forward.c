@@ -61,6 +61,10 @@ struct forward_ctx {
     float* ffn_gate;      // [ffn_hidden]
     float* ffn_up;        // [ffn_hidden]
     float* ffn_mid;       // [dim]
+    /* Second slot for 2-token batched prefill FFN */
+    int8_t* xq_buf2;      // [max(dim, ffn_hidden)] second activation buffer
+    float*  ffn_gate2;    // [ffn_hidden]  second gate output
+    float*  ffn_up2;      // [ffn_hidden]  second up output
     float* scores;        // [max_seq]
     float* rope_cos;      // [max_seq * head_dim/2]  precomputed RoPE cosines
     float* rope_sin;      // [max_seq * head_dim/2]  precomputed RoPE sines
@@ -450,6 +454,46 @@ static void matmul_q8_dot_perrow(float* y, const int8_t* xq, float x_scale,
 #endif
 }
 
+/* Batched matmul: processes 2 activation vectors per W pass.
+   Loads W[o] once, computes dot with both xq0 and xq1 simultaneously.
+   Halves W-read overhead vs calling matmul_q8_dot_perrow twice.
+   For 6-token prefill called in 3 pairs: W read 3x instead of 6x. */
+__attribute__((target("+dotprod")))
+static void matmul_q8_2batch(float* y0, float* y1,
+                              const int8_t* xq0, float xs0,
+                              const int8_t* xq1, float xs1,
+                              const int8_t* W, const float* wscales,
+                              int in_dim, int out_dim) {
+#ifdef __ARM_NEON
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t* wr = W + (size_t)o * in_dim;
+        /* 8 accumulators: 4 for t0, 4 for t1 */
+        int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+        int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+        int32x4_t b0 = vdupq_n_s32(0), b1 = vdupq_n_s32(0);
+        int32x4_t b2 = vdupq_n_s32(0), b3 = vdupq_n_s32(0);
+        int i = 0;
+        /* 64-byte inner loop: 4 W regs + 8 acc regs = 12 regs, no spills */
+        for (; i <= in_dim - 64; i += 64) {
+            int8x16_t w0 = vld1q_s8(wr+i),    w1 = vld1q_s8(wr+i+16);
+            int8x16_t w2 = vld1q_s8(wr+i+32), w3 = vld1q_s8(wr+i+48);
+            /* Token 0 */
+            a0 = vdotq_s32(a0, w0, vld1q_s8(xq0+i));   a1 = vdotq_s32(a1, w1, vld1q_s8(xq0+i+16));
+            a2 = vdotq_s32(a2, w2, vld1q_s8(xq0+i+32)); a3 = vdotq_s32(a3, w3, vld1q_s8(xq0+i+48));
+            /* Token 1 */
+            b0 = vdotq_s32(b0, w0, vld1q_s8(xq1+i));   b1 = vdotq_s32(b1, w1, vld1q_s8(xq1+i+16));
+            b2 = vdotq_s32(b2, w2, vld1q_s8(xq1+i+32)); b3 = vdotq_s32(b3, w3, vld1q_s8(xq1+i+48));
+        }
+        float ws_o = wscales[o];
+        y0[o] = (float)vaddvq_s32(vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3))) * xs0 * ws_o;
+        y1[o] = (float)vaddvq_s32(vaddq_s32(vaddq_s32(b0,b1),vaddq_s32(b2,b3))) * xs1 * ws_o;
+    }
+#else
+    matmul_q8_dot_perrow(y0, xq0, xs0, W, wscales, in_dim, out_dim);
+    matmul_q8_dot_perrow(y1, xq1, xs1, W, wscales, in_dim, out_dim);
+#endif
+}
+
 // GPT-NeoX RoPE: pair (i, i+hd/2) for each head independently
 /* rope_neox using precomputed cos/sin table (faster than powf+cosf+sinf per step) */
 static void rope_neox_table(float* v, int pos, int n_heads, int head_dim,
@@ -583,7 +627,10 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->o_proj   = malloc(f->dim         * sizeof(float));
     f->ffn_gate = malloc(f->ffn_hidden  * sizeof(float));
     f->ffn_up   = malloc(f->ffn_hidden  * sizeof(float));
-    f->ffn_mid  = malloc(f->dim         * sizeof(float));
+    f->ffn_mid   = malloc(f->dim         * sizeof(float));
+    f->xq_buf2   = malloc(xq_size        * sizeof(int8_t));
+    f->ffn_gate2 = malloc(f->ffn_hidden  * sizeof(float));
+    f->ffn_up2   = malloc(f->ffn_hidden  * sizeof(float));
     f->scores   = malloc((size_t)max_seq * sizeof(float));
     int half_hd = f->head_dim / 2;
     f->rope_cos = malloc((size_t)max_seq * half_hd * sizeof(float));
@@ -599,7 +646,8 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
         !f->k_cache || !f->v_cache ||
         !f->x_buf || !f->x_norm || !f->q || !f->k || !f->v ||
         !f->attn_out || !f->o_proj || !f->ffn_gate || !f->ffn_up ||
-        !f->ffn_mid || !f->scores || !f->rope_cos || !f->rope_sin) {
+        !f->ffn_mid || !f->xq_buf2 || !f->ffn_gate2 || !f->ffn_up2 ||
+        !f->scores || !f->rope_cos || !f->rope_sin) {
         fprintf(stderr, "forward: alloc failed\n");
         forward_free(f);
         return -1;
@@ -794,21 +842,60 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             float ao_sc_p = quantize_row_to_q8_tensor(f->xq_buf, f->attn_out, dim);
             matmul_q8_dot_perrow(f->o_proj, f->xq_buf, ao_sc_p, q8o, so, dim, dim);
             for (int i = 0; i < dim; i++) xt[i] += f->o_proj[i];
+        } /* end per-token attention loop */
 
-            // --- FFN block (SwiGLU) ---
-            rmsnorm(f->x_norm, xt, wfn, dim, eps);
-            float xf_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-            matmul_q8_dot_perrow(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
-            matmul_q8_dot_perrow(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
-            for (int i = 0; i < ffn; i++) {
-                float g = f->ffn_gate[i];
-                f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
+        /* Batched FFN: process pairs of tokens with one W pass each.
+           Halves gate/up/down DRAM reads vs per-token sequential. */
+        for (int t = 0; t < n_tokens; t += 2) {
+            float* xt0 = f->x_buf + (size_t)t * dim;
+            if (t + 1 < n_tokens) {
+                /* Process tokens t and t+1 together */
+                float* xt1 = f->x_buf + (size_t)(t + 1) * dim;
+                /* rmsnorm + quantize both tokens' FFN activations */
+                rmsnorm(f->x_norm, xt0, wfn, dim, eps);
+                float xs0 = quantize_row_to_q8_tensor(f->xq_buf,  f->x_norm, dim);
+                rmsnorm(f->x_norm, xt1, wfn, dim, eps);
+                float xs1 = quantize_row_to_q8_tensor(f->xq_buf2, f->x_norm, dim);
+                /* Gate matmul: W read ONCE for both tokens */
+                matmul_q8_2batch(f->ffn_gate, f->ffn_gate2,
+                                 f->xq_buf, xs0, f->xq_buf2, xs1,
+                                 q8g, sg, dim, ffn);
+                /* Up matmul: W read ONCE for both tokens */
+                matmul_q8_2batch(f->ffn_up, f->ffn_up2,
+                                 f->xq_buf, xs0, f->xq_buf2, xs1,
+                                 q8u, su, dim, ffn);
+                /* SwiGLU for both tokens */
+                for (int i = 0; i < ffn; i++) {
+                    float g0 = f->ffn_gate[i];
+                    f->ffn_gate[i]  = g0 * fast_sigmoid(g0) * f->ffn_up[i];
+                    float g1 = f->ffn_gate2[i];
+                    f->ffn_gate2[i] = g1 * fast_sigmoid(g1) * f->ffn_up2[i];
+                }
+                /* Down matmul: W read ONCE for both tokens */
+                float fg0 = quantize_row_to_q8_tensor(f->xq_buf,  f->ffn_gate,  ffn);
+                float fg1 = quantize_row_to_q8_tensor(f->xq_buf2, f->ffn_gate2, ffn);
+                matmul_q8_2batch(f->ffn_mid, f->ffn_gate2,  /* reuse gate2 as down output */
+                                 f->xq_buf, fg0, f->xq_buf2, fg1,
+                                 q8d, sd, ffn, dim);
+                /* Residual add */
+                for (int i = 0; i < dim; i++) xt0[i] += f->ffn_mid[i];
+                for (int i = 0; i < dim; i++) xt1[i] += f->ffn_gate2[i];
+            } else {
+                /* Odd token: fall back to single-token FFN */
+                rmsnorm(f->x_norm, xt0, wfn, dim, eps);
+                float xf_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
+                matmul_q8_dot_perrow(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
+                matmul_q8_dot_perrow(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
+                for (int i = 0; i < ffn; i++) {
+                    float g = f->ffn_gate[i];
+                    f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
+                }
+                float fg_sc = quantize_row_to_q8_tensor(f->xq_buf, f->ffn_gate, ffn);
+                matmul_q8_dot_perrow(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
+                for (int i = 0; i < dim; i++) xt0[i] += f->ffn_mid[i];
             }
-            float fg_sc = quantize_row_to_q8_tensor(f->xq_buf, f->ffn_gate, ffn);
-            matmul_q8_dot_perrow(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
-            for (int i = 0; i < dim; i++) xt[i] += f->ffn_mid[i];
         }
-    }
+    } /* end layer loop */
 
     // 3. Final RMSNorm + tied-embedding logits
     rmsnorm(f->x_norm,
@@ -999,6 +1086,7 @@ void forward_free(forward_ctx* f) {
     free(f->ffn_gate);
     free(f->ffn_up);
     free(f->ffn_mid);
+    free(f->xq_buf2); free(f->ffn_gate2); free(f->ffn_up2);
     free(f->scores); free(f->rope_cos); free(f->rope_sin);
     free(f);
 }
