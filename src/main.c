@@ -238,7 +238,11 @@ static int do_generate(const char* path, const char* user_text,
 }
 
 // ----------------------------------------------------------------------------
-static int do_logits(const char* path, const char* prompt, int max_seq) {
+// --logits / --logits-json <prompt>
+//   as_json=0: human lines (legacy)
+//   as_json=1: one JSON object with prompt_tokens + top-10 logits
+// ----------------------------------------------------------------------------
+static int do_logits(const char* path, const char* prompt, int max_seq, int as_json) {
     gguf_ctx ctx;
     if (gguf_load(path, &ctx) < 0) {
         fprintf(stderr, "failed to load %s\n", path);
@@ -293,27 +297,73 @@ static int do_logits(const char* path, const char* prompt, int max_seq) {
     }
     double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
 
-    int best = 0;
-    for (int v = 1; v < vocab; v++) {
-        if (logits[v] > logits[best]) best = v;
+    /* Top-K (K=10) via partial selection into fixed array. */
+    enum { TOPK = 10 };
+    int top_id[TOPK];
+    float top_l[TOPK];
+    int ntop = 0;
+    for (int v = 0; v < vocab; v++) {
+        float lv = logits[v];
+        if (ntop < TOPK) {
+            int j = ntop++;
+            while (j > 0 && top_l[j - 1] < lv) {
+                top_l[j] = top_l[j - 1];
+                top_id[j] = top_id[j - 1];
+                j--;
+            }
+            top_l[j] = lv;
+            top_id[j] = v;
+        } else if (lv > top_l[TOPK - 1]) {
+            int j = TOPK - 1;
+            while (j > 0 && top_l[j - 1] < lv) {
+                top_l[j] = top_l[j - 1];
+                top_id[j] = top_id[j - 1];
+                j--;
+            }
+            top_l[j] = lv;
+            top_id[j] = v;
+        }
     }
+    int best = (ntop > 0) ? top_id[0] : 0;
 
-    printf("prompt tokens (%d):", n);
-    for (int i = 0; i < n; i++) printf(" %d", ids[i]);
-    printf("\n");
+    if (as_json) {
+        printf("{\"prompt_tokens\":[");
+        for (int i = 0; i < n; i++) {
+            if (i) putchar(',');
+            printf("%d", ids[i]);
+        }
+        printf("],\"topk\":[");
+        for (int i = 0; i < ntop; i++) {
+            char dbuf[512];
+            int dm = tokenizer_decode(tok, top_id[i], dbuf, sizeof(dbuf));
+            if (i) putchar(',');
+            printf("{\"id\":%d,\"logit\":%.6f,\"bytes\":[", top_id[i], top_l[i]);
+            for (int b = 0; b < dm; b++) {
+                if (b) putchar(',');
+                printf("%d", (unsigned char)dbuf[b]);
+            }
+            printf("]}");
+        }
+        printf("],\"argmax\":%d,\"vocab\":%d,\"n_tokens\":%d,\"prefill_s\":%.4f}\n",
+               best, vocab, n, secs);
+    } else {
+        printf("prompt tokens (%d):", n);
+        for (int i = 0; i < n; i++) printf(" %d", ids[i]);
+        printf("\n");
 
-    char buf[512];
-    int m = tokenizer_decode(tok, best, buf, sizeof(buf));
-    printf("argmax: %d  logit=%.4f  decoded(%d bytes): \"", best, logits[best], m);
-    for (int i = 0; i < m; i++) {
-        unsigned char b = (unsigned char)buf[i];
-        if (b >= 32 && b < 127) putchar(b);
-        else printf("\\x%02x", b);
+        char buf[512];
+        int m = tokenizer_decode(tok, best, buf, sizeof(buf));
+        printf("argmax: %d  logit=%.4f  decoded(%d bytes): \"", best, logits[best], m);
+        for (int i = 0; i < m; i++) {
+            unsigned char b = (unsigned char)buf[i];
+            if (b >= 32 && b < 127) putchar(b);
+            else printf("\\x%02x", b);
+        }
+        printf("\"\n");
+
+        printf("prefill: %.3fs for %d tokens (%.2f tok/s scalar)\n",
+               secs, n, n / secs);
     }
-    printf("\"\n");
-
-    printf("prefill: %.3fs for %d tokens (%.2f tok/s scalar)\n",
-           secs, n, n / secs);
 
     free(logits);
     forward_free(fwd);
@@ -348,6 +398,7 @@ static void usage(const char* prog) {
         "  --inspect            Print model metadata.\n"
         "  --tok-test <text>    Tokenizer round-trip test.\n"
         "  --logits <prompt>    Print argmax logit for prompt.\n"
+        "  --logits-json <p>    Same as --logits, one JSON line (top-10).\n"
         "  -h / --help          Show this help.\n",
         prog, prog, prog);
 }
@@ -356,6 +407,7 @@ int main(int argc, char** argv) {
     const char* model_path   = NULL;
     const char* tok_test_text = NULL;
     const char* logits_prompt = NULL;
+    int logits_as_json = 0;
     int inspect = 0;
     int do_tui  = 0;
     int do_web  = 0;
@@ -368,6 +420,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--inspect") == 0) inspect = 1;
         else if (strcmp(argv[i], "--tok-test") == 0 && i + 1 < argc) tok_test_text = argv[++i];
         else if (strcmp(argv[i], "--logits") == 0 && i + 1 < argc) logits_prompt = argv[++i];
+        else if (strcmp(argv[i], "--logits-json") == 0 && i + 1 < argc) { logits_prompt = argv[++i]; logits_as_json = 1; }
         else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) prompt = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
@@ -464,7 +517,7 @@ int main(int argc, char** argv) {
     }
 
     if (logits_prompt) {
-        rc = do_logits(model_path, logits_prompt, 2048);
+        rc = do_logits(model_path, logits_prompt, 2048, logits_as_json);
         goto cleanup;
     }
 

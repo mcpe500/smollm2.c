@@ -1,0 +1,26 @@
+# Reference prompts for logits/tokenizer parity vs Ollama smollm2:135m.
+# Lines starting with # are comments. Empty lines ignored.
+# Each line is a RAW prompt (no chat template wrapping by the harness).
+
+# Short ChatML "hello" — the reported 0-token failure case.
+<|im_start|>system
+You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
+<|im_start|>user
+hello<|im_end|>
+<|im_start|>assistant
+
+# Substantive ChatML math.
+<|im_start|>system
+You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
+<|im_start|>user
+What is 2+2?<|im_end|>
+<|im_start|>assistant
+
+# 4-token reference used by .auto/measure.sh (expected argmax=504 "The").
+<|im_start|>assistant
+
+# Plain "hello" without template (tokenizer edge: leading space).
+hello
+
+# Leading-space " hello" (PrependSpace candidate).
+ hello
