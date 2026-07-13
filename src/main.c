@@ -169,6 +169,177 @@ static void build_prompt(const char* user_text, char* out, int max_out) {
         user_text);
 }
 
+// ----------------------------------------------------------------------------
+// Heavy mode — think → answer → verify(gate). One forward_load for all passes.
+// ----------------------------------------------------------------------------
+#define HEAVY_PROMPT_MAX 12288
+#define HEAVY_OUT_MAX    8192
+#define HEAVY_IDS_MAX    1536
+
+static const char HEAVY_SYS_THINK[] =
+    "You are a careful reasoner. Write step-by-step notes inside "
+    "<think>...</think> only. Focus on what the user asked. End with </think>.";
+
+static const char HEAVY_SYS_ANSWER[] =
+    "Answer the user using the notes. Be direct and correct. No <think> tags.";
+
+static const char HEAVY_SYS_VERIFY[] =
+    "Check the draft answer against the question. Reply with exactly one line: "
+    "VERIFIED: <short reason> or REJECT: <what is wrong>.";
+
+static const char HEAVY_SYS_REANSWER[] =
+    "The draft was rejected. Write a corrected final answer only. No tags.";
+
+/* gen_once: run one prefill+decode pass.
+   - prompt: full ChatML string (NUL-terminated)
+   - max_new: token budget
+   - stop_sub: if non-NULL, halt once decoded text contains it
+   - out_buf: NUL-terminated decoded text (capped out_max-1)
+   - stream: if 1, fwrite decode bytes as they arrive
+   Returns tokens generated, or -1 on error. */
+static int gen_once(forward_ctx* fwd, tokenizer* tok,
+                    const char* prompt, int max_new,
+                    const sample_params* sp,
+                    const char* stop_sub,
+                    char* out_buf, int out_max, int stream) {
+    int ids[HEAVY_IDS_MAX];
+    int n = tokenizer_encode(tok, prompt, ids, HEAVY_IDS_MAX);
+    if (n <= 0) { fprintf(stderr, "heavy: empty prompt encode\n"); return -1; }
+    if (n > 2047) n = 2047;
+
+    int vocab = forward_vocab_size(fwd);
+    float* logits = malloc((size_t)vocab * sizeof(float));
+    int*   gen    = malloc((size_t)max_new * sizeof(int));
+    if (!logits || !gen) { free(logits); free(gen); return -1; }
+
+    forward_reset(fwd);
+    if (forward_prefill(fwd, ids, n, logits) < 0) {
+        free(logits); free(gen); return -1;
+    }
+
+    int pos = n, gen_n = 0, out_len = 0;
+    char dec_buf[512];
+    while (gen_n < max_new) {
+        int next = sample_token(logits, vocab, sp, gen, gen_n);
+        if (next == 1 || next == 2) break;
+        gen[gen_n++] = next;
+        int m = tokenizer_decode(tok, next, dec_buf, sizeof(dec_buf));
+        if (m > 0) {
+            if (stream) { fwrite(dec_buf, 1, m, stdout); fflush(stdout); }
+            if (out_len + m < out_max - 1) {
+                memcpy(out_buf + out_len, dec_buf, m);
+                out_len += m;
+                out_buf[out_len] = '\0';
+                if (stop_sub && strstr(out_buf, stop_sub)) {
+                    out_len = (int)(strstr(out_buf, stop_sub) - out_buf);
+                    out_buf[out_len] = '\0';
+                    break;
+                }
+            }
+        }
+        if (pos < 2047) {
+            if (forward_decode(fwd, next, pos, logits) < 0) break;
+            pos++;
+        } else break;
+    }
+    free(logits); free(gen);
+    return gen_n;
+}
+
+static int do_heavy(const char* path, const char* user_text,
+                    int ans_n, int think_n, int ver_n,
+                    const sample_params* sp) {
+    gguf_ctx ctx;
+    if (gguf_load(path, &ctx) < 0) { fprintf(stderr, "failed to load model\n"); return 1; }
+    tokenizer* tok = NULL;
+    if (tokenizer_load(&tok, &ctx) < 0) {
+        fprintf(stderr, "tokenizer load failed\n"); gguf_free(&ctx); return 1;
+    }
+    forward_ctx* fwd = NULL;
+    if (forward_load(&fwd, &ctx, 2048) < 0) {
+        fprintf(stderr, "forward load failed\n");
+        tokenizer_free(tok); gguf_free(&ctx); return 1;
+    }
+
+    char *prompt = malloc(HEAVY_PROMPT_MAX);
+    char *think_buf = malloc(HEAVY_OUT_MAX);
+    char *ans_buf = malloc(HEAVY_OUT_MAX);
+    char *ver_buf = malloc(HEAVY_OUT_MAX);
+    char *re_buf = malloc(HEAVY_OUT_MAX);
+    if (!prompt || !think_buf || !ans_buf || !ver_buf || !re_buf) {
+        fprintf(stderr, "heavy: alloc failed\n");
+        free(prompt); free(think_buf); free(ans_buf); free(ver_buf); free(re_buf);
+        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx); return 1;
+    }
+
+    clock_t t0 = clock();
+    int t_think=0, t_ans=0, t_ver=0, t_re=0;
+    int re_done = 0;
+
+    /* PASS 1: THINK */
+    think_buf[0] = ans_buf[0] = ver_buf[0] = re_buf[0] = '\0';
+    snprintf(prompt, HEAVY_PROMPT_MAX,
+        "<|im_start|>system\n%s<|im_end|>\n"
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n",
+        HEAVY_SYS_THINK, user_text);
+    printf("=== THINK ===\n"); fflush(stdout);
+    t_think = gen_once(fwd, tok, prompt, think_n, sp, "</think>",
+                       think_buf, HEAVY_OUT_MAX, 1);
+    printf("\n"); fflush(stdout);
+
+    /* PASS 2: ANSWER */
+    snprintf(prompt, HEAVY_PROMPT_MAX,
+        "<|im_start|>system\n%s<|im_end|>\n"
+        "<|im_start|>user\nQuestion: %s\nNotes: %s<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        HEAVY_SYS_ANSWER, user_text, think_buf);
+    printf("=== ANSWER ===\n"); fflush(stdout);
+    t_ans = gen_once(fwd, tok, prompt, ans_n, sp, NULL,
+                     ans_buf, HEAVY_OUT_MAX, 1);
+    printf("\n"); fflush(stdout);
+
+    /* PASS 3: VERIFY (gate) */
+    snprintf(prompt, HEAVY_PROMPT_MAX,
+        "<|im_start|>system\n%s<|im_end|>\n"
+        "<|im_start|>user\nQuestion: %s\nDraft: %s<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        HEAVY_SYS_VERIFY, user_text, ans_buf);
+    printf("=== VERIFY ===\n"); fflush(stdout);
+    t_ver = gen_once(fwd, tok, prompt, ver_n, sp, NULL,
+                     ver_buf, HEAVY_OUT_MAX, 1);
+    printf("\n"); fflush(stdout);
+
+    /* Gate: REJECT → one re-answer (no re-verify). */
+    {
+        const char* p = ver_buf;
+        while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++;
+        if (strncmp(p, "REJECT", 6) == 0) {
+            snprintf(prompt, HEAVY_PROMPT_MAX,
+                "<|im_start|>system\n%s<|im_end|>\n"
+                "<|im_start|>user\nQuestion: %s\nDraft: %s\nCritique: %s<|im_end|>\n"
+                "<|im_start|>assistant\n",
+                HEAVY_SYS_REANSWER, user_text, ans_buf, ver_buf);
+            printf("=== RE-ANSWER ===\n"); fflush(stdout);
+            t_re = gen_once(fwd, tok, prompt, ans_n, sp, NULL,
+                            re_buf, HEAVY_OUT_MAX, 1);
+            printf("\n"); fflush(stdout);
+            re_done = 1;
+        }
+    }
+
+    double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+    int total = (t_think>0?t_think:0) + (t_ans>0?t_ans:0) + (t_ver>0?t_ver:0) + (t_re>0?t_re:0);
+    printf("[heavy: think=%d ans=%d ver=%d %s%d tokens, %.1fs, %.1f tok/s overall]\n",
+           t_think<0?0:t_think, t_ans<0?0:t_ans, t_ver<0?0:t_ver,
+           re_done ? "re=" : "", re_done ? (t_re<0?0:t_re) : 0,
+           secs, total > 0 ? total / secs : 0.0);
+
+    free(prompt); free(think_buf); free(ans_buf); free(ver_buf); free(re_buf);
+    forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
+    return 0;
+}
+
 static int do_generate(const char* path, const char* user_text,
                        int max_new, const sample_params* sp) {
     gguf_ctx ctx;
@@ -399,6 +570,9 @@ static void usage(const char* prog) {
         "  --tok-test <text>    Tokenizer round-trip test.\n"
         "  --logits <prompt>    Print argmax logit for prompt.\n"
         "  --logits-json <p>    Same as --logits, one JSON line (top-10).\n"
+        "  --heavy              Multi-pass: think → answer → verify(gate).\n"
+        "  --heavy-think-n <n>  Think token budget (default 128).\n"
+        "  --heavy-verify-n <n> Verify token budget (default 64).\n"
         "  -h / --help          Show this help.\n",
         prog, prog, prog);
 }
@@ -414,6 +588,7 @@ int main(int argc, char** argv) {
     int web_port = 8080;
     const char* prompt = NULL;
     int n_tokens = 200;
+    int heavy = 0, heavy_think_n = 128, heavy_verify_n = 64;
     sample_params sp = {0.3f, 0.0f, 5, 1.1f, 0};
 
     for (int i = 1; i < argc; i++) {
@@ -428,6 +603,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) sp.top_p = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) sp.top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) sp.rep_penalty = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--heavy") == 0) heavy = 1;
+        else if (strcmp(argv[i], "--heavy-think-n") == 0 && i + 1 < argc) heavy_think_n = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--heavy-verify-n") == 0 && i + 1 < argc) heavy_verify_n = atoi(argv[++i]);
         else if (strcmp(argv[i], "--tui") == 0) do_tui = 1;
         else if (strcmp(argv[i], "--web") == 0) do_web = 1;
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) web_port = atoi(argv[++i]);
@@ -522,7 +700,11 @@ int main(int argc, char** argv) {
     }
 
     if (prompt) {
-        rc = do_generate(model_path, prompt, n_tokens, &sp);
+        if (heavy) {
+            rc = do_heavy(model_path, prompt, n_tokens, heavy_think_n, heavy_verify_n, &sp);
+        } else {
+            rc = do_generate(model_path, prompt, n_tokens, &sp);
+        }
         goto cleanup;
     }
 
