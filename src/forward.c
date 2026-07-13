@@ -78,10 +78,9 @@ struct forward_ctx {
 
 /* Fast exp via Schraudolph bit trick: ~10x faster than libm expf.
    Error: ~1.7% max, acceptable for sigmoid gating and attention softmax. */
+/* libm expf — Schraudolph distorts attention softmax across 30 layers. */
 static inline float fast_expf(float x) {
-    union { float f; int32_t i; } u;
-    u.i = (int32_t)(12102203.1875f * x + 1065353216.0f);
-    return u.f;
+    return expf(x);
 }
 /* libm sigmoid — Schraudolph fails for |x|>10 which FFN activations hit. */
 static inline float fast_sigmoid(float x) {
@@ -381,7 +380,6 @@ static void matmul_f32(float* y, const float* x, const float* W,
 }
 
 // Matmul with F16 weights: y[o] = sum_i f16_to_f32(W[o*in_dim+i]) * x[i]
-// Keeps weights in F16 storage, converts on-the-fly matching training precision.
 static void matmul(float* y, const float* x, const uint16_t* W,
                    int in_dim, int out_dim) {
 #ifdef __ARM_NEON
@@ -524,9 +522,10 @@ static void matmul_q8_2batch(float* y0, float* y1,
 #endif
 }
 
-// GPT-NeoX RoPE: pair (i, i+hd/2) for each head independently
-/* rope_neox using precomputed cos/sin table (faster than powf+cosf+sinf per step) */
-static void rope_neox_table(float* v, int pos, int n_heads, int head_dim,
+/* LLaMA RoPE (interleaved pairs): rotate (2i, 2i+1) per head.
+   SmolLM2 GGUF is arch=llama — NOT GPT-NeoX half-split (i, i+hd/2).
+   Wrong layout flips Hello/I ranking on ChatML prompts. */
+static void rope_llama_table(float* v, int pos, int n_heads, int head_dim,
                              const float* rope_cos, const float* rope_sin) {
     int half = head_dim / 2;
     const float* cv = rope_cos + (size_t)pos * half;
@@ -534,26 +533,9 @@ static void rope_neox_table(float* v, int pos, int n_heads, int head_dim,
     for (int h = 0; h < n_heads; h++) {
         float* vh = v + (size_t)h * head_dim;
         for (int i = 0; i < half; i++) {
-            float a = vh[i], b = vh[i + half];
-            vh[i]        = a * cv[i] - b * sv[i];
-            vh[i + half] = a * sv[i] + b * cv[i];
-        }
-    }
-}
-
-/* Legacy: used during load if needed */
-static void rope_neox(float* v, int pos, int n_heads, int head_dim, float theta) {
-    int half = head_dim / 2;
-    for (int h = 0; h < n_heads; h++) {
-        float* vh = v + (size_t)h * head_dim;
-        for (int i = 0; i < half; i++) {
-            float freq  = 1.0f / powf(theta, (2.0f * (float)i) / (float)head_dim);
-            float angle = (float)pos * freq;
-            float c = cosf(angle);
-            float s = sinf(angle);
-            float a = vh[i], b = vh[i + half];
-            vh[i]        = a * c - b * s;
-            vh[i + half] = a * s + b * c;
+            float a = vh[2 * i], b = vh[2 * i + 1];
+            vh[2 * i]     = a * cv[i] - b * sv[i];
+            vh[2 * i + 1] = a * sv[i] + b * cv[i];
         }
     }
 }
@@ -693,7 +675,7 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
             memcpy(f->w_token_embd_f16, src, s_embd * sizeof(uint16_t));
             for (size_t i = 0; i < s_embd; i++) f->w_token_embd[i] = f16_to_f32(src[i]);
             /* Also quantize token_embd to INT8 for fast logit projection */
-            quantize_f16_rows_to_q8_perrow(f->q8_embd, f->q8_sembd, src, f->vocab_size, f->dim);
+            /* skip q8 embd */
         }
     }
     rc |= load_tensor_f32(g, "output_norm.weight", f->w_norm,       (size_t)f->dim);
@@ -715,27 +697,27 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
         rc |= load_tensor_f32(g, name, f->w_attn_norm + off_n, (size_t)f->dim);
         snprintf(name, sizeof(name), "blk.%d.attn_q.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_q        + off_q,  (size_t)f->dim    * f->dim);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_q+off_q, f->q8_sq+off_q_sc, f->w_q+off_q, f->dim, f->dim);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
         snprintf(name, sizeof(name), "blk.%d.attn_k.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_k        + off_kv, (size_t)f->kv_dim * f->dim);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_k+off_kv, f->q8_sk+off_kv_sc, f->w_k+off_kv, f->kv_dim, f->dim);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
         snprintf(name, sizeof(name), "blk.%d.attn_v.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_v        + off_kv, (size_t)f->kv_dim * f->dim);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_v+off_kv, f->q8_sv+off_kv_sc, f->w_v+off_kv, f->kv_dim, f->dim);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight",L);
         rc |= load_tensor_f16(g, name, f->w_o        + off_q,  (size_t)f->dim    * f->dim);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_o+off_q, f->q8_so+off_q_sc, f->w_o+off_q, f->dim, f->dim);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight",   L);
         rc |= load_tensor_f32(g, name, f->w_ffn_norm + off_n,  (size_t)f->dim);
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight",   L);
         rc |= load_tensor_f16(g, name, f->w_gate     + off_gu, (size_t)f->ffn_hidden * f->dim);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_gate+off_gu, f->q8_sgate+off_gu_sc, f->w_gate+off_gu, f->ffn_hidden, f->dim);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight",     L);
         rc |= load_tensor_f16(g, name, f->w_up       + off_gu, (size_t)f->ffn_hidden * f->dim);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_up+off_gu, f->q8_sup+off_gu_sc, f->w_up+off_gu, f->ffn_hidden, f->dim);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
         snprintf(name, sizeof(name), "blk.%d.ffn_down.weight",   L);
         rc |= load_tensor_f16(g, name, f->w_down     + off_d,  (size_t)f->dim    * f->ffn_hidden);
-        if (!rc) quantize_f16_rows_to_q8_perrow(f->q8_down+off_d, f->q8_sdown+off_dn_sc, f->w_down+off_d, f->dim, f->ffn_hidden);
+        /* skip dead q8 quant */ if (0) quantize_f16_rows_to_q8_perrow(0,0,0,0,0);
     }
 
     if (rc != 0) {
@@ -817,8 +799,8 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             matmul(f->q, f->x_norm, wq, dim, dim);
             matmul(f->k, f->x_norm, wk, dim, kvdim);
             matmul(f->v, f->x_norm, wv, dim, kvdim);
-            rope_neox_table(f->q, t, nh,  hd, f->rope_cos, f->rope_sin);
-            rope_neox_table(f->k, t, nkv, hd, f->rope_cos, f->rope_sin);
+            rope_llama_table(f->q, t, nh,  hd, f->rope_cos, f->rope_sin);
+            rope_llama_table(f->k, t, nkv, hd, f->rope_cos, f->rope_sin);
             memcpy(kc + (size_t)t * kvdim, f->k, kvdim * sizeof(float));
             memcpy(vc + (size_t)t * kvdim, f->v, kvdim * sizeof(float));
 
@@ -873,7 +855,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
     rmsnorm(f->x_norm,
             f->x_buf + (size_t)(n_tokens - 1) * dim,
             f->w_norm, dim, eps);
-    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
+    matmul_f32(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
     return 0;
 }
 
@@ -926,8 +908,8 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
         matmul(f->q, f->x_norm, wq, dim, dim);
         matmul(f->k, f->x_norm, wk, dim, kvdim);
         matmul(f->v, f->x_norm, wv, dim, kvdim);
-        rope_neox_table(f->q, pos, nh,  hd, f->rope_cos, f->rope_sin);
-        rope_neox_table(f->k, pos, nkv, hd, f->rope_cos, f->rope_sin);
+        rope_llama_table(f->q, pos, nh,  hd, f->rope_cos, f->rope_sin);
+        rope_llama_table(f->k, pos, nkv, hd, f->rope_cos, f->rope_sin);
         memcpy(kc + (size_t)pos * kvdim, f->k, kvdim * sizeof(float));
         memcpy(vc + (size_t)pos * kvdim, f->v, kvdim * sizeof(float));
 
@@ -1004,7 +986,7 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     }
 
     rmsnorm(f->x_norm, x, f->w_norm, dim, eps);
-    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
+    matmul_f32(logits_out, f->x_norm, f->w_token_embd, dim, vocab);
     return 0;
 }
 
