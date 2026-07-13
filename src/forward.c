@@ -83,8 +83,9 @@ static inline float fast_expf(float x) {
     u.i = (int32_t)(12102203.1875f * x + 1065353216.0f);
     return u.f;
 }
+/* libm sigmoid — Schraudolph fails for |x|>10 which FFN activations hit. */
 static inline float fast_sigmoid(float x) {
-    return 1.0f / (1.0f + fast_expf(-x));
+    return 1.0f / (1.0f + expf(-x));
 }
 
 /* Quantize a float row to int8 per-tensor: single amax scale for the whole vector.
