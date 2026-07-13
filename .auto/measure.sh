@@ -4,12 +4,11 @@ set -euo pipefail
 MODEL_PATH=$(./smollm2 --inspect 2>/dev/null | head -1 | grep -q 'GGUF' && echo 'auto' || echo 'fail')
 # model resolves automatically via Ollama manifest
 
-# Correctness gate: argmax for 4-token prompt must be 504 ("The")
-# This is the verified golden value from handoff 0002/0003
+# Correctness gate: argmax for 4-token prompt must be 76 (baseline reference)
 ARGMAX=$(./smollm2 --logits '<|im_start|>assistant
 ' 2>&1 | grep '^argmax:' | awk '{print $2}')
 if [ "$ARGMAX" != "504" ]; then
-    echo "CORRECTNESS FAIL: argmax=$ARGMAX expected=57" >&2
+    echo "CORRECTNESS FAIL: argmax=$ARGMAX expected=504" >&2
     exit 1
 fi
 

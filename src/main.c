@@ -161,6 +161,9 @@ static int do_inspect(const char* path) {
 
 static void build_prompt(const char* user_text, char* out, int max_out) {
     snprintf(out, max_out,
+        "<|im_start|>system\n"
+        "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
+        "<|im_end|>\n"
         "<|im_start|>user\n%s<|im_end|>\n"
         "<|im_start|>assistant\n",
         user_text);
@@ -215,7 +218,7 @@ static int do_generate(const char* path, const char* user_text,
     char dec_buf[512];
     while (gen_n < max_new) {
         int next = sample_token(logits, vocab, sp, gen, gen_n);
-        if (next == 2) break;  /* <|im_end|> */
+        if (next == 1 || next == 2) break;  /* <|im_end|> */
         gen[gen_n++] = next;
         int m = tokenizer_decode(tok, next, dec_buf, sizeof(dec_buf));
         fwrite(dec_buf, 1, m, stdout);

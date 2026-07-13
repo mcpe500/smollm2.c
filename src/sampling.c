@@ -28,17 +28,8 @@ int sample_token(float* logits, int vocab, const sample_params* p,
                  const int* history, int hist_len) {
     if (!logits || vocab <= 0 || !p) return 0;
 
-    /* Suppress im_start(1) and im_end(2) — matches Ollama's stop tokens.
-       Without this, the model emits <|im_end|> immediately at position 0
-       when the system prompt makes it want to end the turn (mathematically
-       verified by Python F64 reference — not a precision bug). */
-    if (vocab > 1) logits[1] = -1e30f;
-    if (vocab > 2) logits[2] = -1e30f;
-
-    /* Skip rep_penalty when temperature <= 0 (pure greedy).
-       llama.cpp's greedy does NOT apply penalty; we want pure argmax. */
-    if (p->rep_penalty > 1.0f && p->temperature > 0.0f &&
-        history && hist_len > 0) {
+    /* Apply rep_penalty for both greedy and sampled paths. */
+    if (p->rep_penalty > 1.0f && history && hist_len > 0) {
         for (int i = 0; i < hist_len; i++) {
             int t = history[i];
             if (t >= 0 && t < vocab) {
@@ -73,11 +64,8 @@ int sample_token(float* logits, int vocab, const sample_params* p,
     float inv_sum = 1.0f / sum;
     for (int v = 0; v < vocab; v++) logits[v] *= inv_sum;
 
-    /* Top-k: zero out all but top_k entries. Preserve im_end (token 2) so the
-       model can always stop naturally even when im_end falls outside top-k. */
+    /* Top-k: zero out all but top_k entries. */
     if (p->top_k > 0 && p->top_k < vocab) {
-        float eos_prob = (vocab > 2) ? logits[2] : 0.0f;
-        if (vocab > 2) logits[2] = 0.0f;
         float kth = 0.0f;
         float seen[64]; int ns = 0;
         int ks = (p->top_k < 64) ? p->top_k : 64;
@@ -97,10 +85,6 @@ int sample_token(float* logits, int vocab, const sample_params* p,
         for (int v = 0; v < vocab; v++) {
             if (logits[v] < kth) logits[v] = 0.0f;
             sum += logits[v];
-        }
-        if (vocab > 2 && eos_prob > kth) {
-            logits[2] = eos_prob;
-            sum += eos_prob;
         }
         if (sum > 0.0f) { inv_sum = 1.0f/sum; for (int v=0;v<vocab;v++) logits[v]*=inv_sum; }
     }

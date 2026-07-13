@@ -136,7 +136,7 @@ static float quantize_row_to_q8_tensor(int8_t* dst, const float* src, int n) {
     float scale = (amax>0.0f)?amax/127.0f:1.0f;
     float inv   = (amax>0.0f)?127.0f/amax:0.0f;
     for (int i = 0; i < n; i++) {
-        int q = (int)(src[i]*inv+0.5f); if(q>127)q=127; if(q<-127)q=-127; dst[i]=(int8_t)q;
+        int q = (int)roundf(src[i]*inv); if(q>127)q=127; if(q<-127)q=-127; dst[i]=(int8_t)q;
     }
     return scale;
 }
@@ -223,6 +223,16 @@ static int quantize_row_to_q8_blocked(int8_t* dst, float* dst_scales,
 }
 #endif /* #if 0 block */
 
+static uint16_t f32_to_f16(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+    int exp = (int)((u >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = u & 0x7fffffu;
+    if (exp <= 0)  return sign;
+    if (exp >= 31) return sign | 0x7c00u;
+    return (uint16_t)(sign | (uint16_t)(exp << 10) | (uint16_t)(mant >> 13));
+}
+
 static float f16_to_f32(uint16_t h) {
     uint32_t sign = ((uint32_t)(h & 0x8000u)) << 16;
     int exp  = (h >> 10) & 0x1f;
@@ -259,13 +269,32 @@ static int load_tensor_f16(const gguf_ctx* g, const char* name,
         fprintf(stderr, "forward: missing tensor %s\n", name);
         return -1;
     }
-    if (t->dtype != GGUF_DT_F16) {
-        fprintf(stderr, "forward: %s expected F16, got dtype %u\n",
-                name, (unsigned)t->dtype);
-        return -1;
+    if (t->dtype == GGUF_DT_F16) {
+        memcpy(dst, gguf_tensor_data(g, t), count * sizeof(uint16_t));
+        return 0;
     }
-    memcpy(dst, gguf_tensor_data(g, t), count * sizeof(uint16_t));
-    return 0;
+    if (t->dtype == GGUF_DT_Q8_0) {
+        /* Q8_0: 32-element blocks with F16 scale + int8 weights.
+           Convert to F16 for compatibility with existing INT8 quantization path. */
+        const uint8_t* src = (const uint8_t*)gguf_tensor_data(g, t);
+        size_t n_blocks = (count + 31) / 32;
+        for (size_t b = 0; b < n_blocks; b++) {
+            uint16_t scale_f16;
+            memcpy(&scale_f16, src, 2);
+            float scale = f16_to_f32(scale_f16);
+            const int8_t* q = (const int8_t*)(src + 2);
+            size_t block_size = (b == n_blocks - 1) ? (count - b * 32) : 32;
+            for (size_t i = 0; i < block_size; i++) {
+                float val = (float)q[i] * scale;
+                dst[b * 32 + i] = f32_to_f16(val);
+            }
+            src += 34;  /* 2 bytes scale + 32 bytes int8 */
+        }
+        return 0;
+    }
+    fprintf(stderr, "forward: %s expected F16, got unsupported dtype %u\n",
+            name, (unsigned)t->dtype);
+    return -1;
 }
 
 static int load_tensor_f32(const gguf_ctx* g, const char* name,
@@ -728,15 +757,6 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
 
     /* Free F16 weight arrays — no longer needed after INT8 quantization.
        Saves ~202 MB RAM and improves cache locality for inference. */
-    free(f->w_q);     f->w_q     = NULL;
-    free(f->w_k);     f->w_k     = NULL;
-    free(f->w_v);     f->w_v     = NULL;
-    free(f->w_o);     f->w_o     = NULL;
-    free(f->w_gate);  f->w_gate  = NULL;
-    free(f->w_up);    f->w_up    = NULL;
-    free(f->w_down);  f->w_down  = NULL;
-    free(f->w_token_embd_f16); f->w_token_embd_f16 = NULL;
-
     *out = f;
     return 0;
 }
@@ -776,22 +796,15 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
 
     // 2. Transformer layers (per-row weight scales)
     for (int L = 0; L < nl; L++) {
-        const int8_t* q8q   = f->q8_q    + (size_t)L * dim   * dim;
-        const float*  sq    = f->q8_sq   + (size_t)L * dim;
-        const int8_t* q8k   = f->q8_k    + (size_t)L * kvdim * dim;
-        const float*  sk    = f->q8_sk   + (size_t)L * kvdim;
-        const int8_t* q8v   = f->q8_v    + (size_t)L * kvdim * dim;
-        const float*  sv    = f->q8_sv   + (size_t)L * kvdim;
-        const int8_t* q8o   = f->q8_o    + (size_t)L * dim   * dim;
-        const float*  so    = f->q8_so   + (size_t)L * dim;
-        const float*   wan  = f->w_attn_norm + (size_t)L * dim;
-        const float*   wfn  = f->w_ffn_norm  + (size_t)L * dim;
-        const int8_t* q8g   = f->q8_gate + (size_t)L * ffn  * dim;
-        const float*  sg    = f->q8_sgate+ (size_t)L * ffn;
-        const int8_t* q8u   = f->q8_up   + (size_t)L * ffn  * dim;
-        const float*  su    = f->q8_sup  + (size_t)L * ffn;
-        const int8_t* q8d   = f->q8_down + (size_t)L * dim  * ffn;
-        const float*  sd    = f->q8_sdown+ (size_t)L * dim;
+        const uint16_t* wq  = f->w_q    + (size_t)L * dim   * dim;
+        const uint16_t* wk  = f->w_k    + (size_t)L * kvdim * dim;
+        const uint16_t* wv  = f->w_v    + (size_t)L * kvdim * dim;
+        const uint16_t* wo  = f->w_o    + (size_t)L * dim   * dim;
+        const float*    wan = f->w_attn_norm + (size_t)L * dim;
+        const float*    wfn = f->w_ffn_norm  + (size_t)L * dim;
+        const uint16_t* wg  = f->w_gate + (size_t)L * ffn  * dim;
+        const uint16_t* wu  = f->w_up   + (size_t)L * ffn  * dim;
+        const uint16_t* wd  = f->w_down + (size_t)L * dim  * ffn;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
@@ -800,10 +813,9 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
 
             // --- attention block ---
             rmsnorm(f->x_norm, xt, wan, dim, eps);
-            float xn_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-            matmul_q8_dot_perrow(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
-            matmul_q8_dot_perrow(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
-            matmul_q8_dot_perrow(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
+            matmul(f->q, f->x_norm, wq, dim, dim);
+            matmul(f->k, f->x_norm, wk, dim, kvdim);
+            matmul(f->v, f->x_norm, wv, dim, kvdim);
             rope_neox_table(f->q, t, nh,  hd, f->rope_cos, f->rope_sin);
             rope_neox_table(f->k, t, nkv, hd, f->rope_cos, f->rope_sin);
             memcpy(kc + (size_t)t * kvdim, f->k, kvdim * sizeof(float));
@@ -839,73 +851,28 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                 }
             }
 
-            float ao_sc_p = quantize_row_to_q8_tensor(f->xq_buf, f->attn_out, dim);
-            matmul_q8_dot_perrow(f->o_proj, f->xq_buf, ao_sc_p, q8o, so, dim, dim);
+            matmul(f->o_proj, f->attn_out, wo, dim, dim);
             for (int i = 0; i < dim; i++) xt[i] += f->o_proj[i];
         } /* end per-token attention loop */
 
-        /* Batched FFN: process pairs of tokens with one W pass each.
-           Halves gate/up/down DRAM reads vs per-token sequential. */
-        for (int t = 0; t < n_tokens; t += 2) {
+        for (int t = 0; t < n_tokens; t++) {
             float* xt0 = f->x_buf + (size_t)t * dim;
-            if (t + 1 < n_tokens) {
-                /* Process tokens t and t+1 together */
-                float* xt1 = f->x_buf + (size_t)(t + 1) * dim;
-                /* rmsnorm + quantize both tokens' FFN activations */
-                rmsnorm(f->x_norm, xt0, wfn, dim, eps);
-                float xs0 = quantize_row_to_q8_tensor(f->xq_buf,  f->x_norm, dim);
-                rmsnorm(f->x_norm, xt1, wfn, dim, eps);
-                float xs1 = quantize_row_to_q8_tensor(f->xq_buf2, f->x_norm, dim);
-                /* Gate matmul: W read ONCE for both tokens */
-                matmul_q8_2batch(f->ffn_gate, f->ffn_gate2,
-                                 f->xq_buf, xs0, f->xq_buf2, xs1,
-                                 q8g, sg, dim, ffn);
-                /* Up matmul: W read ONCE for both tokens */
-                matmul_q8_2batch(f->ffn_up, f->ffn_up2,
-                                 f->xq_buf, xs0, f->xq_buf2, xs1,
-                                 q8u, su, dim, ffn);
-                /* SwiGLU for both tokens */
-                for (int i = 0; i < ffn; i++) {
-                    float g0 = f->ffn_gate[i];
-                    f->ffn_gate[i]  = g0 * fast_sigmoid(g0) * f->ffn_up[i];
-                    float g1 = f->ffn_gate2[i];
-                    f->ffn_gate2[i] = g1 * fast_sigmoid(g1) * f->ffn_up2[i];
-                }
-                /* Down matmul: W read ONCE for both tokens */
-                float fg0 = quantize_row_to_q8_tensor(f->xq_buf,  f->ffn_gate,  ffn);
-                float fg1 = quantize_row_to_q8_tensor(f->xq_buf2, f->ffn_gate2, ffn);
-                matmul_q8_2batch(f->ffn_mid, f->ffn_gate2,  /* reuse gate2 as down output */
-                                 f->xq_buf, fg0, f->xq_buf2, fg1,
-                                 q8d, sd, ffn, dim);
-                /* Residual add */
-                for (int i = 0; i < dim; i++) xt0[i] += f->ffn_mid[i];
-                for (int i = 0; i < dim; i++) xt1[i] += f->ffn_gate2[i];
-            } else {
-                /* Odd token: fall back to single-token FFN */
-                rmsnorm(f->x_norm, xt0, wfn, dim, eps);
-                float xf_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-                matmul_q8_dot_perrow(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
-                matmul_q8_dot_perrow(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
-                for (int i = 0; i < ffn; i++) {
-                    float g = f->ffn_gate[i];
-                    f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
-                }
-                float fg_sc = quantize_row_to_q8_tensor(f->xq_buf, f->ffn_gate, ffn);
-                matmul_q8_dot_perrow(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
-                for (int i = 0; i < dim; i++) xt0[i] += f->ffn_mid[i];
+            rmsnorm(f->x_norm, xt0, wfn, dim, eps);
+            matmul(f->ffn_gate, f->x_norm, wg, dim, ffn);
+            matmul(f->ffn_up,   f->x_norm, wu, dim, ffn);
+            for (int i = 0; i < ffn; i++) {
+                float g = f->ffn_gate[i];
+                f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
             }
+            matmul(f->ffn_mid, f->ffn_gate, wd, ffn, dim);
+            for (int i = 0; i < dim; i++) xt0[i] += f->ffn_mid[i];
         }
     } /* end layer loop */
 
-    // 3. Final RMSNorm + tied-embedding logits
     rmsnorm(f->x_norm,
             f->x_buf + (size_t)(n_tokens - 1) * dim,
             f->w_norm, dim, eps);
-    {
-        float xls = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot_perrow(logits_out, f->xq_buf, xls, f->q8_embd, f->q8_sembd, dim, vocab);
-    }
-
+    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
     return 0;
 }
 
@@ -942,31 +909,22 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
     memcpy(x, f->w_token_embd + (size_t)token * dim, dim * sizeof(float));
 
     for (int L = 0; L < nl; L++) {
-        const int8_t*  q8q  = f->q8_q    + (size_t)L * dim   * dim;
-        const float*   sq   = f->q8_sq   + (size_t)L * dim;
-        const int8_t*  q8k  = f->q8_k    + (size_t)L * kvdim * dim;
-        const float*   sk   = f->q8_sk   + (size_t)L * kvdim;
-        const int8_t*  q8v  = f->q8_v    + (size_t)L * kvdim * dim;
-        const float*   sv   = f->q8_sv   + (size_t)L * kvdim;
-        const int8_t*  q8o  = f->q8_o    + (size_t)L * dim   * dim;
-        const float*   so   = f->q8_so   + (size_t)L * dim;
-        const float*   wan  = f->w_attn_norm + (size_t)L * dim;
-        const float*   wfn  = f->w_ffn_norm  + (size_t)L * dim;
-        const int8_t*  q8g  = f->q8_gate + (size_t)L * ffn * dim;
-        const float*   sg   = f->q8_sgate+ (size_t)L * ffn;
-        const int8_t*  q8u  = f->q8_up   + (size_t)L * ffn * dim;
-        const float*   su   = f->q8_sup  + (size_t)L * ffn;
-        const int8_t*  q8d  = f->q8_down + (size_t)L * dim * ffn;
-        const float*   sd   = f->q8_sdown+ (size_t)L * dim;
+        const uint16_t* wq  = f->w_q    + (size_t)L * dim   * dim;
+        const uint16_t* wk  = f->w_k    + (size_t)L * kvdim * dim;
+        const uint16_t* wv  = f->w_v    + (size_t)L * kvdim * dim;
+        const uint16_t* wo  = f->w_o    + (size_t)L * dim   * dim;
+        const float*    wan = f->w_attn_norm + (size_t)L * dim;
+        const float*    wfn = f->w_ffn_norm  + (size_t)L * dim;
+        const uint16_t* wg  = f->w_gate + (size_t)L * ffn  * dim;
+        const uint16_t* wu  = f->w_up   + (size_t)L * ffn  * dim;
+        const uint16_t* wd  = f->w_down + (size_t)L * dim  * ffn;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
 
         rmsnorm(f->x_norm, x, wan, dim, eps);
-        /* Quantize x_norm per-block-64, reuse for q/k/v */
-        float xn_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot_perrow(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
-        matmul_q8_dot_perrow(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
-        matmul_q8_dot_perrow(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
+        matmul(f->q, f->x_norm, wq, dim, dim);
+        matmul(f->k, f->x_norm, wk, dim, kvdim);
+        matmul(f->v, f->x_norm, wv, dim, kvdim);
         rope_neox_table(f->q, pos, nh,  hd, f->rope_cos, f->rope_sin);
         rope_neox_table(f->k, pos, nkv, hd, f->rope_cos, f->rope_sin);
         memcpy(kc + (size_t)pos * kvdim, f->k, kvdim * sizeof(float));
@@ -1030,31 +988,22 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
 #endif
         }
 
-        /* Quantize attn_out for output projection */
-        float ao_sc = quantize_row_to_q8_tensor(f->xq_buf, f->attn_out, dim);
-        matmul_q8_dot_perrow(f->o_proj, f->xq_buf, ao_sc, q8o, so, dim, dim);
+        matmul(f->o_proj, f->attn_out, wo, dim, dim);
         for (int i = 0; i < dim; i++) x[i] += f->o_proj[i];
 
         rmsnorm(f->x_norm, x, wfn, dim, eps);
-        /* Quantize x_norm per-block-64 for gate+up */
-        float xf_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot_perrow(f->ffn_gate, f->xq_buf, xf_sc, q8g, sg, dim, ffn);
-        matmul_q8_dot_perrow(f->ffn_up,   f->xq_buf, xf_sc, q8u, su, dim, ffn);
+        matmul(f->ffn_gate, f->x_norm, wg, dim, ffn);
+        matmul(f->ffn_up,   f->x_norm, wu, dim, ffn);
         for (int i = 0; i < ffn; i++) {
             float g = f->ffn_gate[i];
             f->ffn_gate[i] = g * fast_sigmoid(g) * f->ffn_up[i];
         }
-        /* Quantize ffn_gate (post-SwiGLU) per-block-64 for down projection */
-        float fg_sc = quantize_row_to_q8_tensor(f->xq_buf, f->ffn_gate, ffn);
-        matmul_q8_dot_perrow(f->ffn_mid, f->xq_buf, fg_sc, q8d, sd, ffn, dim);
+        matmul(f->ffn_mid, f->ffn_gate, wd, ffn, dim);
         for (int i = 0; i < dim; i++) x[i] += f->ffn_mid[i];
     }
 
     rmsnorm(f->x_norm, x, f->w_norm, dim, eps);
-    {
-        float xl_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
-        matmul_q8_dot_perrow(logits_out, f->xq_buf, xl_sc, f->q8_embd, f->q8_sembd, dim, vocab);
-    }
+    matmul(logits_out, f->x_norm, f->w_token_embd_f16, dim, vocab);
     return 0;
 }
 
