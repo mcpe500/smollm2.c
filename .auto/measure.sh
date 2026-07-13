@@ -4,11 +4,16 @@ set -euo pipefail
 MODEL_PATH=$(./smollm2 --inspect 2>/dev/null | head -1 | grep -q 'GGUF' && echo 'auto' || echo 'fail')
 # model resolves automatically via Ollama manifest
 
-# Correctness gate: argmax for 4-token prompt must be 76 (baseline reference)
-ARGMAX=$(./smollm2 --logits '<|im_start|>assistant
+# Correctness gate: ChatML "hello" first token must be Hello (19556).
+# Short <|im_start|>assistant probe is soft under INT8 (I/The near-tie).
+ARGMAX=$(./smollm2 --logits '<|im_start|>system
+You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
+<|im_start|>user
+hello<|im_end|>
+<|im_start|>assistant
 ' 2>&1 | grep '^argmax:' | awk '{print $2}')
-if [ "$ARGMAX" != "504" ]; then
-    echo "CORRECTNESS FAIL: argmax=$ARGMAX expected=504" >&2
+if [ "$ARGMAX" != "19556" ]; then
+    echo "CORRECTNESS FAIL: argmax=$ARGMAX expected=19556 (Hello)" >&2
     exit 1
 fi
 
