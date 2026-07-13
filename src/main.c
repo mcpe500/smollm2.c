@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <ctype.h>
 
 // ----------------------------------------------------------------------------
 // Default model resolution: read Ollama manifest, find model layer digest,
@@ -191,17 +192,18 @@ static const char HEAVY_SYS_REANSWER[] =
     "The draft was rejected. Write a corrected final answer only. No tags.";
 
 /* gen_once: run one prefill+decode pass.
-   - prompt: full ChatML string (NUL-terminated)
-   - max_new: token budget
    - stop_sub: if non-NULL, halt once decoded text contains it
-   - out_buf: NUL-terminated decoded text (capped out_max-1)
-   - stream: if 1, fwrite decode bytes as they arrive
+   - hit_stop: optional; set 1 if stop_sub was hit (before strip)
+   - out_buf: NUL-term decoded text (stop_sub stripped if hit)
    Returns tokens generated, or -1 on error. */
 static int gen_once(forward_ctx* fwd, tokenizer* tok,
                     const char* prompt, int max_new,
                     const sample_params* sp,
                     const char* stop_sub,
-                    char* out_buf, int out_max, int stream) {
+                    char* out_buf, int out_max, int stream,
+                    int* hit_stop) {
+    if (hit_stop) *hit_stop = 0;
+    if (out_buf && out_max > 0) out_buf[0] = '\0';
     int ids[HEAVY_IDS_MAX];
     int n = tokenizer_encode(tok, prompt, ids, HEAVY_IDS_MAX);
     if (n <= 0) { fprintf(stderr, "heavy: empty prompt encode\n"); return -1; }
@@ -231,6 +233,7 @@ static int gen_once(forward_ctx* fwd, tokenizer* tok,
                 out_len += m;
                 out_buf[out_len] = '\0';
                 if (stop_sub && strstr(out_buf, stop_sub)) {
+                    if (hit_stop) *hit_stop = 1;
                     out_len = (int)(strstr(out_buf, stop_sub) - out_buf);
                     out_buf[out_len] = '\0';
                     break;
@@ -244,6 +247,21 @@ static int gen_once(forward_ctx* fwd, tokenizer* tok,
     }
     free(logits); free(gen);
     return gen_n;
+}
+
+/* 1 if VERIFIED/REJECT appears in first 40 chars (after leading space). */
+static int gate_decision(const char* ver_buf) {
+    for (int i = 0; i < 40 && ver_buf && ver_buf[i]; i++) {
+        if (isspace((unsigned char)ver_buf[i])) continue;
+        if (strncmp(ver_buf + i, "VERIFIED", 8) == 0) return 1;
+        if (strncmp(ver_buf + i, "REJECT", 6) == 0) return -1;
+        break; /* first non-space token is neither */
+    }
+    return 0;
+}
+
+static int verify_stamp_present(const char* buf) {
+    return gate_decision(buf) != 0;
 }
 
 static int do_heavy(const char* path, const char* user_text,
@@ -274,9 +292,10 @@ static int do_heavy(const char* path, const char* user_text,
 
     clock_t t0 = clock();
     int t_think=0, t_ans=0, t_ver=0, t_re=0;
-    int re_done = 0;
+    int re_done = 0, think_degraded = 0, ver_degraded = 0;
+    int hit = 0;
 
-    /* PASS 1: THINK */
+    /* PASS 1: THINK (retry once with half budget if no </think>) */
     think_buf[0] = ans_buf[0] = ver_buf[0] = re_buf[0] = '\0';
     snprintf(prompt, HEAVY_PROMPT_MAX,
         "<|im_start|>system\n%s<|im_end|>\n"
@@ -285,8 +304,22 @@ static int do_heavy(const char* path, const char* user_text,
         HEAVY_SYS_THINK, user_text);
     printf("=== THINK ===\n"); fflush(stdout);
     t_think = gen_once(fwd, tok, prompt, think_n, sp, "</think>",
-                       think_buf, HEAVY_OUT_MAX, 1);
+                       think_buf, HEAVY_OUT_MAX, 1, &hit);
     printf("\n"); fflush(stdout);
+    if (!hit) {
+        int think_n2 = think_n / 2;
+        if (think_n2 >= 16) {
+            fprintf(stderr, "[think: retry %d tokens, no </think> in first pass]\n", think_n2);
+            printf("=== THINK (retry) ===\n"); fflush(stdout);
+            t_think = gen_once(fwd, tok, prompt, think_n2, sp, "</think>",
+                               think_buf, HEAVY_OUT_MAX, 1, &hit);
+            printf("\n"); fflush(stdout);
+        }
+        if (!hit) {
+            think_degraded = 1;
+            fprintf(stderr, "[think: degraded, no </think> after retry]\n");
+        }
+    }
 
     /* PASS 2: ANSWER */
     snprintf(prompt, HEAVY_PROMPT_MAX,
@@ -296,10 +329,10 @@ static int do_heavy(const char* path, const char* user_text,
         HEAVY_SYS_ANSWER, user_text, think_buf);
     printf("=== ANSWER ===\n"); fflush(stdout);
     t_ans = gen_once(fwd, tok, prompt, ans_n, sp, NULL,
-                     ans_buf, HEAVY_OUT_MAX, 1);
+                     ans_buf, HEAVY_OUT_MAX, 1, NULL);
     printf("\n"); fflush(stdout);
 
-    /* PASS 3: VERIFY (gate) */
+    /* PASS 3: VERIFY (prefix-force retry if no stamp) */
     snprintf(prompt, HEAVY_PROMPT_MAX,
         "<|im_start|>system\n%s<|im_end|>\n"
         "<|im_start|>user\nQuestion: %s\nDraft: %s<|im_end|>\n"
@@ -307,33 +340,52 @@ static int do_heavy(const char* path, const char* user_text,
         HEAVY_SYS_VERIFY, user_text, ans_buf);
     printf("=== VERIFY ===\n"); fflush(stdout);
     t_ver = gen_once(fwd, tok, prompt, ver_n, sp, NULL,
-                     ver_buf, HEAVY_OUT_MAX, 1);
+                     ver_buf, HEAVY_OUT_MAX, 1, NULL);
     printf("\n"); fflush(stdout);
+    if (!verify_stamp_present(ver_buf)) {
+        fprintf(stderr, "[verify: retry with prefix force]\n");
+        snprintf(prompt, HEAVY_PROMPT_MAX,
+            "<|im_start|>system\n%s<|im_end|>\n"
+            "<|im_start|>user\nQuestion: %s\nDraft: %s<|im_end|>\n"
+            "<|im_start|>assistant\nVERIFIED: ",
+            HEAVY_SYS_VERIFY, user_text, ans_buf);
+        printf("=== VERIFY (retry) ===\n"); fflush(stdout);
+        t_ver = gen_once(fwd, tok, prompt, ver_n, sp, NULL,
+                         ver_buf, HEAVY_OUT_MAX, 1, NULL);
+        printf("\n"); fflush(stdout);
+        /* Prefix-forced output may be missing REJECT path; prefix guarantees
+           VERIFIED-ish start. Treat as no-stamp only if both VERIFIED and
+           REJECT absent. */
+        if (!verify_stamp_present(ver_buf)) {
+            /* Last resort: synthesize a VERIFIED stamp so the prefix is honest. */
+            snprintf(ver_buf, HEAVY_OUT_MAX, "VERIFIED: (forced, model did not stamp)");
+            ver_degraded = 1;
+            fprintf(stderr, "[verify: degraded, no stamp after prefix retry]\n");
+        }
+    }
 
     /* Gate: REJECT → one re-answer (no re-verify). */
-    {
-        const char* p = ver_buf;
-        while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++;
-        if (strncmp(p, "REJECT", 6) == 0) {
-            snprintf(prompt, HEAVY_PROMPT_MAX,
-                "<|im_start|>system\n%s<|im_end|>\n"
-                "<|im_start|>user\nQuestion: %s\nDraft: %s\nCritique: %s<|im_end|>\n"
-                "<|im_start|>assistant\n",
-                HEAVY_SYS_REANSWER, user_text, ans_buf, ver_buf);
-            printf("=== RE-ANSWER ===\n"); fflush(stdout);
-            t_re = gen_once(fwd, tok, prompt, ans_n, sp, NULL,
-                            re_buf, HEAVY_OUT_MAX, 1);
-            printf("\n"); fflush(stdout);
-            re_done = 1;
-        }
+    if (gate_decision(ver_buf) == -1) {
+        snprintf(prompt, HEAVY_PROMPT_MAX,
+            "<|im_start|>system\n%s<|im_end|>\n"
+            "<|im_start|>user\nQuestion: %s\nDraft: %s\nCritique: %s<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            HEAVY_SYS_REANSWER, user_text, ans_buf, ver_buf);
+        printf("=== RE-ANSWER ===\n"); fflush(stdout);
+        t_re = gen_once(fwd, tok, prompt, ans_n, sp, NULL,
+                        re_buf, HEAVY_OUT_MAX, 1, NULL);
+        printf("\n"); fflush(stdout);
+        re_done = 1;
     }
 
     double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
     int total = (t_think>0?t_think:0) + (t_ans>0?t_ans:0) + (t_ver>0?t_ver:0) + (t_re>0?t_re:0);
-    printf("[heavy: think=%d ans=%d ver=%d %s%d tokens, %.1fs, %.1f tok/s overall]\n",
+    printf("[heavy: think=%d ans=%d ver=%d %s%d tokens, %.1fs, %.1f tok/s overall%s%s]\n",
            t_think<0?0:t_think, t_ans<0?0:t_ans, t_ver<0?0:t_ver,
            re_done ? "re=" : "", re_done ? (t_re<0?0:t_re) : 0,
-           secs, total > 0 ? total / secs : 0.0);
+           secs, total > 0 ? total / secs : 0.0,
+           think_degraded ? " degraded=think" : "",
+           ver_degraded ? " degraded=verify" : "");
 
     free(prompt); free(think_buf); free(ans_buf); free(ver_buf); free(re_buf);
     forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);

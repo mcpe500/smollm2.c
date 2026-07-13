@@ -75,6 +75,17 @@ def test_reject_triggers_reanswer() -> bool:
     return True
 
 
+def test_degraded_summary_flag() -> bool:
+    """Short budgets reliably break stamps on 135M — degraded flag MUST appear."""
+    r = run("-p", "x", "--heavy",
+            "--heavy-think-n", "8", "--heavy-verify-n", "8",
+            "-n", "8", "--temp", "0")
+    out = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+    flagged = ("degraded" in out)
+    print(f"[degraded] {'PASS' if flagged else 'FAIL'}: flag_present={flagged}")
+    return flagged
+
+
 def main() -> int:
     if not BINARY.exists():
         print(f"FAIL: {BINARY} missing", file=sys.stderr)
@@ -84,6 +95,7 @@ def main() -> int:
         test_heavy_sections_present(),
         test_plain_prompt_unchanged(),
         test_reject_triggers_reanswer(),
+        test_degraded_summary_flag(),
     ]
     print(f"\n=== heavy_test: {sum(results)}/{len(results)} pass ===")
     return 0 if all(results) else 1
