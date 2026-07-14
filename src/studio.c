@@ -9,6 +9,8 @@
 #include "hw_probe.h"
 #include "train.h"
 #include "attn_registry.h"
+#include "sampling.h"
+#include "web.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +29,8 @@ static int usage() {
         "                      [--simulate-mem-kb N]\n"
         "  studio merge        --base <gguf> --adapter <lora.bin> --out <merged.gguf>\n"
         "  studio attn-list\n"
-        "  studio attn-config  --config <layers.json> [--layers N]\n");
+        "  studio attn-config  --config <layers.json> [--layers N]\n"
+        "  studio web          [--port 8082] --model <gguf>\n");
     return 1;
 }
 
@@ -214,16 +217,19 @@ static int cmd_merge(int argc, char** argv) {
     return train_merge(base, adapter, out) < 0 ? 1 : 0;
 }
 
-static const char* attn_type_name(int t) {
-    switch (t) {
-    case ATTN_TYPE_DENSE:   return "dense";
-    case ATTN_TYPE_SWA:     return "swa";
-    case ATTN_TYPE_DILATED: return "dilated";
-    case ATTN_TYPE_BIGBIRD: return "bigbird";
-    case ATTN_TYPE_GLOCAL:  return "glocal";
-    case ATTN_TYPE_MLA:     return "mla";
-    default:                return "unknown";
+static int cmd_web(int argc, char** argv) {
+    int port = 8082;
+    const char* model = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) model = argv[++i];
     }
+    if (!model) {
+        fprintf(stderr, "web: --model <gguf> required (for now)\n");
+        return 1;
+    }
+    sample_params sp = {0.3f, 0.0f, 5, 1.1f, 0};
+    return web_run(model, port, &sp) < 0 ? 1 : 0;
 }
 
 static int cmd_attn_list(int argc, char** argv) {
@@ -273,5 +279,6 @@ int studio_dispatch(int argc, char** argv) {
     if (strcmp(argv[0], "merge") == 0)        return cmd_merge(argc - 1, argv + 1);
     if (strcmp(argv[0], "attn-list") == 0)    return cmd_attn_list(argc - 1, argv + 1);
     if (strcmp(argv[0], "attn-config") == 0)  return cmd_attn_config(argc - 1, argv + 1);
+    if (strcmp(argv[0], "web") == 0)          return cmd_web(argc - 1, argv + 1);
     return usage();
 }

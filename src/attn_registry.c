@@ -56,6 +56,18 @@ int attn_get_spec(int L, attn_spec* out) {
 
 int attn_n_layers(void) { ensure_inited(); return g_n_layers; }
 
+const char* attn_type_name(int t) {
+    switch (t) {
+    case ATTN_TYPE_DENSE:   return "dense";
+    case ATTN_TYPE_SWA:     return "swa";
+    case ATTN_TYPE_DILATED: return "dilated";
+    case ATTN_TYPE_BIGBIRD: return "bigbird";
+    case ATTN_TYPE_GLOCAL:  return "glocal";
+    case ATTN_TYPE_MLA:     return "mla";
+    default:                return "unknown";
+    }
+}
+
 /* Hot path: compute first valid attention index for position t at layer L. */
 int attn_s_start(int L, int t) {
     ensure_inited();

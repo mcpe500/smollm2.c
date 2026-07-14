@@ -11,6 +11,8 @@
 #include "tokenizer.h"
 #include "forward.h"
 #include "sampling.h"
+#include "hw_probe.h"
+#include "attn_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +110,152 @@ static const char* kHTML =
 "if(bot.textContent===''){bot.textContent='(no response)';}"
 "}"
 "}"
+"</script></body></html>";
+
+/* Studio SPA — tabs: Infer / HW / Attn / Data / Train / Merge. */
+static const char* kStudioHTML =
+"<!DOCTYPE html>\n"
+"<html lang=\"en\"><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>smollm2 studio</title>"
+"<style>"
+"*{box-sizing:border-box;margin:0;padding:0}"
+"body{font-family:system-ui,sans-serif;background:#0f1117;color:#e6e6e6;"
+"min-height:100vh;display:flex;flex-direction:column}"
+"header{padding:12px 16px;background:#161922;border-bottom:1px solid #252836;"
+"font-weight:600;font-size:14px;color:#9ca3af;display:flex;gap:16px;align-items:center}"
+"header b{color:#60a5fa}"
+"nav{display:flex;gap:4px;flex-wrap:wrap}"
+"nav button{padding:6px 12px;background:#1f2937;border:1px solid #2d3748;"
+"color:#e6e6e6;border-radius:6px;cursor:pointer;font-size:13px}"
+"nav button.active{background:#3b82f6;border-color:#3b82f6}"
+"main{flex:1;padding:16px;max-width:900px;width:100%;margin:0 auto}"
+".tab{display:none}.tab.active{display:block}"
+"pre{background:#1f2937;padding:12px;border-radius:8px;overflow:auto;"
+"font-size:12px;white-space:pre-wrap;border:1px solid #2d3748}"
+"label{display:block;font-size:12px;color:#9ca3af;margin:8px 0 4px}"
+"input,textarea,select{width:100%;padding:8px 10px;background:#1f2937;"
+"border:1px solid #2d3748;border-radius:6px;color:#e6e6e6;font-size:13px}"
+"button.primary{margin-top:10px;padding:8px 16px;background:#3b82f6;border:0;"
+"border-radius:6px;color:#fff;font-weight:600;cursor:pointer}"
+".row{display:grid;grid-template-columns:1fr 1fr;gap:10px}"
+".status{font-size:12px;color:#9ca3af;margin-top:8px}"
+".log{max-height:280px;overflow:auto}"
+"</style></head><body>"
+"<header><b>smollm2 studio</b>"
+"<nav id=\"nav\">"
+"<button data-t=\"infer\" class=\"active\">Infer</button>"
+"<button data-t=\"hw\">HW</button>"
+"<button data-t=\"attn\">Attn</button>"
+"<button data-t=\"data\">Data</button>"
+"<button data-t=\"train\">Train</button>"
+"<button data-t=\"merge\">Merge</button>"
+"</nav></header>"
+"<main>"
+"<section class=\"tab active\" id=\"tab-infer\">"
+"<label>Prompt</label><textarea id=\"inf-p\" rows=\"3\">hello</textarea>"
+"<label>Tokens</label><input id=\"inf-n\" type=\"number\" value=\"64\">"
+"<button class=\"primary\" id=\"inf-go\">Generate</button>"
+"<div class=\"status\" id=\"inf-st\">Ready.</div>"
+"<pre class=\"log\" id=\"inf-out\"></pre></section>"
+"<section class=\"tab\" id=\"tab-hw\">"
+"<button class=\"primary\" id=\"hw-go\">Probe</button>"
+"<pre class=\"log\" id=\"hw-out\">(click Probe)</pre></section>"
+"<section class=\"tab\" id=\"tab-attn\">"
+"<button class=\"primary\" id=\"attn-go\">List registry</button>"
+"<pre class=\"log\" id=\"attn-out\">(click List)</pre></section>"
+"<section class=\"tab\" id=\"tab-data\">"
+"<label>Raw text</label><textarea id=\"data-t\" rows=\"4\">Hello world.\\nHow are you?</textarea>"
+"<label>Format</label><select id=\"data-f\"><option>raw</option>"
+"<option>instruct</option><option>sharegpt</option></select>"
+"<label>Out path</label><input id=\"data-o\" value=\"/tmp/studio_packed.bin\">"
+"<button class=\"primary\" id=\"data-go\">Build</button>"
+"<pre class=\"log\" id=\"data-out\"></pre></section>"
+"<section class=\"tab\" id=\"tab-train\">"
+"<div class=\"row\">"
+"<div><label>Data</label><input id=\"tr-data\" value=\"/tmp/studio_packed.bin\"></div>"
+"<div><label>Mode</label><select id=\"tr-mode\"><option>lora</option>"
+"<option>qlora</option><option>fullft</option></select></div>"
+"<div><label>Rank</label><input id=\"tr-rank\" type=\"number\" value=\"4\"></div>"
+"<div><label>Epochs</label><input id=\"tr-ep\" type=\"number\" value=\"1\"></div>"
+"<div><label>LR</label><input id=\"tr-lr\" value=\"1e-3\"></div>"
+"<div><label>Max steps</label><input id=\"tr-ms\" type=\"number\" value=\"5\"></div>"
+"</div>"
+"<button class=\"primary\" id=\"tr-go\">Train</button>"
+"<div class=\"status\" id=\"tr-st\">Ready.</div>"
+"<pre class=\"log\" id=\"tr-out\"></pre></section>"
+"<section class=\"tab\" id=\"tab-merge\">"
+"<label>Base GGUF</label><input id=\"mg-base\" value=\"models/smollm2-135m-f16.gguf\">"
+"<label>Adapter</label><input id=\"mg-ad\" value=\"adapters/lora_final.bin\">"
+"<label>Out</label><input id=\"mg-out\" value=\"/tmp/merged.gguf\">"
+"<button class=\"primary\" id=\"mg-go\">Merge</button>"
+"<pre class=\"log\" id=\"mg-out-log\"></pre></section>"
+"</main>"
+"<script>"
+"const tabs=document.querySelectorAll('.tab');"
+"document.getElementById('nav').onclick=e=>{"
+"const b=e.target.closest('button');if(!b)return;"
+"document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));"
+"b.classList.add('active');"
+"tabs.forEach(t=>t.classList.toggle('active',t.id==='tab-'+b.dataset.t));"
+"};"
+"async function jget(u){const r=await fetch(u);return r.json();}"
+"async function jpost(u,body){const r=await fetch(u,{method:'POST',"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
+"return r.json();}"
+"document.getElementById('hw-go').onclick=async()=>{"
+"document.getElementById('hw-out').textContent=JSON.stringify(await jget('/studio/hw'),null,2);};"
+"document.getElementById('attn-go').onclick=async()=>{"
+"document.getElementById('attn-out').textContent=JSON.stringify(await jget('/studio/attn'),null,2);};"
+"document.getElementById('data-go').onclick=async()=>{"
+"const body={text:document.getElementById('data-t').value,"
+"fmt:document.getElementById('data-f').value,"
+"out:document.getElementById('data-o').value};"
+"document.getElementById('data-out').textContent=JSON.stringify(await jpost('/studio/data',body),null,2);};"
+"document.getElementById('mg-go').onclick=async()=>{"
+"const body={base:document.getElementById('mg-base').value,"
+"adapter:document.getElementById('mg-ad').value,"
+"out:document.getElementById('mg-out').value};"
+"document.getElementById('mg-out-log').textContent=JSON.stringify(await jpost('/studio/merge',body),null,2);};"
+"document.getElementById('inf-go').onclick=async()=>{"
+"const p=document.getElementById('inf-p').value;"
+"const n=+document.getElementById('inf-n').value||64;"
+"const out=document.getElementById('inf-out');out.textContent='';"
+"const st=document.getElementById('inf-st');st.textContent='Generating...';"
+"try{const r=await fetch('/studio/infer',{method:'POST',"
+"headers:{'Content-Type':'application/json'},"
+"body:JSON.stringify({prompt:p,n:n})});"
+"const reader=r.body.getReader();const dec=new TextDecoder();let buf='',text='';"
+"while(true){const{done,value}=await reader.read();if(done)break;"
+"buf+=dec.decode(value,{stream:true});let idx;"
+"while((idx=buf.indexOf('\\n'))>=0){const line=buf.slice(0,idx);buf=buf.slice(idx+1);"
+"if(!line.startsWith('data: '))continue;const payload=line.slice(6);"
+"if(payload==='[DONE]'){st.textContent='Done.';continue;}"
+"try{const j=JSON.parse(payload);if(j.token){text+=j.token;out.textContent=text;}}"
+"catch(e){}}}"
+"}catch(e){st.textContent='Error';}"
+"};"
+"document.getElementById('tr-go').onclick=async()=>{"
+"const body={data:document.getElementById('tr-data').value,"
+"mode:document.getElementById('tr-mode').value,"
+"rank:+document.getElementById('tr-rank').value||4,"
+"epochs:+document.getElementById('tr-ep').value||1,"
+"lr:parseFloat(document.getElementById('tr-lr').value)||1e-3,"
+"max_steps:+document.getElementById('tr-ms').value||5};"
+"const out=document.getElementById('tr-out');out.textContent='';"
+"const st=document.getElementById('tr-st');st.textContent='Training...';"
+"try{const r=await fetch('/studio/train',{method:'POST',"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
+"const reader=r.body.getReader();const dec=new TextDecoder();let buf='';"
+"while(true){const{done,value}=await reader.read();if(done)break;"
+"buf+=dec.decode(value,{stream:true});let idx;"
+"while((idx=buf.indexOf('\\n'))>=0){const line=buf.slice(0,idx);buf=buf.slice(idx+1);"
+"if(!line.startsWith('data: '))continue;const payload=line.slice(6);"
+"if(payload==='[DONE]'){st.textContent='Done.';continue;}"
+"out.textContent+=payload+'\\n';out.scrollTop=out.scrollHeight;}"
+"}"
+"}catch(e){st.textContent='Error';}"
+"};"
 "</script></body></html>";
 
 // ---------------------------------------------------------------------------
@@ -214,6 +362,74 @@ static void handle_home(int fd) {
         off += chunk;
     }
     send_chunk(fd, "", 0);  // end-of-body
+}
+
+static void handle_studio_page(int fd) {
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n");
+    send_all(fd, header, (size_t)hlen);
+    size_t html_len = strlen(kStudioHTML);
+    size_t off = 0;
+    while (off < html_len) {
+        size_t chunk = html_len - off;
+        if (chunk > 4096) chunk = 4096;
+        send_chunk(fd, kStudioHTML + off, chunk);
+        off += chunk;
+    }
+    send_chunk(fd, "", 0);
+}
+
+static void handle_studio_hw(int fd) {
+    hw_caps c; hw_probe(&c);
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"mem_total_kb\":%ld,\"mem_avail_kb\":%ld,"
+        "\"max_seq_advised\":%d,\"max_batch_advised\":%d,"
+        "\"fullft_allowed\":%d,\"qlora_recommended\":%d}\n",
+        c.mem_total_kb, c.mem_avail_kb,
+        c.max_seq_advised, c.max_batch_advised,
+        c.fullft_allowed, c.qlora_recommended);
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
+    send_all(fd, header, (size_t)hlen);
+    send_all(fd, buf, (size_t)n);
+}
+
+static void handle_studio_attn(int fd) {
+    char header[256];
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    send_all(fd, header, (size_t)hlen);
+    char line[256];
+    int n = snprintf(line, sizeof(line), "{\"n_layers\":%d,\"variants\":[\"dense\",\"swa\",\"dilated\",\"bigbird\",\"glocal\",\"mla\"],\"layers\":[",
+                     attn_n_layers());
+    send_chunk(fd, line, (size_t)n);
+    int nl = attn_n_layers();
+    if (nl <= 0) {
+        attn_spec s; attn_get_spec(0, &s);
+        n = snprintf(line, sizeof(line),
+            "{\"L\":0,\"type\":\"%s\",\"window\":%d,\"dilation\":%d,\"n_global\":%d,\"latent_dim\":%d}",
+            attn_type_name(s.type), s.window, s.dilation, s.n_global, s.latent_dim);
+        send_chunk(fd, line, (size_t)n);
+    } else {
+        for (int i = 0; i < nl; i++) {
+            attn_spec s; attn_get_spec(i, &s);
+            n = snprintf(line, sizeof(line),
+                "%s{\"L\":%d,\"type\":\"%s\",\"window\":%d,\"dilation\":%d,\"n_global\":%d,\"latent_dim\":%d}",
+                i ? "," : "", i,
+                attn_type_name(s.type), s.window, s.dilation, s.n_global, s.latent_dim);
+            send_chunk(fd, line, (size_t)n);
+        }
+    }
+    send_chunk(fd, "]}\n", 3);
+    send_chunk(fd, "", 0);
 }
 
 static void handle_generate(int fd, const char* body,
@@ -413,6 +629,12 @@ int web_run(const char* model_path, int port, const sample_params* sp) {
 
         if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
             handle_home(cli_fd);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/studio") == 0) {
+            handle_studio_page(cli_fd);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/studio/hw") == 0) {
+            handle_studio_hw(cli_fd);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/studio/attn") == 0) {
+            handle_studio_attn(cli_fd);
         } else if (strcmp(method, "POST") == 0 &&
                    strcmp(path, "/generate") == 0) {
             handle_generate(cli_fd, body ? body : "", model_path, sp);

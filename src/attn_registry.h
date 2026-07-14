@@ -34,6 +34,7 @@ int  attn_load_config(const char* json_path, int n_layers_expected);
 /* Inspect current registry (for --attn-info / studio attn-list). */
 int  attn_get_spec(int L, attn_spec* out);
 int  attn_n_layers(void);
+const char* attn_type_name(int t);
 
 /* Reset (mainly for tests). */
 void attn_reset(void);
