@@ -93,6 +93,38 @@ def main() -> int:
         print(f"[studio-attn] {'PASS' if ok else 'FAIL'}: code={code} body={body[:200]}")
         results.append(ok)
 
+        # 4. POST /studio/data — tiny raw text
+        import tempfile
+        out_bin = str(Path(tempfile.gettempdir()) / "studio_web_packed.bin")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT}/studio/data",
+            data=json.dumps({
+                "text": "Hello world.\nHow are you?\n",
+                "fmt": "raw",
+                "out": out_bin,
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                dcode, dbody = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            try:
+                dbody = e.read().decode("utf-8", "replace")
+            except Exception:
+                dbody = ""
+            dcode = e.code
+        except Exception as e:
+            dcode, dbody = 0, str(e)
+        try:
+            dj = json.loads(dbody)
+        except Exception:
+            dj = {}
+        ok = dcode == 200 and dj.get("ok") is True
+        print(f"[studio-data] {'PASS' if ok else 'FAIL'}: code={dcode} body={dbody[:300]}")
+        results.append(ok)
+
         print(f"\n=== studio_web: {sum(results)}/{len(results)} pass ===")
         return 0 if all(results) else 1
     finally:

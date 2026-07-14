@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -432,6 +433,201 @@ static void handle_studio_attn(int fd) {
     send_chunk(fd, "", 0);
 }
 
+/* Phase 4b: POST /studio/{data,train,merge} — exec ./smollm2 studio <cmd>
+   and stream stdout as SSE. Single-shot, blocking, no auth. */
+#include <sys/wait.h>
+
+static void sse_send(int fd, const char* s) {
+    char esc[2048]; int n = 0;
+    for (const char* p = s; *p && n < (int)sizeof(esc) - 4; p++) {
+        char c = *p;
+        if (c == '\n') { esc[n++] = '\\'; esc[n++] = 'n'; }
+        else if (c == '"') { esc[n++] = '\\'; esc[n++] = '"'; }
+        else if (c == '\\') { esc[n++] = '\\'; esc[n++] = '\\'; }
+        else if ((unsigned char)c < 32) { /* skip */ }
+        else esc[n++] = c;
+    }
+    char buf[4096];
+    int bl = snprintf(buf, sizeof(buf), "data: {\"line\":\"%s\"}\n\n", esc);
+    if (bl > 0) send_chunk(fd, buf, (size_t)bl);
+}
+
+static void sse_done(int fd) {
+    send_chunk(fd, "data: [DONE]\n\n", strlen("data: [DONE]\n\n"));
+    send_chunk(fd, "", 0);
+}
+
+static const char* sse_header =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n"
+    "Transfer-Encoding: chunked\r\n\r\n";
+
+/* Trivial extractor: "{key":"value"}" — returns length, copies into out. */
+static int jp_str(const char* body, const char* key, char* out, int mx) {
+    char pat[64]; int pl = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(body, pat); if (!p) return 0;
+    p += pl; while (*p == ' ' || *p == ':') p++;
+    if (*p != '"') return 0;
+    p++;
+    int n = 0;
+    while (*p && *p != '"' && n < mx - 1) {
+        if (*p == '\\' && p[1]) {
+            char e = p[1];
+            if      (e == 'n') out[n++] = '\n';
+            else if (e == 't') out[n++] = '\t';
+            else if (e == 'r') out[n++] = '\r';
+            else if (e == '"') out[n++] = '"';
+            else if (e == '\\') out[n++] = '\\';
+            else                 out[n++] = e;
+            p += 2;
+        } else out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return n;
+}
+static int jp_int(const char* body, const char* key, int def) {
+    char pat[64]; int pl = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(body, pat); if (!p) return def;
+    p += pl; while (*p == ' ' || *p == ':') p++;
+    return atoi(p);
+}
+static int jp_float_str(char* out, int mx, const char* body, const char* key) {
+    char pat[64]; int pl = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(body, pat); if (!p) return 0;
+    p += pl; while (*p == ' ' || *p == ':') p++;
+    int n = 0;
+    while (*p && *p != ',' && *p != '}' && *p != ' ' && n < mx - 1)
+        out[n++] = *p++;
+    out[n] = '\0';
+    return n;
+}
+
+static void send_json(int fd, int code, const char* body) {
+    char header[256];
+    int blen = (int)strlen(body);
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n",
+        code, code == 200 ? "OK" : "Bad Request", blen);
+    send_all(fd, header, (size_t)hlen);
+    send_all(fd, body, (size_t)blen);
+}
+
+static const char* tmp_dir(void) {
+    const char* t = getenv("TMPDIR");
+    if (t && t[0]) return t;
+    t = getenv("TMP");
+    if (t && t[0]) return t;
+    return "/tmp";
+}
+
+static void handle_studio_data(int fd, const char* body, const char* model_path) {
+    char text[16384], fmt[32], out_path[1024];
+    int tlen = jp_str(body, "text", text, sizeof(text));
+    jp_str(body, "fmt", fmt, sizeof(fmt));
+    jp_str(body, "out", out_path, sizeof(out_path));
+    if (tlen <= 0 || out_path[0] == '\0' || model_path == NULL) {
+        send_json(fd, 400, "{\"ok\":false,\"error\":\"missing text/out or --model\"}");
+        return;
+    }
+    char in_path[1024];
+    snprintf(in_path, sizeof(in_path), "%s/studio_in_%d.txt", tmp_dir(), (int)getpid());
+    FILE* f = fopen(in_path, "w");
+    if (!f) { send_json(fd, 500, "{\"ok\":false,\"error\":\"tmpfile\"}"); return; }
+    fwrite(text, 1, tlen, f); fclose(f);
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "./smollm2 studio data-build --in %s --out %s --fmt %s --model %s 2>&1",
+        in_path, out_path, fmt[0] ? fmt : "raw", model_path);
+    FILE* p = popen(cmd, "r");
+    char log[4096] = {0}; int logn = 0;
+    if (p) {
+        char line[512];
+        while (fgets(line, sizeof(line), p) && logn < (int)sizeof(log) - 2)
+            logn += snprintf(log + logn, sizeof(log) - (size_t)logn, "%s", line);
+    }
+    int rc = p ? pclose(p) : -1;
+    unlink(in_path);
+    char resp[8192], log_esc[4096];
+    json_escape(log, logn, log_esc, sizeof(log_esc));
+    snprintf(resp, sizeof(resp),
+        "{\"ok\":%s,\"rc\":%d,\"out\":\"%s\",\"log\":\"%s\"}",
+        rc == 0 ? "true" : "false", rc, out_path, log_esc);
+    send_json(fd, rc == 0 ? 200 : 500, resp);
+}
+
+static void handle_studio_train(int fd, const char* body, const char* model_path) {
+    send_all(fd, sse_header, strlen(sse_header));
+    char data[1024], mode[16];
+    int rank = 4, epochs = 1, max_steps = 5, seq = 64, batch = 1;
+    char lr_s[32] = "1e-3";
+    jp_str(body, "data", data, sizeof(data));
+    jp_str(body, "mode", mode, sizeof(mode));
+    rank = jp_int(body, "rank", 4);
+    epochs = jp_int(body, "epochs", 1);
+    max_steps = jp_int(body, "max_steps", 5);
+    seq = jp_int(body, "seq", 64);
+    batch = jp_int(body, "batch", 1);
+    jp_float_str(lr_s, sizeof(lr_s), body, "lr");
+    if (!data[0] || !model_path) {
+        sse_send(fd, "{\"error\":\"missing data or --model\"}");
+        sse_done(fd); return;
+    }
+    char out_dir[256];
+    snprintf(out_dir, sizeof(out_dir), "%s/studio_adapter_%d", tmp_dir(), (int)getpid());
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "./smollm2 studio train --data %s --mode %s --rank %d "
+        "--epochs %d --lr %s --seq %d --batch %d --max-steps %d "
+        "--out-dir %s --model %s 2>&1",
+        data, mode[0] ? mode : "lora", rank, epochs, lr_s, seq, batch,
+        max_steps, out_dir, model_path);
+
+    FILE* p = popen(cmd, "r");
+    char line[1024];
+    if (!p) { sse_send(fd, "{\"error\":\"popen\"}"); sse_done(fd); return; }
+    while (fgets(line, sizeof(line), p)) sse_send(fd, line);
+    int rc = pclose(p);
+    char meta[256];
+    snprintf(meta, sizeof(meta), "{\"done\":true,\"rc\":%d,\"out_dir\":\"%s\"}",
+             rc, out_dir);
+    sse_send(fd, meta);
+    sse_done(fd);
+}
+
+static void handle_studio_merge(int fd, const char* body) {
+    char base[1024], adapter[1024], out[1024];
+    jp_str(body, "base", base, sizeof(base));
+    jp_str(body, "adapter", adapter, sizeof(adapter));
+    jp_str(body, "out", out, sizeof(out));
+    if (!base[0] || !adapter[0] || !out[0]) {
+        send_json(fd, 400, "{\"ok\":false,\"error\":\"missing base/adapter/out\"}");
+        return;
+    }
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "./smollm2 studio merge --base %s --adapter %s --out %s 2>&1",
+        base, adapter, out);
+    FILE* p = popen(cmd, "r");
+    char log[4096] = {0}; int logn = 0;
+    if (p) {
+        char line[512];
+        while (fgets(line, sizeof(line), p) && logn < (int)sizeof(log) - 2)
+            logn += snprintf(log + logn, sizeof(log) - (size_t)logn, "%s", line);
+    }
+    int rc = p ? pclose(p) : -1;
+    char resp[8192], log_esc[4096];
+    json_escape(log, logn, log_esc, sizeof(log_esc));
+    snprintf(resp, sizeof(resp),
+        "{\"ok\":%s,\"rc\":%d,\"out\":\"%s\",\"sidecar\":\"%s.lora\",\"log\":\"%s\"}",
+        rc == 0 ? "true" : "false", rc, out, out, log_esc);
+    send_json(fd, rc == 0 ? 200 : 500, resp);
+}
+
 static void handle_generate(int fd, const char* body,
                             const char* model_path,
                             const sample_params* sp) {
@@ -619,6 +815,22 @@ int web_run(const char* model_path, int port, const sample_params* sp) {
         if (n <= 0) { close(cli_fd); continue; }
         req[n] = '\0';
 
+        /* Drain rest of body if Content-Length > initial recv. */
+        char* cl_p = strcasestr(req, "Content-Length:");
+        if (cl_p) {
+            int clen = atoi(cl_p + 15);
+            const char* body_start = strstr(req, "\r\n\r\n");
+            int body_off = body_start ? (int)(body_start + 4 - req) : (int)n;
+            int body_have = (int)n - body_off;
+            while (body_have < clen && n < (ssize_t)sizeof(req) - 1) {
+                ssize_t k = recv(cli_fd, req + n, clen - body_have, 0);
+                if (k <= 0) break;
+                n += k;
+                body_have += (int)k;
+                req[n] = '\0';
+            }
+        }
+
         char method[16], path[256];
         char* body = NULL;
         if (parse_request(req, (int)n, method, sizeof(method),
@@ -635,8 +847,15 @@ int web_run(const char* model_path, int port, const sample_params* sp) {
             handle_studio_hw(cli_fd);
         } else if (strcmp(method, "GET") == 0 && strcmp(path, "/studio/attn") == 0) {
             handle_studio_attn(cli_fd);
+        } else if (strcmp(method, "POST") == 0 && strcmp(path, "/studio/data") == 0) {
+            handle_studio_data(cli_fd, body ? body : "", model_path);
+        } else if (strcmp(method, "POST") == 0 && strcmp(path, "/studio/train") == 0) {
+            handle_studio_train(cli_fd, body ? body : "", model_path);
+        } else if (strcmp(method, "POST") == 0 && strcmp(path, "/studio/merge") == 0) {
+            handle_studio_merge(cli_fd, body ? body : "");
         } else if (strcmp(method, "POST") == 0 &&
-                   strcmp(path, "/generate") == 0) {
+                   (strcmp(path, "/generate") == 0 ||
+                    strcmp(path, "/studio/infer") == 0)) {
             handle_generate(cli_fd, body ? body : "", model_path, sp);
         } else {
             const char* nf = "HTTP/1.1 404 Not Found\r\n"
