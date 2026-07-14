@@ -6,6 +6,7 @@
 #include "sampling.h"
 #include "tui.h"
 #include "web.h"
+#include "studio.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -633,6 +634,9 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "studio") == 0) {
+        return studio_dispatch(argc - 2, argv + 2);
+    }
     const char* model_path   = NULL;
     const char* tok_test_text = NULL;
     const char* logits_prompt = NULL;

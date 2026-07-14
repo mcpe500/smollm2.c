@@ -11,13 +11,17 @@ SRC = \
     src/sampling.c \
     src/tui.c \
     src/web.c \
+    src/data.c \
+    src/gguf_write.c \
+    src/backward.c \
+    src/studio.c \
     src/main.c
 
 OBJ = $(SRC:.c=.o)
 
 TARGET = smollm2
 
-.PHONY: all clean inspect
+.PHONY: all clean inspect studio-smoke studio-test
 
 all: $(TARGET)
 
@@ -32,3 +36,12 @@ clean:
 
 inspect: $(TARGET)
 	./$(TARGET) --inspect
+
+studio-smoke: $(TARGET)
+	python3 eval/studio_smoke.py
+
+studio-test: $(TARGET)
+	python3 eval/studio_smoke.py
+	python3 eval/attn_matrix_test.py
+	python3 eval/heavy_test.py
+	python3 eval/parity.py
