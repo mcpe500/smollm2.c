@@ -625,6 +625,9 @@ static void usage(const char* prog) {
         "  --heavy              Multi-pass: think → answer → verify(gate).\n"
         "  --heavy-think-n <n>  Think token budget (default 128).\n"
         "  --heavy-verify-n <n> Verify token budget (default 64).\n"
+        "  --rope <f32|f16|q8>  RoPE table precision (default f32).\n"
+        "  --kv   <f32|f16|q8>  KV cache precision (default f32).\n"
+        "  --attn <naive|flash> Attention kernel (default naive).\n"
         "  -h / --help          Show this help.\n",
         prog, prog, prog);
 }
@@ -641,6 +644,7 @@ int main(int argc, char** argv) {
     const char* prompt = NULL;
     int n_tokens = 200;
     int heavy = 0, heavy_think_n = 128, heavy_verify_n = 64;
+    int rope_mode = ROPE_F32, kv_mode = KV_F32, attn_mode = ATTN_NAIVE;
     sample_params sp = {0.3f, 0.0f, 5, 1.1f, 0};
 
     for (int i = 1; i < argc; i++) {
@@ -658,6 +662,26 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--heavy") == 0) heavy = 1;
         else if (strcmp(argv[i], "--heavy-think-n") == 0 && i + 1 < argc) heavy_think_n = atoi(argv[++i]);
         else if (strcmp(argv[i], "--heavy-verify-n") == 0 && i + 1 < argc) heavy_verify_n = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--rope") == 0 && i + 1 < argc) {
+            const char* v = argv[++i];
+            if      (strcmp(v, "f32") == 0) rope_mode = ROPE_F32;
+            else if (strcmp(v, "f16") == 0) rope_mode = ROPE_F16;
+            else if (strcmp(v, "q8")  == 0) rope_mode = ROPE_Q8;
+            else { fprintf(stderr, "invalid --rope value: %s (want f32|f16|q8)\n", v); return 1; }
+        }
+        else if (strcmp(argv[i], "--kv") == 0 && i + 1 < argc) {
+            const char* v = argv[++i];
+            if      (strcmp(v, "f32") == 0) kv_mode = KV_F32;
+            else if (strcmp(v, "f16") == 0) kv_mode = KV_F16;
+            else if (strcmp(v, "q8")  == 0) kv_mode = KV_Q8;
+            else { fprintf(stderr, "invalid --kv value: %s (want f32|f16|q8)\n", v); return 1; }
+        }
+        else if (strcmp(argv[i], "--attn") == 0 && i + 1 < argc) {
+            const char* v = argv[++i];
+            if      (strcmp(v, "naive") == 0) attn_mode = ATTN_NAIVE;
+            else if (strcmp(v, "flash") == 0) attn_mode = ATTN_FLASH;
+            else { fprintf(stderr, "invalid --attn value: %s (want naive|flash)\n", v); return 1; }
+        }
         else if (strcmp(argv[i], "--tui") == 0) do_tui = 1;
         else if (strcmp(argv[i], "--web") == 0) do_web = 1;
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) web_port = atoi(argv[++i]);
@@ -671,6 +695,7 @@ int main(int argc, char** argv) {
     }
 
     int resolver_allocated = 0;
+    forward_set_modes(rope_mode, kv_mode, attn_mode);
     if (!model_path) {
         model_path = resolve_ollama_model_path();
         if (!model_path) {

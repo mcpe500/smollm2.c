@@ -14,11 +14,23 @@
 
 // RoPE theta read from GGUF at load time (SmolLM2 uses 100000, not 10000)
 
+/* Process-wide mode defaults; applied at forward_load. */
+static int g_rope_mode = ROPE_F32;
+static int g_kv_mode   = KV_F32;
+static int g_attn_mode = ATTN_NAIVE;
+
+void forward_set_modes(int rope, int kv, int attn) {
+    g_rope_mode = rope;
+    g_kv_mode   = kv;
+    g_attn_mode = attn;
+}
+
 struct forward_ctx {
     // config
     int dim, n_layers, n_heads, n_kv_heads, head_dim, kv_dim;
     int ffn_hidden, vocab_size, max_seq;
     float rms_eps, rope_theta;
+    int rope_mode, kv_mode, attn_mode;
 
     // weights: token_embd/norms stored F32; heavy matmul weights kept as F16
     float*    w_token_embd;     // [vocab * dim]  F32 — used for embedding lookup
@@ -46,9 +58,16 @@ struct forward_ctx {
     int8_t*  q8_down;   float* q8_sdown; // [n_layers * dim * ffn_hidden]
     int8_t*  xq_buf;    // [max(dim, ffn_hidden)] activation quantization buffer
 
-    // KV cache
-    float* k_cache;       // [n_layers * max_seq * kv_dim]
-    float* v_cache;       // [n_layers * max_seq * kv_dim]
+    // KV cache — only one precision active (selected by kv_mode)
+    float*    k_cache;       // F32
+    float*    v_cache;
+    uint16_t* k_cache_f16;   // F16
+    uint16_t* v_cache_f16;
+    int8_t*   k_cache_q8;    // Q8 + per-(L,pos) scale
+    int8_t*   v_cache_q8;
+    float*    k_cache_scale; // [n_layers * max_seq]
+    float*    v_cache_scale;
+    float*    kv_tmp;        // [kv_dim] dequant scratch
 
     // activation buffers
     float* x_buf;         // [max_seq * dim]   residual stream
@@ -68,6 +87,10 @@ struct forward_ctx {
     float* scores;        // [max_seq]
     float* rope_cos;      // [max_seq * head_dim/2]  precomputed RoPE cosines
     float* rope_sin;      // [max_seq * head_dim/2]  precomputed RoPE sines
+    uint16_t* rope_cos_f16;
+    uint16_t* rope_sin_f16;
+    int8_t*   rope_cos_q8;
+    int8_t*   rope_sin_q8;
 };
 
 // ---------------------------------------------------------------------------
@@ -540,6 +563,107 @@ static void rope_llama_table(float* v, int pos, int n_heads, int head_dim,
     }
 }
 
+static void rope_llama_table_f16(float* v, int pos, int n_heads, int head_dim,
+                                 const uint16_t* rope_cos,
+                                 const uint16_t* rope_sin) {
+    int half = head_dim / 2;
+    const uint16_t* cv = rope_cos + (size_t)pos * half;
+    const uint16_t* sv = rope_sin + (size_t)pos * half;
+    for (int h = 0; h < n_heads; h++) {
+        float* vh = v + (size_t)h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float c = f16_to_f32(cv[i]);
+            float s = f16_to_f32(sv[i]);
+            float a = vh[2 * i], b = vh[2 * i + 1];
+            vh[2 * i]     = a * c - b * s;
+            vh[2 * i + 1] = a * s + b * c;
+        }
+    }
+}
+
+static void rope_llama_table_q8(float* v, int pos, int n_heads, int head_dim,
+                                const int8_t* rope_cos,
+                                const int8_t* rope_sin) {
+    int half = head_dim / 2;
+    const int8_t* cv = rope_cos + (size_t)pos * half;
+    const int8_t* sv = rope_sin + (size_t)pos * half;
+    const float INV = 1.0f / 127.0f;
+    for (int h = 0; h < n_heads; h++) {
+        float* vh = v + (size_t)h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float c = (float)cv[i] * INV;
+            float s = (float)sv[i] * INV;
+            float a = vh[2 * i], b = vh[2 * i + 1];
+            vh[2 * i]     = a * c - b * s;
+            vh[2 * i + 1] = a * s + b * c;
+        }
+    }
+}
+
+static void rope_apply(float* v, int pos, int n_heads, int head_dim,
+                       const forward_ctx* f) {
+    switch (f->rope_mode) {
+    case ROPE_F16:
+        rope_llama_table_f16(v, pos, n_heads, head_dim,
+                             f->rope_cos_f16, f->rope_sin_f16);
+        break;
+    case ROPE_Q8:
+        rope_llama_table_q8(v, pos, n_heads, head_dim,
+                            f->rope_cos_q8, f->rope_sin_q8);
+        break;
+    default:
+        rope_llama_table(v, pos, n_heads, head_dim, f->rope_cos, f->rope_sin);
+        break;
+    }
+}
+
+/* ---- KV store/load helpers.
+   Q8 scale is per-(L,pos); data offset within layer = pos*kv_dim + off. ---- */
+static inline void kv_store_row(int kv_mode, int kv_dim,
+                                float* cf32, uint16_t* cf16,
+                                int8_t* cq8, float* cq8_scale,
+                                int pos, int off, const float* src, int n) {
+    size_t didx = (size_t)pos * kv_dim + off;
+    if (kv_mode == KV_F16) {
+        uint16_t* d = cf16 + didx;
+        for (int i = 0; i < n; i++) d[i] = f32_to_f16(src[i]);
+    } else if (kv_mode == KV_Q8) {
+        float amax = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float a = src[i] < 0 ? -src[i] : src[i];
+            if (a > amax) amax = a;
+        }
+        float sc  = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        float inv = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+        cq8_scale[pos] = sc;
+        int8_t* d = cq8 + didx;
+        for (int i = 0; i < n; i++) {
+            int v = (int)(src[i] * inv + (src[i] >= 0 ? 0.5f : -0.5f));
+            if (v > 127) v = 127; if (v < -127) v = -127;
+            d[i] = (int8_t)v;
+        }
+    } else {
+        memcpy(cf32 + didx, src, n * sizeof(float));
+    }
+}
+
+static inline void kv_load_row(int kv_mode, int kv_dim,
+                               const float* cf32, const uint16_t* cf16,
+                               const int8_t* cq8, const float* cq8_scale,
+                               int pos, int off, float* out, int n) {
+    size_t didx = (size_t)pos * kv_dim + off;
+    if (kv_mode == KV_F16) {
+        const uint16_t* s = cf16 + didx;
+        for (int i = 0; i < n; i++) out[i] = f16_to_f32(s[i]);
+    } else if (kv_mode == KV_Q8) {
+        float sc = cq8_scale[pos];
+        const int8_t* s = cq8 + didx;
+        for (int i = 0; i < n; i++) out[i] = (float)s[i] * sc;
+    } else {
+        memcpy(out, cf32 + didx, n * sizeof(float));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Load
 // ---------------------------------------------------------------------------
@@ -587,6 +711,9 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->head_dim = f->dim / f->n_heads;
     f->kv_dim   = f->n_kv_heads * f->head_dim;
     f->max_seq  = max_seq;
+    f->rope_mode = g_rope_mode;
+    f->kv_mode   = g_kv_mode;
+    f->attn_mode = g_attn_mode;
 
     size_t s_embd  = (size_t)f->vocab_size * f->dim;
     size_t s_q     = (size_t)f->n_layers  * f->dim    * f->dim;
@@ -627,8 +754,21 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->q8_up   = malloc(s_gu   * sizeof(int8_t));  f->q8_sup   = malloc(sgu_sc * sizeof(float));
     f->q8_down = malloc(s_down * sizeof(int8_t));  f->q8_sdown = malloc(sdn_sc  * sizeof(float));
     f->xq_buf  = malloc(xq_size * sizeof(int8_t));
-    f->k_cache      = malloc(s_cache * sizeof(float));
-    f->v_cache      = malloc(s_cache * sizeof(float));
+    /* KV cache: only allocate the active precision. */
+    if (f->kv_mode == KV_F16) {
+        f->k_cache_f16 = malloc(s_cache * sizeof(uint16_t));
+        f->v_cache_f16 = malloc(s_cache * sizeof(uint16_t));
+        f->kv_tmp      = malloc(f->kv_dim * sizeof(float));
+    } else if (f->kv_mode == KV_Q8) {
+        f->k_cache_q8    = malloc(s_cache * sizeof(int8_t));
+        f->v_cache_q8    = malloc(s_cache * sizeof(int8_t));
+        f->k_cache_scale = malloc((size_t)f->n_layers * max_seq * sizeof(float));
+        f->v_cache_scale = malloc((size_t)f->n_layers * max_seq * sizeof(float));
+        f->kv_tmp        = malloc(f->kv_dim * sizeof(float));
+    } else {
+        f->k_cache = malloc(s_cache * sizeof(float));
+        f->v_cache = malloc(s_cache * sizeof(float));
+    }
 
     f->x_buf    = malloc((size_t)max_seq * f->dim      * sizeof(float));
     f->x_norm   = malloc(f->dim         * sizeof(float));
@@ -645,8 +785,29 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     f->ffn_up2   = malloc(f->ffn_hidden  * sizeof(float));
     f->scores   = malloc((size_t)max_seq * sizeof(float));
     int half_hd = f->head_dim / 2;
+    /* Always build F32 table; convert to F16/Q8 if selected. */
     f->rope_cos = malloc((size_t)max_seq * half_hd * sizeof(float));
     f->rope_sin = malloc((size_t)max_seq * half_hd * sizeof(float));
+    if (f->rope_mode == ROPE_F16) {
+        f->rope_cos_f16 = malloc((size_t)max_seq * half_hd * sizeof(uint16_t));
+        f->rope_sin_f16 = malloc((size_t)max_seq * half_hd * sizeof(uint16_t));
+    } else if (f->rope_mode == ROPE_Q8) {
+        f->rope_cos_q8 = malloc((size_t)max_seq * half_hd * sizeof(int8_t));
+        f->rope_sin_q8 = malloc((size_t)max_seq * half_hd * sizeof(int8_t));
+    }
+
+    int kv_ok = 0;
+    if (f->kv_mode == KV_F16)
+        kv_ok = f->k_cache_f16 && f->v_cache_f16 && f->kv_tmp;
+    else if (f->kv_mode == KV_Q8)
+        kv_ok = f->k_cache_q8 && f->v_cache_q8 &&
+                f->k_cache_scale && f->v_cache_scale && f->kv_tmp;
+    else
+        kv_ok = f->k_cache && f->v_cache;
+
+    int rope_ok = f->rope_cos && f->rope_sin;
+    if (f->rope_mode == ROPE_F16) rope_ok = rope_ok && f->rope_cos_f16 && f->rope_sin_f16;
+    if (f->rope_mode == ROPE_Q8)  rope_ok = rope_ok && f->rope_cos_q8  && f->rope_sin_q8;
 
     if (!f->w_token_embd || !f->w_token_embd_f16 || !f->q8_embd || !f->q8_sembd ||
         !f->w_norm || !f->w_attn_norm || !f->w_q ||
@@ -655,11 +816,11 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
         !f->q8_q || !f->q8_sq || !f->q8_k || !f->q8_sk || !f->q8_v || !f->q8_sv ||
         !f->q8_o || !f->q8_so || !f->q8_gate || !f->q8_sgate ||
         !f->q8_up || !f->q8_sup || !f->q8_down || !f->q8_sdown || !f->xq_buf ||
-        !f->k_cache || !f->v_cache ||
+        !kv_ok ||
         !f->x_buf || !f->x_norm || !f->q || !f->k || !f->v ||
         !f->attn_out || !f->o_proj || !f->ffn_gate || !f->ffn_up ||
         !f->ffn_mid || !f->xq_buf2 || !f->ffn_gate2 || !f->ffn_up2 ||
-        !f->scores || !f->rope_cos || !f->rope_sin) {
+        !f->scores || !rope_ok) {
         fprintf(stderr, "forward: alloc failed\n");
         forward_free(f);
         return -1;
@@ -726,6 +887,7 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
     /* Precompute RoPE cos/sin tables for all positions up to max_seq. */
     {
         int half = f->head_dim / 2;
+        size_t n = (size_t)max_seq * half;
         for (int pos = 0; pos < max_seq; pos++) {
             for (int i = 0; i < half; i++) {
                 float freq = 1.0f / powf(f->rope_theta, (2.0f * (float)i) / (float)f->head_dim);
@@ -733,6 +895,21 @@ int forward_load(forward_ctx** out, const gguf_ctx* g, int max_seq) {
                 f->rope_cos[pos * half + i] = cosf(angle);
                 f->rope_sin[pos * half + i] = sinf(angle);
             }
+        }
+        if (f->rope_mode == ROPE_F16) {
+            for (size_t k = 0; k < n; k++) {
+                f->rope_cos_f16[k] = f32_to_f16(f->rope_cos[k]);
+                f->rope_sin_f16[k] = f32_to_f16(f->rope_sin[k]);
+            }
+            free(f->rope_cos); f->rope_cos = NULL;
+            free(f->rope_sin); f->rope_sin = NULL;
+        } else if (f->rope_mode == ROPE_Q8) {
+            for (size_t k = 0; k < n; k++) {
+                f->rope_cos_q8[k] = (int8_t)(f->rope_cos[k] * 127.0f + (f->rope_cos[k] >= 0 ? 0.5f : -0.5f));
+                f->rope_sin_q8[k] = (int8_t)(f->rope_sin[k] * 127.0f + (f->rope_sin[k] >= 0 ? 0.5f : -0.5f));
+            }
+            free(f->rope_cos); f->rope_cos = NULL;
+            free(f->rope_sin); f->rope_sin = NULL;
         }
     }
 
@@ -802,8 +979,14 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
         const float*  su  = f->q8_sup  + (size_t)L * ffn;
         const int8_t* q8d = f->q8_down + (size_t)L * dim  * ffn;
         const float*  sd  = f->q8_sdown+ (size_t)L * dim;
-        float* kc = f->k_cache + (size_t)L * cache_stride;
-        float* vc = f->v_cache + (size_t)L * cache_stride;
+        float* kc = f->k_cache ? f->k_cache + (size_t)L * cache_stride : NULL;
+        float* vc = f->v_cache ? f->v_cache + (size_t)L * cache_stride : NULL;
+        uint16_t* kc_f16 = f->k_cache_f16 ? f->k_cache_f16 + (size_t)L * cache_stride : NULL;
+        uint16_t* vc_f16 = f->v_cache_f16 ? f->v_cache_f16 + (size_t)L * cache_stride : NULL;
+        int8_t*   kc_q8  = f->k_cache_q8  ? f->k_cache_q8  + (size_t)L * cache_stride : NULL;
+        int8_t*   vc_q8  = f->v_cache_q8  ? f->v_cache_q8  + (size_t)L * cache_stride : NULL;
+        float*    ks     = f->k_cache_scale ? f->k_cache_scale + (size_t)L * f->max_seq : NULL;
+        float*    vs     = f->v_cache_scale ? f->v_cache_scale + (size_t)L * f->max_seq : NULL;
 
         for (int t = 0; t < n_tokens; t++) {
             float* xt = f->x_buf + (size_t)t * dim;
@@ -813,10 +996,10 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
             matmul_q8_dot_perrow(f->q, f->xq_buf, xn_sc, q8q, sq, dim, dim);
             matmul_q8_dot_perrow(f->k, f->xq_buf, xn_sc, q8k, sk, dim, kvdim);
             matmul_q8_dot_perrow(f->v, f->xq_buf, xn_sc, q8v, sv, dim, kvdim);
-            rope_llama_table(f->q, t, nh,  hd, f->rope_cos, f->rope_sin);
-            rope_llama_table(f->k, t, nkv, hd, f->rope_cos, f->rope_sin);
-            memcpy(kc + (size_t)t * kvdim, f->k, kvdim * sizeof(float));
-            memcpy(vc + (size_t)t * kvdim, f->v, kvdim * sizeof(float));
+            rope_apply(f->q, t, nh,  hd, f);
+            rope_apply(f->k, t, nkv, hd, f);
+            kv_store_row(f->kv_mode, kvdim, kc, kc_f16, kc_q8, ks, t, 0, f->k, kvdim);
+            kv_store_row(f->kv_mode, kvdim, vc, vc_f16, vc_q8, vs, t, 0, f->v, kvdim);
 
             for (int h = 0; h < nh; h++) {
                 int kvh = h * nkv / nh;
@@ -825,9 +1008,11 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
 
                 float max_s = -INFINITY;
                 for (int s = 0; s <= t; s++) {
-                    const float* ks = kc + (size_t)s * kvdim + kvh * hd;
+                    float ks_local[64];
+                    kv_load_row(f->kv_mode, kvdim, kc, kc_f16, kc_q8, ks,
+                                s, kvh * hd, ks_local, hd);
                     float d = 0.0f;
-                    for (int i = 0; i < hd; i++) d += qh[i] * ks[i];
+                    for (int i = 0; i < hd; i++) d += qh[i] * ks_local[i];
                     d *= inv_sqrt_hd;
                     f->scores[s] = d;
                     if (d > max_s) max_s = d;
@@ -843,8 +1028,10 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                 for (int i = 0; i < hd; i++) oh[i] = 0.0f;
                 for (int s = 0; s <= t; s++) {
                     float w = f->scores[s] * inv_sum;
-                    const float* vs = vc + (size_t)s * kvdim + kvh * hd;
-                    for (int i = 0; i < hd; i++) oh[i] += w * vs[i];
+                    float vs_local[64];
+                    kv_load_row(f->kv_mode, kvdim, vc, vc_f16, vc_q8, vs,
+                                s, kvh * hd, vs_local, hd);
+                    for (int i = 0; i < hd; i++) oh[i] += w * vs_local[i];
                 }
             }
 
@@ -909,10 +1096,20 @@ int forward_vocab_size(const forward_ctx* f) {
 
 void forward_reset(forward_ctx* f) {
     if (!f) return;
-    memset(f->k_cache, 0,
-           (size_t)f->n_layers * f->max_seq * f->kv_dim * sizeof(float));
-    memset(f->v_cache, 0,
-           (size_t)f->n_layers * f->max_seq * f->kv_dim * sizeof(float));
+    size_t cache_n = (size_t)f->n_layers * f->max_seq * f->kv_dim;
+    size_t scale_n = (size_t)f->n_layers * f->max_seq;
+    if (f->kv_mode == KV_F16) {
+        memset(f->k_cache_f16, 0, cache_n * sizeof(uint16_t));
+        memset(f->v_cache_f16, 0, cache_n * sizeof(uint16_t));
+    } else if (f->kv_mode == KV_Q8) {
+        memset(f->k_cache_q8, 0, cache_n * sizeof(int8_t));
+        memset(f->v_cache_q8, 0, cache_n * sizeof(int8_t));
+        memset(f->k_cache_scale, 0, scale_n * sizeof(float));
+        memset(f->v_cache_scale, 0, scale_n * sizeof(float));
+    } else {
+        memset(f->k_cache, 0, cache_n * sizeof(float));
+        memset(f->v_cache, 0, cache_n * sizeof(float));
+    }
 }
 
 int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
@@ -955,16 +1152,22 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
         const float*  sd  = f->q8_sdown+ (size_t)L * dim;
         float* kc = f->k_cache + (size_t)L * cache_stride;
         float* vc = f->v_cache + (size_t)L * cache_stride;
+        uint16_t* kc_f16 = f->k_cache_f16 + (size_t)L * cache_stride;
+        uint16_t* vc_f16 = f->v_cache_f16 + (size_t)L * cache_stride;
+        int8_t*   kc_q8  = f->k_cache_q8  + (size_t)L * cache_stride;
+        int8_t*   vc_q8  = f->v_cache_q8  + (size_t)L * cache_stride;
+        float*    ks     = f->k_cache_scale + (size_t)L * f->max_seq;
+        float*    vs     = f->v_cache_scale + (size_t)L * f->max_seq;
 
         rmsnorm(f->x_norm, x, wan, dim, eps);
         float xa_sc = quantize_row_to_q8_tensor(f->xq_buf, f->x_norm, dim);
         matmul_q8_dot_perrow(f->q, f->xq_buf, xa_sc, q8q, sq, dim, dim);
         matmul_q8_dot_perrow(f->k, f->xq_buf, xa_sc, q8k, sk, dim, kvdim);
         matmul_q8_dot_perrow(f->v, f->xq_buf, xa_sc, q8v, sv, dim, kvdim);
-        rope_llama_table(f->q, pos, nh,  hd, f->rope_cos, f->rope_sin);
-        rope_llama_table(f->k, pos, nkv, hd, f->rope_cos, f->rope_sin);
-        memcpy(kc + (size_t)pos * kvdim, f->k, kvdim * sizeof(float));
-        memcpy(vc + (size_t)pos * kvdim, f->v, kvdim * sizeof(float));
+        rope_apply(f->q, pos, nh,  hd, f);
+        rope_apply(f->k, pos, nkv, hd, f);
+        kv_store_row(f->kv_mode, kvdim, kc, kc_f16, kc_q8, ks, pos, 0, f->k, kvdim);
+        kv_store_row(f->kv_mode, kvdim, vc, vc_f16, vc_q8, vs, pos, 0, f->v, kvdim);
 
         for (int h = 0; h < nh; h++) {
             int kvh = h * nkv / nh;
@@ -972,29 +1175,27 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
             float* oh = f->attn_out + h * hd;
 
             float max_s = -INFINITY;
-#ifdef __ARM_NEON
             for (int s = 0; s <= pos; s++) {
-                const float* ks = kc + (size_t)s * kvdim + kvh * hd;
+                float ks_local[64];
+                kv_load_row(f->kv_mode, kvdim, kc, kc_f16, kc_q8, ks,
+                            s, kvh * hd, ks_local, hd);
+#ifdef __ARM_NEON
                 float32x4_t a0=vdupq_n_f32(0),a1=vdupq_n_f32(0);
                 float32x4_t a2=vdupq_n_f32(0),a3=vdupq_n_f32(0);
                 for (int i = 0; i <= hd-16; i += 16) {
-                    a0=vfmaq_f32(a0,vld1q_f32(qh+i),   vld1q_f32(ks+i));
-                    a1=vfmaq_f32(a1,vld1q_f32(qh+i+4), vld1q_f32(ks+i+4));
-                    a2=vfmaq_f32(a2,vld1q_f32(qh+i+8), vld1q_f32(ks+i+8));
-                    a3=vfmaq_f32(a3,vld1q_f32(qh+i+12),vld1q_f32(ks+i+12));
+                    a0=vfmaq_f32(a0,vld1q_f32(qh+i),   vld1q_f32(ks_local+i));
+                    a1=vfmaq_f32(a1,vld1q_f32(qh+i+4), vld1q_f32(ks_local+i+4));
+                    a2=vfmaq_f32(a2,vld1q_f32(qh+i+8), vld1q_f32(ks_local+i+8));
+                    a3=vfmaq_f32(a3,vld1q_f32(qh+i+12),vld1q_f32(ks_local+i+12));
                 }
                 float d = vaddvq_f32(vaddq_f32(vaddq_f32(a0,a1),vaddq_f32(a2,a3))) * inv_sqrt_hd;
+#else
+                float d = 0.0f;
+                for (int i = 0; i < hd; i++) d += qh[i] * ks_local[i];
+                d *= inv_sqrt_hd;
+#endif
                 f->scores[s] = d; if (d > max_s) max_s = d;
             }
-#else
-            for (int s = 0; s <= pos; s++) {
-                const float* ks = kc + (size_t)s * kvdim + kvh * hd;
-                float d = 0.0f;
-                for (int i = 0; i < hd; i++) d += qh[i] * ks[i];
-                d *= inv_sqrt_hd; f->scores[s] = d;
-                if (d > max_s) max_s = d;
-            }
-#endif
             float sum = 0.0f;
             for (int s = 0; s <= pos; s++) {
                 float e = fast_expf(f->scores[s] - max_s);
@@ -1003,25 +1204,23 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
             }
             float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
             for (int i = 0; i < hd; i++) oh[i] = 0.0f;
-#ifdef __ARM_NEON
             for (int s = 0; s <= pos; s++) {
                 float w = f->scores[s] * inv_sum;
-                const float* vs = vc + (size_t)s * kvdim + kvh * hd;
+                float vs_local[64];
+                kv_load_row(f->kv_mode, kvdim, vc, vc_f16, vc_q8, vs,
+                            s, kvh * hd, vs_local, hd);
+#ifdef __ARM_NEON
                 float32x4_t vw = vdupq_n_f32(w);
                 for (int i = 0; i <= hd-16; i += 16) {
-                    vst1q_f32(oh+i,    vfmaq_f32(vld1q_f32(oh+i),    vw, vld1q_f32(vs+i)));
-                    vst1q_f32(oh+i+4,  vfmaq_f32(vld1q_f32(oh+i+4),  vw, vld1q_f32(vs+i+4)));
-                    vst1q_f32(oh+i+8,  vfmaq_f32(vld1q_f32(oh+i+8),  vw, vld1q_f32(vs+i+8)));
-                    vst1q_f32(oh+i+12, vfmaq_f32(vld1q_f32(oh+i+12), vw, vld1q_f32(vs+i+12)));
+                    vst1q_f32(oh+i,    vfmaq_f32(vld1q_f32(oh+i),    vw, vld1q_f32(vs_local+i)));
+                    vst1q_f32(oh+i+4,  vfmaq_f32(vld1q_f32(oh+i+4),  vw, vld1q_f32(vs_local+i+4)));
+                    vst1q_f32(oh+i+8,  vfmaq_f32(vld1q_f32(oh+i+8),  vw, vld1q_f32(vs_local+i+8)));
+                    vst1q_f32(oh+i+12, vfmaq_f32(vld1q_f32(oh+i+12), vw, vld1q_f32(vs_local+i+12)));
                 }
-            }
 #else
-            for (int s = 0; s <= pos; s++) {
-                float w = f->scores[s] * inv_sum;
-                const float* vs = vc + (size_t)s * kvdim + kvh * hd;
-                for (int i = 0; i < hd; i++) oh[i] += w * vs[i];
-            }
+                for (int i = 0; i < hd; i++) oh[i] += w * vs_local[i];
 #endif
+            }
         }
 
         float ao_sc = quantize_row_to_q8_tensor(f->xq_buf, f->attn_out, dim);
@@ -1065,6 +1264,10 @@ void forward_free(forward_ctx* f) {
     free(f->xq_buf);
     free(f->k_cache);
     free(f->v_cache);
+    free(f->k_cache_f16);  free(f->v_cache_f16);
+    free(f->k_cache_q8);   free(f->v_cache_q8);
+    free(f->k_cache_scale); free(f->v_cache_scale);
+    free(f->kv_tmp);
     free(f->w_token_embd_f16);
     free(f->q8_embd); free(f->q8_sembd);
     free(f->x_buf);
@@ -1079,5 +1282,7 @@ void forward_free(forward_ctx* f) {
     free(f->ffn_mid);
     free(f->xq_buf2); free(f->ffn_gate2); free(f->ffn_up2);
     free(f->scores); free(f->rope_cos); free(f->rope_sin);
+    free(f->rope_cos_f16); free(f->rope_sin_f16);
+    free(f->rope_cos_q8);  free(f->rope_sin_q8);
     free(f);
 }

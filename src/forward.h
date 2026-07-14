@@ -7,6 +7,13 @@
 
 typedef struct forward_ctx forward_ctx;
 
+/* Runtime mode axes (default = current baseline). Set before forward_load. */
+enum rope_mode { ROPE_F32 = 0, ROPE_F16 = 1, ROPE_Q8 = 2 };
+enum kv_mode   { KV_F32   = 0, KV_F16   = 1, KV_Q8   = 2 };
+enum attn_mode { ATTN_NAIVE = 0, ATTN_FLASH = 1 };
+
+void forward_set_modes(int rope, int kv, int attn);
+
 // Load model weights from parsed GGUF into F32 buffers + allocate KV cache.
 // max_seq caps how many tokens a single prefill can process.
 // Returns 0 on success, -1 on error.
