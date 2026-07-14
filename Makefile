@@ -16,6 +16,7 @@ SRC = \
     src/backward.c \
     src/hw_probe.c \
     src/train.c \
+    src/attn_registry.c \
     src/studio.c \
     src/main.c
 

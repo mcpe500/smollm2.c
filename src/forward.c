@@ -2,6 +2,7 @@
 
 #include "forward.h"
 #include "gguf.h"
+#include "attn_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1006,8 +1007,9 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                 const float* qh = f->q + h * hd;
                 float* oh = f->attn_out + h * hd;
 
+                int s_start = attn_s_start(L, t);
                 float max_s = -INFINITY;
-                for (int s = 0; s <= t; s++) {
+                for (int s = s_start; s <= t; s++) {
                     float ks_local[64];
                     kv_load_row(f->kv_mode, kvdim, kc, kc_f16, kc_q8, ks,
                                 s, kvh * hd, ks_local, hd);
@@ -1018,7 +1020,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                     if (d > max_s) max_s = d;
                 }
                 float sum = 0.0f;
-                for (int s = 0; s <= t; s++) {
+                for (int s = s_start; s <= t; s++) {
                     float e = fast_expf(f->scores[s] - max_s);
                     f->scores[s] = e;
                     sum += e;
@@ -1026,7 +1028,7 @@ int forward_prefill(forward_ctx* f, const int* tokens, int n_tokens,
                 float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
 
                 for (int i = 0; i < hd; i++) oh[i] = 0.0f;
-                for (int s = 0; s <= t; s++) {
+                for (int s = s_start; s <= t; s++) {
                     float w = f->scores[s] * inv_sum;
                     float vs_local[64];
                     kv_load_row(f->kv_mode, kvdim, vc, vc_f16, vc_q8, vs,
@@ -1100,6 +1102,10 @@ const float* forward_last_hidden(const forward_ctx* f) {
 
 int forward_dim(const forward_ctx* f) {
     return f ? f->dim : 0;
+}
+
+int forward_n_layers(const forward_ctx* f) {
+    return f ? f->n_layers : 0;
 }
 
 void forward_reset(forward_ctx* f) {
@@ -1182,8 +1188,9 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
             const float* qh = f->q + h * hd;
             float* oh = f->attn_out + h * hd;
 
+            int s_start = attn_s_start(L, pos);
             float max_s = -INFINITY;
-            for (int s = 0; s <= pos; s++) {
+            for (int s = s_start; s <= pos; s++) {
                 float ks_local[64];
                 kv_load_row(f->kv_mode, kvdim, kc, kc_f16, kc_q8, ks,
                             s, kvh * hd, ks_local, hd);
@@ -1205,14 +1212,14 @@ int forward_decode(forward_ctx* f, int token, int pos, float* logits_out) {
                 f->scores[s] = d; if (d > max_s) max_s = d;
             }
             float sum = 0.0f;
-            for (int s = 0; s <= pos; s++) {
+            for (int s = s_start; s <= pos; s++) {
                 float e = fast_expf(f->scores[s] - max_s);
                 f->scores[s] = e;
                 sum += e;
             }
             float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
             for (int i = 0; i < hd; i++) oh[i] = 0.0f;
-            for (int s = 0; s <= pos; s++) {
+            for (int s = s_start; s <= pos; s++) {
                 float w = f->scores[s] * inv_sum;
                 float vs_local[64];
                 kv_load_row(f->kv_mode, kvdim, vc, vc_f16, vc_q8, vs,

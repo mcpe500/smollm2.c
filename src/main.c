@@ -7,6 +7,7 @@
 #include "tui.h"
 #include "web.h"
 #include "studio.h"
+#include "attn_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -628,7 +629,8 @@ static void usage(const char* prog) {
         "  --heavy-verify-n <n> Verify token budget (default 64).\n"
         "  --rope <f32|f16|q8>  RoPE table precision (default f32).\n"
         "  --kv   <f32|f16|q8>  KV cache precision (default f32).\n"
-        "  --attn <naive|flash> Attention kernel (default naive).\n"
+        "  --attn <naive|flash|dense|swa:window=N> Attention (default naive/dense).\n"
+        "  --attn-config <path> Per-layer JSON config (see spec/010).\n"
         "  -h / --help          Show this help.\n",
         prog, prog, prog);
 }
@@ -649,6 +651,8 @@ int main(int argc, char** argv) {
     int n_tokens = 200;
     int heavy = 0, heavy_think_n = 128, heavy_verify_n = 64;
     int rope_mode = ROPE_F32, kv_mode = KV_F32, attn_mode = ATTN_NAIVE;
+    int attn_swa_window = 0;              /* 0 = dense */
+    const char* attn_config_path = NULL;
     sample_params sp = {0.3f, 0.0f, 5, 1.1f, 0};
 
     for (int i = 1; i < argc; i++) {
@@ -682,9 +686,25 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--attn") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
-            if      (strcmp(v, "naive") == 0) attn_mode = ATTN_NAIVE;
-            else if (strcmp(v, "flash") == 0) attn_mode = ATTN_FLASH;
-            else { fprintf(stderr, "invalid --attn value: %s (want naive|flash)\n", v); return 1; }
+            if      (strcmp(v, "naive") == 0) { attn_mode = ATTN_NAIVE; attn_swa_window = 0; }
+            else if (strcmp(v, "flash") == 0) { attn_mode = ATTN_FLASH; attn_swa_window = 0; }
+            else if (strcmp(v, "dense") == 0) { attn_mode = ATTN_NAIVE; attn_swa_window = 0; }
+            else if (strncmp(v, "swa", 3) == 0) {
+                attn_mode = ATTN_NAIVE; attn_swa_window = 256;
+                const char* colon = strchr(v, ':');
+                if (colon) {
+                    const char* eq = strstr(colon, "window=");
+                    if (eq) attn_swa_window = atoi(eq + 7);
+                }
+                if (attn_swa_window <= 0) {
+                    fprintf(stderr, "invalid --attn %s (want swa:window=N)\n", v);
+                    return 1;
+                }
+            }
+            else { fprintf(stderr, "invalid --attn value: %s (want naive|flash|dense|swa:window=N)\n", v); return 1; }
+        }
+        else if (strcmp(argv[i], "--attn-config") == 0 && i + 1 < argc) {
+            attn_config_path = argv[++i];
         }
         else if (strcmp(argv[i], "--tui") == 0) do_tui = 1;
         else if (strcmp(argv[i], "--web") == 0) do_web = 1;
@@ -700,6 +720,16 @@ int main(int argc, char** argv) {
 
     int resolver_allocated = 0;
     forward_set_modes(rope_mode, kv_mode, attn_mode);
+    /* Apply attention registry. --attn-config overrides --attn. */
+    if (attn_config_path) {
+        /* SmolLM2-135M has 30 layers; load_config pads remaining with default. */
+        if (attn_load_config(attn_config_path, 30) < 0) {
+            fprintf(stderr, "attn-config: failed to load %s\n", attn_config_path);
+            return 1;
+        }
+    } else if (attn_swa_window > 0) {
+        attn_set_default_spec(ATTN_TYPE_SWA, attn_swa_window, 1, 0, 0);
+    }
     if (!model_path) {
         model_path = resolve_ollama_model_path();
         if (!model_path) {

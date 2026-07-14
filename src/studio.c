@@ -8,6 +8,7 @@
 #include "forward.h"
 #include "hw_probe.h"
 #include "train.h"
+#include "attn_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +25,9 @@ static int usage() {
         "  studio train        --data <packed.bin> --mode lora|qlora|fullft [--rank N] [--epochs N]\n"
         "                      [--lr F] [--seq N] [--batch N] [--max-steps N] [--out-dir DIR] [--model <gguf>]\n"
         "                      [--simulate-mem-kb N]\n"
-        "  studio merge        --base <gguf> --adapter <lora.bin> --out <merged.gguf>\n");
+        "  studio merge        --base <gguf> --adapter <lora.bin> --out <merged.gguf>\n"
+        "  studio attn-list\n"
+        "  studio attn-config  --config <layers.json> [--layers N]\n");
     return 1;
 }
 
@@ -211,6 +214,54 @@ static int cmd_merge(int argc, char** argv) {
     return train_merge(base, adapter, out) < 0 ? 1 : 0;
 }
 
+static const char* attn_type_name(int t) {
+    switch (t) {
+    case ATTN_TYPE_DENSE:   return "dense";
+    case ATTN_TYPE_SWA:     return "swa";
+    case ATTN_TYPE_DILATED: return "dilated";
+    case ATTN_TYPE_BIGBIRD: return "bigbird";
+    case ATTN_TYPE_GLOCAL:  return "glocal";
+    case ATTN_TYPE_MLA:     return "mla";
+    default:                return "unknown";
+    }
+}
+
+static int cmd_attn_list(int argc, char** argv) {
+    (void)argc; (void)argv;
+    printf("registered variants: dense, swa, dilated(stub), bigbird(stub), glocal(stub), mla(stub)\n");
+    int n = attn_n_layers();
+    if (n <= 0) {
+        /* Dump default */
+        attn_spec s;
+        attn_get_spec(0, &s);  /* returns default when empty */
+        printf("default: type=%s window=%d dilation=%d n_global=%d latent_dim=%d\n",
+               attn_type_name(s.type), s.window, s.dilation, s.n_global, s.latent_dim);
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        attn_spec s;
+        attn_get_spec(i, &s);
+        printf("L%02d type=%s window=%d dilation=%d n_global=%d latent_dim=%d\n",
+               i, attn_type_name(s.type), s.window, s.dilation, s.n_global, s.latent_dim);
+    }
+    return 0;
+}
+
+static int cmd_attn_config(int argc, char** argv) {
+    const char* cfg = NULL;
+    int layers = 30;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) cfg = argv[++i];
+        else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) layers = atoi(argv[++i]);
+    }
+    if (!cfg) { fprintf(stderr, "attn-config: --config required\n"); return 1; }
+    if (attn_load_config(cfg, layers) < 0) {
+        fprintf(stderr, "attn-config: load failed\n");
+        return 1;
+    }
+    return cmd_attn_list(0, NULL);
+}
+
 int studio_dispatch(int argc, char** argv) {
     if (argc < 1) return usage();
     if (strcmp(argv[0], "data-build") == 0)    return cmd_data_build(argc - 1, argv + 1);
@@ -220,5 +271,7 @@ int studio_dispatch(int argc, char** argv) {
     if (strcmp(argv[0], "hw") == 0)           return cmd_hw(argc - 1, argv + 1);
     if (strcmp(argv[0], "train") == 0)        return cmd_train(argc - 1, argv + 1);
     if (strcmp(argv[0], "merge") == 0)        return cmd_merge(argc - 1, argv + 1);
+    if (strcmp(argv[0], "attn-list") == 0)    return cmd_attn_list(argc - 1, argv + 1);
+    if (strcmp(argv[0], "attn-config") == 0)  return cmd_attn_config(argc - 1, argv + 1);
     return usage();
 }

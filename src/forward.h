@@ -42,5 +42,6 @@ void forward_reset(forward_ctx* f);
 // Valid only immediately after forward_prefill; pointer owned by ctx.
 const float* forward_last_hidden(const forward_ctx* f);
 int          forward_dim(const forward_ctx* f);
+int          forward_n_layers(const forward_ctx* f);
 
 #endif // FORWARD_H
