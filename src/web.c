@@ -154,11 +154,60 @@ static const char* kStudioHTML =
 "</nav></header>"
 "<main>"
 "<section class=\"tab active\" id=\"tab-infer\">"
-"<label>Prompt</label><textarea id=\"inf-p\" rows=\"3\">hello</textarea>"
-"<label>Tokens</label><input id=\"inf-n\" type=\"number\" value=\"64\">"
+"<details open><summary style=\"cursor:pointer;color:#60a5fa;font-size:13px\">"
+"⚙ Sampling &amp; inference</summary>"
+"<div class=\"row\" style=\"margin-top:8px\">"
+"<div><label>Temperature <span id=\"v-temp\">0.8</span></label>"
+"<input type=\"range\" id=\"inf-temp\" min=\"0\" max=\"2\" step=\"0.05\" value=\"0.8\" "
+"oninput=\"document.getElementById('v-temp').textContent=this.value\"></div>"
+"<div><label>Top-p <span id=\"v-topp\">0.9</span></label>"
+"<input type=\"range\" id=\"inf-topp\" min=\"0\" max=\"1\" step=\"0.05\" value=\"0.9\" "
+"oninput=\"document.getElementById('v-topp').textContent=this.value\"></div>"
+"<div><label>Top-k <span id=\"v-topk\">40</span></label>"
+"<input type=\"range\" id=\"inf-topk\" min=\"0\" max=\"100\" step=\"1\" value=\"40\" "
+"oninput=\"document.getElementById('v-topk').textContent=this.value\"></div>"
+"<div><label>Rep-penalty <span id=\"v-rep\">1.1</span></label>"
+"<input type=\"range\" id=\"inf-rep\" min=\"1\" max=\"2\" step=\"0.05\" value=\"1.1\" "
+"oninput=\"document.getElementById('v-rep').textContent=this.value\"></div>"
+"<div><label>Tokens (max)</label>"
+"<input type=\"range\" id=\"inf-n\" min=\"1\" max=\"512\" step=\"1\" value=\"128\" "
+"oninput=\"document.getElementById('v-n').textContent=this.value\">"
+"<span id=\"v-n\" style=\"color:#9ca3af\">128</span></div>"
+"<div><label>Seed</label>"
+"<input id=\"inf-seed\" type=\"number\" value=\"0\" placeholder=\"0=random\"></div>"
+"</div>"
+"<div class=\"row\" style=\"margin-top:8px\">"
+"<div><label>Attention</label>"
+"<select id=\"inf-attn\">"
+"<option value=\"dense\">dense (GQA, default)</option>"
+"<option value=\"swa:window=64\">SWA window=64</option>"
+"<option value=\"swa:window=128\">SWA window=128</option>"
+"<option value=\"swa:window=256\">SWA window=256</option>"
+"<option value=\"swa:window=512\">SWA window=512</option>"
+"</select></div>"
+"<div><label>RoPE precision</label>"
+"<select id=\"inf-rope\"><option value=\"f32\">f32</option>"
+"<option value=\"f16\">f16</option><option value=\"q8\">q8</option></select></div>"
+"<div><label>KV cache precision</label>"
+"<select id=\"inf-kv\"><option value=\"f32\">f32</option>"
+"<option value=\"f16\">f16</option><option value=\"q8\">q8</option></select></div>"
+"<div><label style=\"display:flex;align-items:center;gap:8px;margin-top:24px\">"
+"<input type=\"checkbox\" id=\"inf-template\" checked style=\"width:auto\">"
+"ChatML template</label>"
+"<label style=\"display:flex;align-items:center;gap:8px\">"
+"<input type=\"checkbox\" id=\"inf-stop\" checked style=\"width:auto\">"
+"Stop on &lt;|im_end|&gt;</label></div>"
+"</div>"
+"</details>"
+
+"<label>System (optional)</label>"
+"<textarea id=\"inf-sys\" rows=\"2\" placeholder=\"You are a helpful AI assistant named SmolLM, trained by Hugging Face\">"
+"You are a helpful AI assistant named SmolLM, trained by Hugging Face</textarea>"
+"<label>Prompt</label>"
+"<textarea id=\"inf-p\" rows=\"3\">hello</textarea>"
 "<button class=\"primary\" id=\"inf-go\">Generate</button>"
 "<div class=\"status\" id=\"inf-st\">Ready.</div>"
-"<pre class=\"log\" id=\"inf-out\"></pre></section>"
+"<pre class=\"log\" id=\"inf-out\" style=\"max-height:380px\"></pre></section>"
 "<section class=\"tab\" id=\"tab-hw\">"
 "<button class=\"primary\" id=\"hw-go\">Probe</button>"
 "<pre class=\"log\" id=\"hw-out\">(click Probe)</pre></section>"
@@ -220,12 +269,22 @@ static const char* kStudioHTML =
 "document.getElementById('mg-out-log').textContent=JSON.stringify(await jpost('/studio/merge',body),null,2);};"
 "document.getElementById('inf-go').onclick=async()=>{"
 "const p=document.getElementById('inf-p').value;"
-"const n=+document.getElementById('inf-n').value||64;"
+"const n=+document.getElementById('inf-n').value||128;"
+"const body={prompt:p,n:n,"
+"temperature:+document.getElementById('inf-temp').value,"
+"top_p:+document.getElementById('inf-topp').value,"
+"top_k:+document.getElementById('inf-topk').value,"
+"rep_penalty:+document.getElementById('inf-rep').value,"
+"seed:+document.getElementById('inf-seed').value||0,"
+"attn:document.getElementById('inf-attn').value,"
+"rope:document.getElementById('inf-rope').value,"
+"kv:document.getElementById('inf-kv').value,"
+"system:document.getElementById('inf-sys').value,"
+"template:document.getElementById('inf-template').checked?1:0};"
 "const out=document.getElementById('inf-out');out.textContent='';"
 "const st=document.getElementById('inf-st');st.textContent='Generating...';"
 "try{const r=await fetch('/studio/infer',{method:'POST',"
-"headers:{'Content-Type':'application/json'},"
-"body:JSON.stringify({prompt:p,n:n})});"
+"headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
 "const reader=r.body.getReader();const dec=new TextDecoder();let buf='',text='';"
 "while(true){const{done,value}=await reader.read();if(done)break;"
 "buf+=dec.decode(value,{stream:true});let idx;"
@@ -630,7 +689,7 @@ static void handle_studio_merge(int fd, const char* body) {
 
 static void handle_generate(int fd, const char* body,
                             const char* model_path,
-                            const sample_params* sp) {
+                            const sample_params* sp_default) {
     char prompt[2048];
     int plen = json_extract_string(body, "prompt", prompt, sizeof(prompt));
     int max_new = json_extract_int(body, "n", 200);
@@ -638,6 +697,55 @@ static void handle_generate(int fd, const char* body,
         const char* err = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
         send_all(fd, err, strlen(err));
         return;
+    }
+
+    /* Per-request overrides — fall back to server defaults. */
+    sample_params sp = *sp_default;
+    const char* pv;
+    pv = json_find_key(body, "temperature"); if (pv) sp.temperature = (float)atof(pv);
+    pv = json_find_key(body, "top_p");       if (pv) sp.top_p       = (float)atof(pv);
+    pv = json_find_key(body, "rep_penalty"); if (pv) sp.rep_penalty = (float)atof(pv);
+    pv = json_find_key(body, "top_k");       if (pv) sp.top_k       = atoi(pv);
+    pv = json_find_key(body, "seed");        if (pv) sp.seed        = (unsigned)atoi(pv);
+
+    /* System prompt + chat template toggle. */
+    char system_msg[1024];
+    int syslen = json_extract_string(body, "system", system_msg, sizeof(system_msg));
+    int use_template = json_extract_int(body, "template", 1);
+
+    /* Rope/KV precision + attention variant — apply before forward_load. */
+    int rope_v = -1, kv_v = -1;
+    char rope_s[16] = {0}, kv_s[16] = {0}, attn_s[64] = {0};
+    json_extract_string(body, "rope", rope_s, sizeof(rope_s));
+    json_extract_string(body, "kv",   kv_s,   sizeof(kv_s));
+    json_extract_string(body, "attn", attn_s, sizeof(attn_s));
+    if (strcmp(rope_s, "f32") == 0) rope_v = ROPE_F32;
+    else if (strcmp(rope_s, "f16") == 0) rope_v = ROPE_F16;
+    else if (strcmp(rope_s, "q8") == 0)   rope_v = ROPE_Q8;
+    if (strcmp(kv_s, "f32") == 0) kv_v = KV_F32;
+    else if (strcmp(kv_s, "f16") == 0) kv_v = KV_F16;
+    else if (strcmp(kv_s, "q8") == 0)   kv_v = KV_Q8;
+    /* attn: "dense" | "swa:window=N" — applied via attn_set_default_spec */
+    if (attn_s[0]) {
+        attn_reset();
+        if (strncmp(attn_s, "swa", 3) == 0) {
+            int w = 256;
+            const char* col = strchr(attn_s, ':');
+            if (col) {
+                const char* eq = strstr(col, "window=");
+                if (eq) w = atoi(eq + 7);
+            }
+            if (w > 0) attn_set_default_spec(ATTN_TYPE_SWA, w, 1, 0, 0);
+        } else {
+            attn_set_default_spec(ATTN_TYPE_DENSE, 0, 1, 0, 0);
+        }
+    }
+    if (rope_v >= 0 || kv_v >= 0) {
+        /* Preserve previous rope/kv when caller specified only one. */
+        static int s_rope = ROPE_F32, s_kv = KV_F32;
+        if (rope_v >= 0) s_rope = rope_v;
+        if (kv_v   >= 0) s_kv   = kv_v;
+        forward_set_modes(s_rope, s_kv, ATTN_NAIVE);
     }
 
     // Send SSE headers
@@ -672,13 +780,27 @@ static void handle_generate(int fd, const char* body,
         return;
     }
 
-    // Build chat template
+    // Build chat template (toggleable)
     char tmpl[4096];
-    snprintf(tmpl, sizeof(tmpl),
-        "<|im_start|>user\n%s<|im_end|>\n"
-        "<|im_start|>assistant\n", prompt);
-    int prompt_ids[1024];
-    int prompt_len = tokenizer_encode(tok, tmpl, prompt_ids, 1024);
+    if (use_template) {
+        if (syslen > 0) {
+            snprintf(tmpl, sizeof(tmpl),
+                "<|im_start|>system\n%s<|im_end|>\n"
+                "<|im_start|>user\n%s<|im_end|>\n"
+                "<|im_start|>assistant\n", system_msg, prompt);
+        } else {
+            snprintf(tmpl, sizeof(tmpl),
+                "<|im_start|>system\n"
+                "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
+                "<|im_end|>\n"
+                "<|im_start|>user\n%s<|im_end|>\n"
+                "<|im_start|>assistant\n", prompt);
+        }
+    } else {
+        snprintf(tmpl, sizeof(tmpl), "%s", prompt);
+    }
+    int prompt_ids[2048];
+    int prompt_len = tokenizer_encode(tok, tmpl, prompt_ids, 2048);
     if (prompt_len <= 0) {
         forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
         send_chunk(fd, "", 0);
@@ -708,7 +830,7 @@ static void handle_generate(int fd, const char* body,
     char json_buf[1024];
 
     while (gen_n < max_new) {
-        int next = sample_token(logits, vocab, sp, gen, gen_n);
+        int next = sample_token(logits, vocab, &sp, gen, gen_n);
         if (next == IM_END_TOKEN) break;
         gen[gen_n++] = next;
 
