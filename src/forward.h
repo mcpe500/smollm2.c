@@ -38,4 +38,9 @@ int  forward_decode(forward_ctx* f, int token, int pos, float* logits_out);
 // Clear KV cache. Call before starting a new conversation.
 void forward_reset(forward_ctx* f);
 
+// Studio training: expose final hidden state (post rmsnorm, pre lm_head).
+// Valid only immediately after forward_prefill; pointer owned by ctx.
+const float* forward_last_hidden(const forward_ctx* f);
+int          forward_dim(const forward_ctx* f);
+
 #endif // FORWARD_H

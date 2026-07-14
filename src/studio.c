@@ -1,10 +1,13 @@
-// studio.c — subcommand dispatcher for studio phase 1
+// studio.c — subcommand dispatcher for studio phase 1+2
 #include "studio.h"
 #include "data.h"
 #include "gguf_write.h"
 #include "backward.h"
 #include "tokenizer.h"
 #include "gguf.h"
+#include "forward.h"
+#include "hw_probe.h"
+#include "train.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +19,12 @@ static int usage() {
         "  studio data-build    --in <file> --out <packed.bin> [--fmt auto|raw|instruct|sharegpt] [--model <gguf>]\n"
         "  studio data-inspect --packed <packed.bin>\n"
         "  studio gguf-rewrite --in <base.gguf> --out <copy.gguf>\n"
-        "  studio grad-check   [--m N --n N --k N] [--eps 1e-3]\n");
+        "  studio grad-check   [--m N --n N --k N] [--eps 1e-3]\n"
+        "  studio hw\n"
+        "  studio train        --data <packed.bin> --mode lora|qlora|fullft [--rank N] [--epochs N]\n"
+        "                      [--lr F] [--seq N] [--batch N] [--max-steps N] [--out-dir DIR] [--model <gguf>]\n"
+        "                      [--simulate-mem-kb N]\n"
+        "  studio merge        --base <gguf> --adapter <lora.bin> --out <merged.gguf>\n");
     return 1;
 }
 
@@ -93,11 +101,124 @@ static int cmd_grad_check(int argc, char** argv) {
     return err < 1e-3f ? 0 : 1;
 }
 
+static int cmd_hw(int argc, char** argv) {
+    (void)argc; (void)argv;
+    hw_caps c;
+    hw_probe(&c);
+    hw_print(&c);
+    return 0;
+}
+
+static int cmd_train(int argc, char** argv) {
+    const char* data = NULL, *mode_s = "lora", *model = NULL, *out_dir = "adapters";
+    train_params p;
+    memset(&p, 0, sizeof(p));
+    p.mode = TRAIN_LORA;
+    p.lora_rank = 8;
+    p.lora_alpha = 16;
+    p.seq_max = 128;
+    p.batch = 1;
+    p.lr = 1e-4f;
+    p.epochs = 1;
+    p.checkpoint_every = 5;
+    p.max_steps = 0;
+    p.seed = 42;
+    p.simulate_mem_kb = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) data = argv[++i];
+        else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) mode_s = argv[++i];
+        else if (strcmp(argv[i], "--rank") == 0 && i + 1 < argc) p.lora_rank = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) p.epochs = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) p.lr = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--seq") == 0 && i + 1 < argc) p.seq_max = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) p.batch = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-steps") == 0 && i + 1 < argc) p.max_steps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--out-dir") == 0 && i + 1 < argc) out_dir = argv[++i];
+        else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) model = argv[++i];
+        else if (strcmp(argv[i], "--simulate-mem-kb") == 0 && i + 1 < argc)
+            p.simulate_mem_kb = atol(argv[++i]);
+    }
+    if (!data || !model) {
+        fprintf(stderr, "train: --data and --model required\n");
+        return 1;
+    }
+    if (strcmp(mode_s, "lora") == 0) p.mode = TRAIN_LORA;
+    else if (strcmp(mode_s, "qlora") == 0) p.mode = TRAIN_QLORA;
+    else if (strcmp(mode_s, "fullft") == 0) p.mode = TRAIN_FULLFT;
+    else { fprintf(stderr, "train: unknown mode %s\n", mode_s); return 1; }
+
+    hw_caps caps;
+    hw_probe(&caps);
+    if (p.simulate_mem_kb > 0) caps.mem_avail_kb = p.simulate_mem_kb;
+
+    if (p.mode == TRAIN_FULLFT) {
+        long need = 2.5L * 1024 * 1024;  /* 2.5 GB */
+        if (caps.mem_avail_kb < need) {
+            fprintf(stderr,
+                "train: fullft refused — insufficient mem "
+                "(avail=%ld MB, need>=2560 MB)\n",
+                caps.mem_avail_kb / 1024);
+            return 1;
+        }
+    }
+    if (p.mode == TRAIN_LORA || p.mode == TRAIN_QLORA) {
+        long need = 800 * 1024;  /* 800 MB */
+        if (caps.mem_avail_kb < need) {
+            fprintf(stderr,
+                "train: lora refused — insufficient mem "
+                "(avail=%ld MB, need>=800 MB)\n",
+                caps.mem_avail_kb / 1024);
+            return 1;
+        }
+    }
+
+    gguf_ctx g;
+    if (gguf_load(model, &g) < 0) {
+        fprintf(stderr, "train: cannot load model %s\n", model);
+        return 1;
+    }
+    forward_ctx* fwd = NULL;
+    if (forward_load(&fwd, &g, p.seq_max + 8) < 0) {
+        fprintf(stderr, "train: forward_load failed\n");
+        gguf_free(&g);
+        return 1;
+    }
+    train_state* ts = train_create(fwd, &p);
+    if (!ts) {
+        fprintf(stderr, "train: train_create failed\n");
+        forward_free(fwd); gguf_free(&g);
+        return 1;
+    }
+    int rc = train_run(ts, data, &p, out_dir);
+    train_free(ts);
+    forward_free(fwd);
+    gguf_free(&g);
+    return rc < 0 ? 1 : 0;
+}
+
+static int cmd_merge(int argc, char** argv) {
+    const char* base = NULL, *adapter = NULL, *out = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--base") == 0 && i + 1 < argc) base = argv[++i];
+        else if (strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) adapter = argv[++i];
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out = argv[++i];
+    }
+    if (!base || !adapter || !out) {
+        fprintf(stderr, "merge: --base --adapter --out required\n");
+        return 1;
+    }
+    return train_merge(base, adapter, out) < 0 ? 1 : 0;
+}
+
 int studio_dispatch(int argc, char** argv) {
     if (argc < 1) return usage();
     if (strcmp(argv[0], "data-build") == 0)    return cmd_data_build(argc - 1, argv + 1);
     if (strcmp(argv[0], "data-inspect") == 0)  return cmd_data_inspect(argc - 1, argv + 1);
     if (strcmp(argv[0], "gguf-rewrite") == 0) return cmd_gguf_rewrite(argc - 1, argv + 1);
     if (strcmp(argv[0], "grad-check") == 0)   return cmd_grad_check(argc - 1, argv + 1);
+    if (strcmp(argv[0], "hw") == 0)           return cmd_hw(argc - 1, argv + 1);
+    if (strcmp(argv[0], "train") == 0)        return cmd_train(argc - 1, argv + 1);
+    if (strcmp(argv[0], "merge") == 0)        return cmd_merge(argc - 1, argv + 1);
     return usage();
 }

@@ -14,6 +14,8 @@ SRC = \
     src/data.c \
     src/gguf_write.c \
     src/backward.c \
+    src/hw_probe.c \
+    src/train.c \
     src/studio.c \
     src/main.c
 

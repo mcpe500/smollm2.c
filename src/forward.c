@@ -1094,6 +1094,14 @@ int forward_vocab_size(const forward_ctx* f) {
     return f ? f->vocab_size : 0;
 }
 
+const float* forward_last_hidden(const forward_ctx* f) {
+    return f ? f->x_norm : NULL;
+}
+
+int forward_dim(const forward_ctx* f) {
+    return f ? f->dim : 0;
+}
+
 void forward_reset(forward_ctx* f) {
     if (!f) return;
     size_t cache_n = (size_t)f->n_layers * f->max_seq * f->kv_dim;
