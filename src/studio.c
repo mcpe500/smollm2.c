@@ -11,6 +11,7 @@
 #include "attn_registry.h"
 #include "sampling.h"
 #include "web.h"
+#include "resolve_model.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,7 @@ static int usage() {
         "  studio merge        --base <gguf> --adapter <lora.bin> --out <merged.gguf>\n"
         "  studio attn-list\n"
         "  studio attn-config  --config <layers.json> [--layers N]\n"
-        "  studio web          [--port 8082] --model <gguf>\n");
+        "  studio web          [--port 8082] [--model <gguf>]\n");
     return 1;
 }
 
@@ -220,16 +221,25 @@ static int cmd_merge(int argc, char** argv) {
 static int cmd_web(int argc, char** argv) {
     int port = 8082;
     const char* model = NULL;
+    char* auto_model = NULL;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) model = argv[++i];
     }
     if (!model) {
-        fprintf(stderr, "web: --model <gguf> required (for now)\n");
-        return 1;
+        auto_model = resolve_ollama_model_path();
+        if (!auto_model) {
+            fprintf(stderr,
+                "web: --model <gguf> required "
+                "(or install Ollama smollm2:135m)\n");
+            return 1;
+        }
+        model = auto_model;
     }
     sample_params sp = {0.3f, 0.0f, 5, 1.1f, 0};
-    return web_run(model, port, &sp) < 0 ? 1 : 0;
+    int rc = web_run(model, port, &sp);
+    free(auto_model);
+    return rc < 0 ? 1 : 0;
 }
 
 static int cmd_attn_list(int argc, char** argv) {
