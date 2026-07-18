@@ -1,7 +1,7 @@
 # Makefile for smollm2.c — minimal C inference engine reading Ollama GGUF
 
 CC      = gcc
-CFLAGS  = -std=c99 -O2 -march=native -Wall -Wextra
+CFLAGS  = -std=c99 -O2 -march=native -Wall -Wextra -MMD -MP
 LDFLAGS = -lm -lncurses
 
 SRC = \
@@ -22,13 +22,16 @@ SRC = \
     src/main.c
 
 OBJ = $(SRC:.c=.o)
+DEPS = $(OBJ:.o=.d)
+
+-include $(DEPS)
 
 TARGET = smollm2
 
 MODEL ?= models/smollm2-135m-f16.gguf
 PORT  ?= 8082
 
-.PHONY: all clean inspect studio studio-smoke studio-test \
+.PHONY: all clean inspect studio studio-smoke studio-test hw-test \
         studio-train studio-bench studio-data studio-merge studio-clean
 
 all: $(TARGET)
@@ -40,7 +43,7 @@ $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(DEPS) $(TARGET)
 
 inspect: $(TARGET)
 	./$(TARGET) --inspect
@@ -57,6 +60,9 @@ studio-test: $(TARGET)
 	python3 eval/attn_matrix_test.py
 	python3 eval/heavy_test.py
 	python3 eval/parity.py
+
+hw-test: $(TARGET)
+	python3 eval/hw_probe_test.py
 
 studio-bench:
 	python3 eval/attn_bench.py

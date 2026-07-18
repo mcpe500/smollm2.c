@@ -7,6 +7,7 @@
 
 #include "train.h"
 #include "gguf_write.h"
+#include "gguf.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,9 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <time.h>
+
+/* A5: max LoRA rank supported (spec 009 plans rank 1-32; 256 is ceiling). */
+#define LORA_MAX_RANK 256
 
 #define LORA_MAGIC "LORA0001"
 #define ADAM_B1 0.9f
@@ -76,10 +80,16 @@ train_state* train_create(forward_ctx* f, const train_params* p) {
         return NULL;
     }
 
-    /* Kaiming-ish init: A ~ N(0, 1/sqrt(dim)), B = 0 */
-    srand(p->seed ? p->seed : 42);
-    for (size_t i = 0; i < a_sz; i++)
-        t->A[i] = ((float)rand() / 2147483647.0f - 0.5f) * 0.02f;
+    /* A7: Kaiming init via Box-Muller Gaussian, std = sqrt(2/fan_in).
+     * B stays zero (LoRA convention: ΔW=0 at init). */
+    srand((unsigned)(p->seed ? p->seed : 42));
+    float std_a = sqrtf(2.0f / (float)t->dim);
+    for (size_t i = 0; i < a_sz; i++) {
+        float u1 = ((float)rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
+        float u2 = ((float)rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
+        float z = sqrtf(-2.0f * logf(u1)) * cosf(6.28318530718f * u2);
+        t->A[i] = z * std_a;
+    }
     /* B zeroed by zalloc */
 
     return t;
@@ -140,8 +150,14 @@ static float lora_accum(train_state* t, const float* h, float* logits, int targe
     float* dlogits = t->delta;  /* reuse */
     float loss = ce_loss_and_grad(logits, t->vocab, target, dlogits);
 
-    float d_mid[64];
-    if (t->rank > 64) return -1.0f;
+    /* A5: rank cap was hardcoded at 64 (silent corruption). Bump to 256 with
+     * explicit error if exceeded. Spec 009 plans rank 1-32. */
+    float d_mid[LORA_MAX_RANK];
+    if (t->rank > LORA_MAX_RANK) {
+        fprintf(stderr, "lora_accum: rank %d > LORA_MAX_RANK %d\n",
+                t->rank, LORA_MAX_RANK);
+        return -1.0f;
+    }
     for (int r = 0; r < t->rank; r++) {
         float s = 0;
         for (int v = 0; v < t->vocab; v++) {
@@ -266,15 +282,13 @@ int train_load(train_state* t, const char* path) {
     return 0;
 }
 
-/* Load packed sample index + tokens */
-static int load_sample(const char* packed, long offset, int n_tokens,
+/* A8: open packed file once per run, seek+read per sample.
+ * Old code reopened per-sample (O(N) opens per epoch). */
+static int load_sample(FILE* f, long offset, int n_tokens,
                        int* out, int max_out) {
     if (n_tokens > max_out) n_tokens = max_out;
-    FILE* f = fopen(packed, "rb");
-    if (!f) return -1;
-    if (fseek(f, offset, SEEK_SET) != 0) { fclose(f); return -1; }
+    if (fseek(f, offset, SEEK_SET) != 0) return -1;
     size_t n = fread(out, sizeof(int), n_tokens, f);
-    fclose(f);
     return (int)n;
 }
 
@@ -309,6 +323,14 @@ int train_run(train_state* t, const char* packed_path,
     }
     fclose(idx);
 
+    /* A8: open packed tokens file once for the whole run. */
+    FILE* packed = fopen(packed_path, "rb");
+    if (!packed) {
+        perror("train_run open packed");
+        free(samples);
+        return -1;
+    }
+
     mkdir(out_dir, 0755);
 
     int max_steps = p->max_steps > 0 ? p->max_steps : n_samples * p->epochs;
@@ -318,7 +340,7 @@ int train_run(train_state* t, const char* packed_path,
 
     for (int epoch = 0; epoch < p->epochs && step < max_steps; epoch++) {
         for (int s = 0; s < n_samples && step < max_steps; s++) {
-            int n = load_sample(packed_path, samples[s].offset,
+            int n = load_sample(packed, samples[s].offset,
                                 samples[s].n_tokens, tokens, 2048);
             if (n < 2) continue;
 
@@ -334,13 +356,15 @@ int train_run(train_state* t, const char* packed_path,
             hw_caps caps;
             hw_probe(&caps);
             if (p->simulate_mem_kb > 0) caps.mem_avail_kb = p->simulate_mem_kb;
-            if (caps.mem_avail_kb < 100 * 1024) {
+            if (caps.mem_avail_kb < (long)MEM_EMERGENCY_MB * 1024) {
                 char path[1024];
                 snprintf(path, sizeof(path), "%s/emergency_%d.bin", out_dir, step);
                 train_save(t, path);
                 fprintf(stderr, "train: emergency save at step %d "
-                        "(mem_avail=%ld MB)\n", step, caps.mem_avail_kb / 1024);
+                        "(mem_avail=%ld MB, threshold=%d MB)\n",
+                        step, caps.mem_avail_kb / 1024, MEM_EMERGENCY_MB);
                 free(samples);
+                fclose(packed);
                 return 0;
             }
 
@@ -360,16 +384,89 @@ int train_run(train_state* t, const char* packed_path,
            step, first_loss, t->last_loss, path);
 
     free(samples);
+    fclose(packed);
     return 0;
 }
 
-/* Phase 2a merge: copy base + keep adapter sidecar. Real weight merge
-   needs gguf_write tensor rewrite (phase 2b). For now: copy base so
-   inference still works, and log that adapter is sidecar. */
+/* ---- F16 helpers (mirror forward.c:250-280, kept local to avoid touching
+ * the inference path). ---- */
+static inline uint16_t merge_f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x & 0x80000000u) >> 16;
+    uint32_t exp_mant = x & 0x7fffffffu;
+    if (exp_mant >= 0x47800000u) {  /* inf/nan/saturation */
+        if (exp_mant > 0x7f800000u) return (uint16_t)(sign | 0x7e00); /* nan */
+        return (uint16_t)(sign | 0x7c00);                            /* inf  */
+    }
+    if (exp_mant < 0x38800000u) {  /* subnormal or zero */
+        if (exp_mant < 0x33000000u) return (uint16_t)sign;
+        uint32_t sh = 113 - (exp_mant >> 23);
+        uint32_t mant = (exp_mant & 0x7fffff) | 0x800000;
+        return (uint16_t)(sign | (mant >> sh));
+    }
+    return (uint16_t)(sign | ((exp_mant + 0xc800000) >> 13));
+}
+
+/* Compute ΔW = scale * B^T @ A^T  for one (vocab × dim) weight tensor,
+ * add to base F16 bytes, write F16 output. Returns malloc'd buffer (caller
+ * frees) or NULL on error. base_f16 is the source tensor bytes (F16).
+ */
+static uint16_t* lora_patched_weight(const uint16_t* base_f16,
+                                     const float* A, const float* B,
+                                     int dim, int rank, int vocab,
+                                     float scale,
+                                     const char* tensor_name) {
+    (void)tensor_name;
+    size_t n = (size_t)vocab * dim;
+    uint16_t* out = malloc(n * sizeof(uint16_t));
+    if (!out) return NULL;
+    for (int v = 0; v < vocab; v++) {
+        /* delta_row[d] = scale * sum_r A[d*rank+r] * B[r*vocab+v] */
+        const float* Bcol = B + v;  /* stride=vocab */
+        for (int d = 0; d < dim; d++) {
+            const float* Arow = A + (size_t)d * rank;
+            float s = 0.0f;
+            for (int r = 0; r < rank; r++) s += Arow[r] * Bcol[(size_t)r * vocab];
+            float delta = scale * s;
+            /* Convert base F16 → F32, add, back to F16 */
+            uint32_t h_bits = base_f16[(size_t)v * dim + d];
+            /* f16 → f32 */
+            uint32_t sign = (h_bits & 0x8000u) << 16;
+            uint32_t exp  = (h_bits & 0x7c00u) >> 10;
+            uint32_t mant = (h_bits & 0x03ffu) << 13;
+            float base_f;
+            if (exp == 0) {
+                if (mant == 0) {
+                    uint32_t zero = sign;
+                    memcpy(&base_f, &zero, 4);
+                } else {
+                    /* subnormal: normalize */
+                    uint32_t e = exp;
+                    while ((mant & 0x00800000u) == 0) { mant <<= 1; e--; }
+                    mant &= 0x007fffffu;
+                    uint32_t bits = sign | ((e + (127 - 15)) << 23) | mant;
+                    memcpy(&base_f, &bits, 4);
+                }
+            } else {
+                uint32_t bits = sign | ((exp + (127 - 15)) << 23) | mant;
+                memcpy(&base_f, &bits, 4);
+            }
+            float merged = base_f + delta;
+            out[(size_t)v * dim + d] = merge_f32_to_f16(merged);
+        }
+    }
+    return out;
+}
+
+/* Phase C: real weight merge. Computes ΔW = scale * B^T @ A^T for the tied
+ * embedding (token_embd.weight == lm_head.weight in SmolLM2-135M) and
+ * patches it via gguf_patch_tensor. */
 int train_merge(const char* base_gguf, const char* adapter_path,
                 const char* out_gguf) {
     if (!base_gguf || !adapter_path || !out_gguf) return -1;
-    /* Verify adapter magic */
+
+    /* Parse adapter header */
     FILE* a = fopen(adapter_path, "rb");
     if (!a) { perror("train_merge adapter"); return -1; }
     char magic[8];
@@ -377,26 +474,69 @@ int train_merge(const char* base_gguf, const char* adapter_path,
         fprintf(stderr, "train_merge: bad adapter magic\n");
         fclose(a); return -1;
     }
+    int32_t hdr[4];
+    if (fread(hdr, sizeof(int32_t), 4, a) != 4) { fclose(a); return -1; }
+    int dim = hdr[0], vocab = hdr[1], rank = hdr[2], step = hdr[3];
+    float scale;
+    if (fread(&scale, sizeof(float), 1, a) != 1) { fclose(a); return -1; }
+    if (rank > LORA_MAX_RANK) {
+        fprintf(stderr, "train_merge: adapter rank %d > %d\n", rank, LORA_MAX_RANK);
+        fclose(a); return -1;
+    }
+    size_t a_sz = (size_t)dim * rank;
+    size_t b_sz = (size_t)rank * vocab;
+    float* A = malloc(a_sz * sizeof(float));
+    float* B = malloc(b_sz * sizeof(float));
+    if (!A || !B) { free(A); free(B); fclose(a); return -1; }
+    if (fread(A, sizeof(float), a_sz, a) != a_sz) { free(A); free(B); fclose(a); return -1; }
+    if (fread(B, sizeof(float), b_sz, a) != b_sz) { free(A); free(B); fclose(a); return -1; }
     fclose(a);
 
-    if (gguf_copy(base_gguf, out_gguf) < 0) return -1;
-
-    /* Sidecar: write adapter next to out so runtime can load later */
-    char side[1024];
-    snprintf(side, sizeof(side), "%s.lora", out_gguf);
-    FILE* src = fopen(adapter_path, "rb");
-    FILE* dst = fopen(side, "wb");
-    if (src && dst) {
-        char buf[64 * 1024];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
-            fwrite(buf, 1, n, dst);
+    /* Load base GGUF, get token_embd.weight as F16 bytes */
+    gguf_ctx g;
+    if (gguf_load(base_gguf, &g) < 0) { free(A); free(B); return -1; }
+    const gguf_tensor_info* t = gguf_tensor_get(&g, "token_embd.weight");
+    if (!t) {
+        fprintf(stderr, "train_merge: token_embd.weight not found in base\n");
+        gguf_free(&g); free(A); free(B); return -1;
     }
-    if (src) fclose(src);
-    if (dst) fclose(dst);
-    printf("train_merge: base copied to %s, adapter sidecar %s\n",
-           out_gguf, side);
-    printf("train_merge: note — phase 2a keeps base weights; LoRA applied "
-           "at runtime when sidecar present (phase 2b full merge)\n");
+    if (t->dtype != GGUF_DT_F16) {
+        fprintf(stderr, "train_merge: expected F16 token_embd.weight, got dtype=%d\n",
+                t->dtype);
+        gguf_free(&g); free(A); free(B); return -1;
+    }
+    /* Sanity-check shape vs adapter header.
+     * GGUF dims[0]=innermost=dim, dims[1]=vocab. */
+    int tv = (int)t->dims[1];
+    int td = (int)t->dims[0];
+    if (tv != vocab || td != dim) {
+        fprintf(stderr, "train_merge: shape mismatch adapter[%d,%d] vs tensor[%d,%d]\n",
+                dim, vocab, td, tv);
+        gguf_free(&g); free(A); free(B); return -1;
+    }
+    const uint16_t* base_f16 = (const uint16_t*)gguf_tensor_data(&g, t);
+    if (!base_f16) {
+        fprintf(stderr, "train_merge: tensor_data null\n");
+        gguf_free(&g); free(A); free(B); return -1;
+    }
+
+    uint16_t* patched = lora_patched_weight(base_f16, A, B,
+                                            dim, rank, vocab, scale,
+                                            "token_embd.weight");
+    gguf_free(&g);
+    free(A); free(B);
+    if (!patched) return -1;
+
+    const char* name = "token_embd.weight";
+    size_t patch_bytes = (size_t)vocab * dim * sizeof(uint16_t);
+    int rc = gguf_patch_tensor(base_gguf, out_gguf, name,
+                               patched, patch_bytes);
+    free(patched);
+    if (rc < 0) {
+        fprintf(stderr, "train_merge: gguf_patch_tensor failed\n");
+        return -1;
+    }
+    printf("train_merge: patched token_embd.weight (step=%d rank=%d scale=%.4f) "
+           "into %s (%zu bytes)\n", step, rank, scale, out_gguf, patch_bytes);
     return 0;
 }

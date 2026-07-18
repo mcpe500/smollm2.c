@@ -23,7 +23,7 @@ static int usage() {
         "  studio data-build    --in <file> --out <packed.bin> [--fmt auto|raw|instruct|sharegpt] [--model <gguf>]\n"
         "  studio data-inspect --packed <packed.bin>\n"
         "  studio gguf-rewrite --in <base.gguf> --out <copy.gguf>\n"
-        "  studio grad-check   [--m N --n N --k N] [--eps 1e-3]\n"
+        "  studio grad-check   [--op matmul|rmsnorm|rope|attention|silu_glu|softmax_ce] [--eps 1e-4]\n"
         "  studio hw\n"
         "  studio train        --data <packed.bin> --mode lora|qlora|fullft [--rank N] [--epochs N]\n"
         "                      [--lr F] [--seq N] [--batch N] [--max-steps N] [--out-dir DIR] [--model <gguf>]\n"
@@ -94,25 +94,51 @@ static int cmd_gguf_rewrite(int argc, char** argv) {
 }
 
 static int cmd_grad_check(int argc, char** argv) {
-    int m = 4, n = 3, k = 5;
-    float eps = 1e-3f;
+    const char* op_s = "matmul";
+    float eps = 1e-4f;
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--m") == 0 && i + 1 < argc) m = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--n") == 0 && i + 1 < argc) n = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) k = atoi(argv[++i]);
+        if (strcmp(argv[i], "--op") == 0 && i + 1 < argc) op_s = argv[++i];
         else if (strcmp(argv[i], "--eps") == 0 && i + 1 < argc) eps = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--m") == 0 && i + 1 < argc) i++;
+        else if (strcmp(argv[i], "--n") == 0 && i + 1 < argc) i++;
+        else if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) i++;
     }
-    float err = backward_matmul_grad_check(m, n, k, eps);
-    printf("grad-check: m=%d n=%d k=%d eps=%.2e max_abs_error=%.3e\n",
-           m, n, k, eps, err);
+    grad_op op = grad_op_from_name(op_s);
+    if (op < 0 || op >= GRAD_OP_COUNT) {
+        fprintf(stderr, "grad-check: unknown op '%s' (try matmul|rmsnorm|rope|attention|silu_glu|softmax_ce)\n", op_s);
+        return 1;
+    }
+    float err = grad_check_dispatch(op, eps);
+    printf("grad-check: op=%s eps=%.2e max_abs_error=%.3e\n",
+           op_s, eps, err);
     return err < 1e-3f ? 0 : 1;
 }
 
 static int cmd_hw(int argc, char** argv) {
-    (void)argc; (void)argv;
+    int json = 0, suggest = 0;
+    long simulate = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0) json = 1;
+        else if (strcmp(argv[i], "--suggest") == 0) suggest = 1;
+        else if (strcmp(argv[i], "--simulate-mem-kb") == 0 && i + 1 < argc)
+            simulate = atol(argv[++i]);
+    }
+    if (simulate > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%ld", simulate);
+        setenv("SMOLLIM2_SIM_MEM_KB", buf, 1);
+    }
     hw_caps c;
     hw_probe(&c);
-    hw_print(&c);
+    if (json) {
+        char* s = hw_json(&c);
+        if (s) { fputs(s, stdout); free(s); }
+    } else if (suggest) {
+        char* s = hw_suggest(&c);
+        if (s) { fputs(s, stdout); free(s); }
+    } else {
+        hw_print(&c);
+    }
     return 0;
 }
 
@@ -154,6 +180,20 @@ static int cmd_train(int argc, char** argv) {
     else if (strcmp(mode_s, "qlora") == 0) p.mode = TRAIN_QLORA;
     else if (strcmp(mode_s, "fullft") == 0) p.mode = TRAIN_FULLFT;
     else { fprintf(stderr, "train: unknown mode %s\n", mode_s); return 1; }
+
+    /* Phase A4: QLoRA/FullFT not yet implemented. Refuse with clear error so
+     * the user knows it's not silently falling through to LoRA. Will relax
+     * in Phase D (QLoRA) and Phase E (FullFT). */
+    if (p.mode == TRAIN_QLORA) {
+        fprintf(stderr,
+            "train: qlora refused — not implemented in this build (planned: spec 015 / phase D)\n");
+        return 2;
+    }
+    if (p.mode == TRAIN_FULLFT) {
+        fprintf(stderr,
+            "train: fullft refused — not implemented in this build (planned: spec 016 / phase E)\n");
+        return 2;
+    }
 
     hw_caps caps;
     hw_probe(&caps);

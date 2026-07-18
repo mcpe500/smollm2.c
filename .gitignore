@@ -1,6 +1,8 @@
 # Build artifacts
 smollm2
+smollm2_scalar
 *.o
+*.d
 obj/
 
 # Model files (read directly from ~/.ollama/models/)
@@ -27,3 +29,13 @@ Thumbs.db
 # Claude Code local files (not project instructions)
 CLAUDE.md
 .claude/
+
+# Debug scratch
+debug_*.py
+.forward_f32test.c
+src/forward_f32test.c
+.auto/
+.selfimprove/
+eval/results/
+eval/prompts*.txt
+

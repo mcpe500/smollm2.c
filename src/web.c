@@ -24,9 +24,24 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 #define MAX_REQ     65536
 #define IM_END_TOKEN 2
+
+/* A2: process-global model cache. Loaded once in web_run, reused per request.
+ * forward_reset() clears KV cache between requests; full reload only when
+ * the caller changes rope/kv precision (which affects forward_load's allocation). */
+static forward_ctx* g_fwd = NULL;
+static tokenizer*    g_tok = NULL;
+static gguf_ctx      g_gctx;
+static int           g_model_loaded = 0;
+static int           g_cache_rope = ROPE_F32, g_cache_kv = KV_F32;
+
+/* Forward declarations — helpers defined below. */
+static void send_json(int fd, int code, const char* body);
+static void send_all(int fd, const char* buf, size_t len);
 
 // ---------------------------------------------------------------------------
 // Embedded HTML/CSS/JS as a single C string literal
@@ -402,6 +417,119 @@ static void send_chunk(int fd, const char* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
+// A1: shell-injection-safe subprocess helpers (no shell, no popen).
+// ---------------------------------------------------------------------------
+/* Reject paths with shell metacharacters or traversal patterns. Defense in
+ * depth — run_capture does not use a shell, but we want a clear error for
+ * suspicious input. Returns 1 if safe, 0 otherwise. */
+static int path_safe(const char* p) {
+    if (!p || !*p) return 0;
+    for (const char* c = p; *c; c++) {
+        if (*c == ';' || *c == '|' || *c == '`' || *c == '$' ||
+            *c == '<' || *c == '>' || *c == '\n' || *c == '\r' ||
+            *c == '\\' || *c == '"' || *c == '\'') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Spawn argv (NULL-terminated), capture combined stdout+stderr up to cap-1
+ * bytes (NUL-terminated). Returns exit status (0-255), or -1 on spawn error.
+ * Caller must allocate `out` with at least `cap` bytes (cap=0 disables capture).
+ * `n_out` (optional) receives captured length. */
+static int run_capture(char** argv, char* out, size_t cap, size_t* n_out) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    size_t total = 0;
+    if (out && cap > 1) {
+        while (total < cap - 1) {
+            ssize_t n = read(pipefd[0], out + total, cap - 1 - total);
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n == 0) break;
+            total += (size_t)n;
+        }
+        out[total] = '\0';
+    }
+    close(pipefd[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) break;
+    }
+    if (n_out) *n_out = total;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+/* A3: growable recv buffer. Reads HTTP request (headers + body up to
+ * Content-Length), growing as needed. Hard cap MAX_REQ_BODY bytes.
+ * On success: *out_buf is malloc'd (caller frees), *out_len is byte count.
+ * Returns 0 on success, -1 on error. */
+#define MAX_REQ_BODY (8 * 1024 * 1024)
+static int recv_request(int fd, char** out_buf, size_t* out_len) {
+    size_t cap = 8192;
+    size_t len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return -1;
+
+    size_t hdr_end = 0;
+    int have_hdr = 0;
+    while (!have_hdr) {
+        if (len + 1 >= cap) {
+            if (cap >= MAX_REQ_BODY) { free(buf); return -1; }
+            size_t ncap = cap * 2;
+            char* nb = (char*)realloc(buf, ncap);
+            if (!nb) { free(buf); return -1; }
+            buf = nb; cap = ncap;
+        }
+        ssize_t k = recv(fd, buf + len, cap - len - 1, 0);
+        if (k < 0) { if (errno == EINTR) continue; free(buf); return -1; }
+        if (k == 0) break;
+        len += (size_t)k;
+        buf[len] = '\0';
+        char* he = strstr(buf, "\r\n\r\n");
+        if (he) { hdr_end = (size_t)(he - buf) + 4; have_hdr = 1; }
+        if (len > 1024 * 1024 && !have_hdr) { free(buf); return -1; }
+    }
+    if (!have_hdr) { free(buf); return -1; }
+
+    long clen = 0;
+    char* cl = strcasestr(buf, "Content-Length:");
+    if (cl) clen = atol(cl + 15);
+    if (clen < 0) clen = 0;
+
+    size_t need = hdr_end + (size_t)clen + 1;
+    if (need > MAX_REQ_BODY) { free(buf); return -1; }
+    if (need > cap) {
+        char* nb = (char*)realloc(buf, need);
+        if (!nb) { free(buf); return -1; }
+        buf = nb; cap = need;
+    }
+    while (len < hdr_end + (size_t)clen) {
+        ssize_t k = recv(fd, buf + len, hdr_end + (size_t)clen - len, 0);
+        if (k < 0) { if (errno == EINTR) continue; break; }
+        if (k == 0) break;
+        len += (size_t)k;
+    }
+    buf[len] = '\0';
+
+    *out_buf = buf;
+    *out_len = len;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Request handlers
 // ---------------------------------------------------------------------------
 static void handle_home(int fd) {
@@ -445,20 +573,19 @@ static void handle_studio_page(int fd) {
 
 static void handle_studio_hw(int fd) {
     hw_caps c; hw_probe(&c);
-    char buf[512];
-    int n = snprintf(buf, sizeof(buf),
-        "{\"mem_total_kb\":%ld,\"mem_avail_kb\":%ld,"
-        "\"max_seq_advised\":%d,\"max_batch_advised\":%d,"
-        "\"fullft_allowed\":%d,\"qlora_recommended\":%d}\n",
-        c.mem_total_kb, c.mem_avail_kb,
-        c.max_seq_advised, c.max_batch_advised,
-        c.fullft_allowed, c.qlora_recommended);
+    char* body = hw_json(&c);
+    if (!body) {
+        send_json(fd, 500, "{\"ok\":false,\"error\":\"hw_json\"}");
+        return;
+    }
+    size_t n = strlen(body);
     char header[256];
     int hlen = snprintf(header, sizeof(header),
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-        "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n", n);
     send_all(fd, header, (size_t)hlen);
-    send_all(fd, buf, (size_t)n);
+    send_all(fd, body, n);
+    free(body);
 }
 
 static void handle_studio_attn(int fd) {
@@ -591,27 +718,36 @@ static void handle_studio_data(int fd, const char* body, const char* model_path)
         send_json(fd, 400, "{\"ok\":false,\"error\":\"missing text/out or --model\"}");
         return;
     }
+    /* A1: path safety — reject shell metacharacters even though run_capture
+     * does not use a shell (defense in depth + clear error for user). */
+    if (!path_safe(out_path) || !path_safe(model_path)) {
+        send_json(fd, 400, "{\"ok\":false,\"error\":\"unsafe path\"}");
+        return;
+    }
     char in_path[1024];
     snprintf(in_path, sizeof(in_path), "%s/studio_in_%d.txt", tmp_dir(), (int)getpid());
     FILE* f = fopen(in_path, "w");
     if (!f) { send_json(fd, 500, "{\"ok\":false,\"error\":\"tmpfile\"}"); return; }
-    fwrite(text, 1, tlen, f); fclose(f);
+    fwrite(text, 1, (size_t)tlen, f); fclose(f);
 
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "./smollm2 studio data-build --in %s --out %s --fmt %s --model %s 2>&1",
-        in_path, out_path, fmt[0] ? fmt : "raw", model_path);
-    FILE* p = popen(cmd, "r");
-    char log[4096] = {0}; int logn = 0;
-    if (p) {
-        char line[512];
-        while (fgets(line, sizeof(line), p) && logn < (int)sizeof(log) - 2)
-            logn += snprintf(log + logn, sizeof(log) - (size_t)logn, "%s", line);
-    }
-    int rc = p ? pclose(p) : -1;
+    char fmt_arg[32];
+    snprintf(fmt_arg, sizeof(fmt_arg), "%s", fmt[0] ? fmt : "raw");
+
+    /* A1: fork+execvp (no shell) eliminates injection surface entirely. */
+    char* argv[] = {
+        "./smollm2", "studio", "data-build",
+        "--in", in_path,
+        "--out", out_path,
+        "--fmt", fmt_arg,
+        "--model", (char*)model_path,
+        NULL,
+    };
+    char log[4096] = {0}; size_t logn = 0;
+    int rc = run_capture(argv, log, sizeof(log), &logn);
     unlink(in_path);
+
     char resp[8192], log_esc[4096];
-    json_escape(log, logn, log_esc, sizeof(log_esc));
+    json_escape(log, (int)logn, log_esc, sizeof(log_esc));
     snprintf(resp, sizeof(resp),
         "{\"ok\":%s,\"rc\":%d,\"out\":\"%s\",\"log\":\"%s\"}",
         rc == 0 ? "true" : "false", rc, out_path, log_esc);
@@ -635,22 +771,59 @@ static void handle_studio_train(int fd, const char* body, const char* model_path
         sse_send(fd, "{\"error\":\"missing data or --model\"}");
         sse_done(fd); return;
     }
+    /* A1: path safety. */
+    if (!path_safe(data) || !path_safe(model_path)) {
+        sse_send(fd, "{\"error\":\"unsafe path\"}");
+        sse_done(fd); return;
+    }
+    /* A4: refuse non-lora mode at server too (mirrors studio.c). */
+    if (mode[0] && strcmp(mode, "lora") != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "{\"error\":\"mode '%s' not implemented in this build\"}", mode);
+        sse_send(fd, msg);
+        sse_done(fd); return;
+    }
     char out_dir[256];
     snprintf(out_dir, sizeof(out_dir), "%s/studio_adapter_%d", tmp_dir(), (int)getpid());
 
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "./smollm2 studio train --data %s --mode %s --rank %d "
-        "--epochs %d --lr %s --seq %d --batch %d --max-steps %d "
-        "--out-dir %s --model %s 2>&1",
-        data, mode[0] ? mode : "lora", rank, epochs, lr_s, seq, batch,
-        max_steps, out_dir, model_path);
+    char rank_s[16], epochs_s[16], seq_s[16], batch_s[16], max_s[16];
+    snprintf(rank_s, sizeof(rank_s), "%d", rank);
+    snprintf(epochs_s, sizeof(epochs_s), "%d", epochs);
+    snprintf(seq_s, sizeof(seq_s), "%d", seq);
+    snprintf(batch_s, sizeof(batch_s), "%d", batch);
+    snprintf(max_s, sizeof(max_s), "%d", max_steps);
 
-    FILE* p = popen(cmd, "r");
-    char line[1024];
-    if (!p) { sse_send(fd, "{\"error\":\"popen\"}"); sse_done(fd); return; }
-    while (fgets(line, sizeof(line), p)) sse_send(fd, line);
-    int rc = pclose(p);
+    /* A1: argv-based execvp, no shell. */
+    char* argv[] = {
+        "./smollm2", "studio", "train",
+        "--data", data,
+        "--mode", mode[0] ? mode : "lora",
+        "--rank", rank_s,
+        "--epochs", epochs_s,
+        "--lr", lr_s,
+        "--seq", seq_s,
+        "--batch", batch_s,
+        "--max-steps", max_s,
+        "--out-dir", out_dir,
+        "--model", (char*)model_path,
+        NULL,
+    };
+
+    /* Capture + forward as SSE. Phase F will replace with direct call + streaming. */
+    char log[16384] = {0}; size_t logn = 0;
+    int rc = run_capture(argv, log, sizeof(log), &logn);
+    char* line = log;
+    while (line < log + logn) {
+        char* nl = memchr(line, '\n', (size_t)(log + logn - line));
+        size_t L = nl ? (size_t)(nl - line) : (size_t)(log + logn - line);
+        char buf[1100];
+        size_t cpy = L < sizeof(buf) - 1 ? L : sizeof(buf) - 1;
+        memcpy(buf, line, cpy); buf[cpy] = '\0';
+        sse_send(fd, buf);
+        if (!nl) break;
+        line = nl + 1;
+    }
     char meta[256];
     snprintf(meta, sizeof(meta), "{\"done\":true,\"rc\":%d,\"out_dir\":\"%s\"}",
              rc, out_dir);
@@ -667,20 +840,22 @@ static void handle_studio_merge(int fd, const char* body) {
         send_json(fd, 400, "{\"ok\":false,\"error\":\"missing base/adapter/out\"}");
         return;
     }
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "./smollm2 studio merge --base %s --adapter %s --out %s 2>&1",
-        base, adapter, out);
-    FILE* p = popen(cmd, "r");
-    char log[4096] = {0}; int logn = 0;
-    if (p) {
-        char line[512];
-        while (fgets(line, sizeof(line), p) && logn < (int)sizeof(log) - 2)
-            logn += snprintf(log + logn, sizeof(log) - (size_t)logn, "%s", line);
+    /* A1: path safety on all three. */
+    if (!path_safe(base) || !path_safe(adapter) || !path_safe(out)) {
+        send_json(fd, 400, "{\"ok\":false,\"error\":\"unsafe path\"}");
+        return;
     }
-    int rc = p ? pclose(p) : -1;
+    char* argv[] = {
+        "./smollm2", "studio", "merge",
+        "--base", base,
+        "--adapter", adapter,
+        "--out", out,
+        NULL,
+    };
+    char log[4096] = {0}; size_t logn = 0;
+    int rc = run_capture(argv, log, sizeof(log), &logn);
     char resp[8192], log_esc[4096];
-    json_escape(log, logn, log_esc, sizeof(log_esc));
+    json_escape(log, (int)logn, log_esc, sizeof(log_esc));
     snprintf(resp, sizeof(resp),
         "{\"ok\":%s,\"rc\":%d,\"out\":\"%s\",\"sidecar\":\"%s.lora\",\"log\":\"%s\"}",
         rc == 0 ? "true" : "false", rc, out, out, log_esc);
@@ -745,7 +920,13 @@ static void handle_generate(int fd, const char* body,
         static int s_rope = ROPE_F32, s_kv = KV_F32;
         if (rope_v >= 0) s_rope = rope_v;
         if (kv_v   >= 0) s_kv   = kv_v;
+        /* A2: if cached model exists with different modes, free + reload. */
+        if (g_model_loaded && (s_rope != g_cache_rope || s_kv != g_cache_kv)) {
+            forward_free(g_fwd); tokenizer_free(g_tok); gguf_free(&g_gctx);
+            g_model_loaded = 0;
+        }
         forward_set_modes(s_rope, s_kv, ATTN_NAIVE);
+        g_cache_rope = s_rope; g_cache_kv = s_kv;
     }
 
     // Send SSE headers
@@ -757,28 +938,31 @@ static void handle_generate(int fd, const char* body,
         "Transfer-Encoding: chunked\r\n\r\n";
     send_all(fd, header, strlen(header));
 
-    // Load model fresh for each request (simple but slow)
-    // For better perf, load once at startup and mutex-protect — out of scope here.
-    gguf_ctx ctx;
-    if (gguf_load(model_path, &ctx) < 0) {
-        send_chunk(fd, "data: {\"error\":\"model load failed\"}\n\n",
-                   strlen("data: {\"error\":\"model load failed\"}\n\n"));
-        send_chunk(fd, "data: [DONE]\n\n", strlen("data: [DONE]\n\n"));
-        send_chunk(fd, "", 0);
-        return;
+    /* A2: load once, cache. forward_reset clears KV per request. */
+    if (!g_model_loaded) {
+        if (gguf_load(model_path, &g_gctx) < 0) {
+            send_chunk(fd, "data: {\"error\":\"model load failed\"}\n\n",
+                       strlen("data: {\"error\":\"model load failed\"}\n\n"));
+            send_chunk(fd, "data: [DONE]\n\n", strlen("data: [DONE]\n\n"));
+            send_chunk(fd, "", 0);
+            return;
+        }
+        if (tokenizer_load(&g_tok, &g_gctx) < 0) {
+            gguf_free(&g_gctx); g_model_loaded = 0;
+            send_chunk(fd, "", 0);
+            return;
+        }
+        if (forward_load(&g_fwd, &g_gctx, 2048) < 0) {
+            tokenizer_free(g_tok); g_tok = NULL;
+            gguf_free(&g_gctx);
+            send_chunk(fd, "", 0);
+            return;
+        }
+        g_model_loaded = 1;
     }
-    tokenizer* tok = NULL;
-    if (tokenizer_load(&tok, &ctx) < 0) {
-        gguf_free(&ctx);
-        send_chunk(fd, "", 0);
-        return;
-    }
-    forward_ctx* fwd = NULL;
-    if (forward_load(&fwd, &ctx, 2048) < 0) {
-        tokenizer_free(tok); gguf_free(&ctx);
-        send_chunk(fd, "", 0);
-        return;
-    }
+    forward_ctx* fwd = g_fwd;
+    tokenizer*    tok = g_tok;
+    forward_reset(fwd);
 
     // Build chat template (toggleable)
     char tmpl[4096];
@@ -802,7 +986,6 @@ static void handle_generate(int fd, const char* body,
     int prompt_ids[2048];
     int prompt_len = tokenizer_encode(tok, tmpl, prompt_ids, 2048);
     if (prompt_len <= 0) {
-        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
         send_chunk(fd, "", 0);
         return;
     }
@@ -812,14 +995,12 @@ static void handle_generate(int fd, const char* body,
     int*   gen    = malloc((size_t)max_new * sizeof(int));
     if (!logits || !gen) {
         free(logits); free(gen);
-        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
         send_chunk(fd, "", 0);
         return;
     }
 
     if (forward_prefill(fwd, prompt_ids, prompt_len, logits) < 0) {
         free(logits); free(gen);
-        forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
         send_chunk(fd, "", 0);
         return;
     }
@@ -853,7 +1034,7 @@ static void handle_generate(int fd, const char* body,
     send_chunk(fd, "", 0);
 
     free(logits); free(gen);
-    forward_free(fwd); tokenizer_free(tok); gguf_free(&ctx);
+    /* A2: model cached in globals; do not free here. */
 }
 
 // ---------------------------------------------------------------------------
@@ -932,31 +1113,19 @@ int web_run(const char* model_path, int port, const sample_params* sp) {
             continue;
         }
 
-        char req[MAX_REQ];
-        ssize_t n = recv(cli_fd, req, sizeof(req) - 1, 0);
-        if (n <= 0) { close(cli_fd); continue; }
-        req[n] = '\0';
-
-        /* Drain rest of body if Content-Length > initial recv. */
-        char* cl_p = strcasestr(req, "Content-Length:");
-        if (cl_p) {
-            int clen = atoi(cl_p + 15);
-            const char* body_start = strstr(req, "\r\n\r\n");
-            int body_off = body_start ? (int)(body_start + 4 - req) : (int)n;
-            int body_have = (int)n - body_off;
-            while (body_have < clen && n < (ssize_t)sizeof(req) - 1) {
-                ssize_t k = recv(cli_fd, req + n, clen - body_have, 0);
-                if (k <= 0) break;
-                n += k;
-                body_have += (int)k;
-                req[n] = '\0';
-            }
+        char* req = NULL;
+        size_t req_len = 0;
+        if (recv_request(cli_fd, &req, &req_len) < 0) {
+            close(cli_fd);
+            continue;
         }
+        int n = (int)req_len;
 
         char method[16], path[256];
         char* body = NULL;
-        if (parse_request(req, (int)n, method, sizeof(method),
+        if (parse_request(req, n, method, sizeof(method),
                           path, sizeof(path), &body) < 0) {
+            free(req);
             close(cli_fd);
             continue;
         }
@@ -985,10 +1154,18 @@ int web_run(const char* model_path, int port, const sample_params* sp) {
             send_all(cli_fd, nf, strlen(nf));
         }
 
+        free(req);
         close(cli_fd);
     }
 
     close(srv);
+    /* A2: free cached model on shutdown. */
+    if (g_model_loaded) {
+        forward_free(g_fwd); g_fwd = NULL;
+        tokenizer_free(g_tok); g_tok = NULL;
+        gguf_free(&g_gctx);
+        g_model_loaded = 0;
+    }
     fprintf(stderr, "\nsmollm2 web: stopped.\n");
     return 0;
 }
